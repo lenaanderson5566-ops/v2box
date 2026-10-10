@@ -149,6 +149,7 @@ func (v *V2Core) DelNode(tag string) error {
 		return nil
 	}
 	delete(v.nodes, tag)
+	v.revokeNode(tag, n)
 	v.tracker.setUsers(tag, nil)
 	if n.cancel != nil {
 		n.cancel()
@@ -166,6 +167,7 @@ func (v *V2Core) Close() error {
 	v.closed = true
 	var errs []error
 	for tag, n := range v.nodes {
+		v.revokeNode(tag, n)
 		v.tracker.setUsers(tag, nil)
 		if n.cancel != nil {
 			n.cancel()
@@ -178,6 +180,19 @@ func (v *V2Core) Close() error {
 	}
 	v.nodes = make(map[string]*nodeState)
 	return errors.Join(errs...)
+}
+
+// Also revoke authenticated transport containers with no currently routed
+// streams, so node shutdown does not leave idle multiplex sessions behind.
+func (v *V2Core) revokeNode(tag string, n *nodeState) {
+	if n.server == nil {
+		return
+	}
+	if options, err := buildOptions(n.info, nil, v.Config); err == nil {
+		if in, ok := n.server.Inbound().Get(tag); ok {
+			_ = updateInboundUsers(in, options.Inbounds[0].Options)
+		}
+	}
 }
 func (v *V2Core) GetUserTrafficSlice(tag string, minTraffic int) ([]panel.UserTraffic, error) {
 	return v.tracker.takeTraffic(tag, minTraffic), nil

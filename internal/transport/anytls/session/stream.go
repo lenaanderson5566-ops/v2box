@@ -22,7 +22,7 @@ type Stream struct {
 	writeDeadline pipe.PipeDeadline
 
 	dieOnce sync.Once
-	dieHook func()
+	dieHook closeHook
 	dieErr  atomic.Pointer[streamError]
 
 	reportOnce sync.Once
@@ -84,10 +84,7 @@ func (s *Stream) closeLocally() {
 		once = true
 	})
 	if once {
-		if s.dieHook != nil {
-			s.dieHook()
-			s.dieHook = nil
-		}
+		s.dieHook.run()
 	}
 }
 
@@ -99,10 +96,7 @@ func (s *Stream) closeWithError(err error) error {
 		once = true
 	})
 	if once {
-		if s.dieHook != nil {
-			s.dieHook()
-			s.dieHook = nil
-		}
+		s.dieHook.run()
 		return s.sess.streamClosed(s.id)
 	} else {
 		return s.closedError()

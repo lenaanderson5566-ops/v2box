@@ -112,7 +112,7 @@ func TestUDPAccounting(t *testing.T) {
 			}
 			v := startTestNode(t, n)
 			exchangeUDP(t, clientBox(t, n, testUUID), echo.LocalAddr())
-			traffic, _ := v.GetUserTrafficSlice(n.Tag, 0)
+			traffic := awaitTraffic(t, v, n.Tag, int64(len("udp-accounting-echo")))
 			if len(traffic) != 1 || traffic[0].Upload == 0 || traffic[0].Download == 0 {
 				t.Fatalf("UDP traffic missing: %+v", traffic)
 			}

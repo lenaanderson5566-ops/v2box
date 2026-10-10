@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"github.com/lenaanderson5566-ops/v2box/internal/authconn"
 	"io"
 	"net"
 	"runtime"
@@ -45,6 +46,7 @@ type ServiceHandler interface {
 }
 
 type Service[U comparable] struct {
+	sessions          authconn.Registry[U]
 	usersMu           sync.RWMutex
 	ctx               context.Context
 	logger            logger.Logger
@@ -108,6 +110,7 @@ func (s *Service[U]) UpdateUsers(userList []U, uuidList [][16]byte, passwordList
 	s.usersMu.Lock()
 	s.userMap = userMap
 	s.passwordMap = passwordMap
+	s.sessions.Replace(userList)
 	s.usersMu.Unlock()
 }
 
@@ -266,6 +269,11 @@ func (s *serverSession[U]) handleUniStream(stream *quic.ReceiveStream) error {
 			return E.New("authentication: multiple authentication requests")
 		default:
 		}
+		release, ok := s.sessions.Track(user, func() { _ = s.quicConn.CloseWithError(0, "account revoked") })
+		if !ok {
+			return net.ErrClosed
+		}
+		context.AfterFunc(s.quicConn.Context(), release)
 		s.authUser = user
 		close(s.authDone)
 		return nil

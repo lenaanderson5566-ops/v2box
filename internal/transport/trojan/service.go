@@ -3,6 +3,7 @@ package trojan
 import (
 	"context"
 	"encoding/binary"
+	"github.com/lenaanderson5566-ops/v2box/internal/authconn"
 	"net"
 	"sync"
 
@@ -22,6 +23,7 @@ type Handler interface {
 }
 
 type Service[K comparable] struct {
+	sessions        authconn.Registry[K]
 	usersMu         sync.RWMutex
 	users           map[K][56]byte
 	keys            map[[56]byte]K
@@ -59,6 +61,7 @@ func (s *Service[K]) UpdateUsers(userList []K, passwordList []string) error {
 	s.usersMu.Lock()
 	s.users = users
 	s.keys = keys
+	s.sessions.Replace(userList)
 	s.usersMu.Unlock()
 	return nil
 }
@@ -76,6 +79,10 @@ func (s *Service[K]) NewConnection(ctx context.Context, conn net.Conn, source M.
 	user, loaded := s.keys[key]
 	s.usersMu.RUnlock()
 	if loaded {
+		conn, err = s.sessions.Wrap(user, conn)
+		if err != nil {
+			return err
+		}
 		ctx = auth.ContextWithUser(ctx, user)
 	} else {
 		return s.fallback(ctx, conn, source, key[:], E.New("bad request"), onClose)

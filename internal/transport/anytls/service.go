@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
+	"github.com/lenaanderson5566-ops/v2box/internal/authconn"
 	"net"
 	"os"
 	"sync"
@@ -22,6 +23,7 @@ import (
 )
 
 type Service struct {
+	sessions        authconn.Registry[string]
 	usersMu         sync.RWMutex
 	users           map[[32]byte]string
 	padding         atomic.TypedValue[*padding.PaddingFactory]
@@ -55,9 +57,7 @@ func NewService(config ServiceConfig) (*Service, error) {
 		return nil, os.ErrInvalid
 	}
 
-	for _, user := range config.Users {
-		service.users[sha256.Sum256([]byte(user.Password))] = user.Name
-	}
+	service.UpdateUsers(config.Users)
 
 	if !padding.UpdatePaddingScheme(config.PaddingScheme, &service.padding) {
 		return nil, errors.New("incorrect padding scheme format")
@@ -67,12 +67,15 @@ func NewService(config ServiceConfig) (*Service, error) {
 }
 
 func (s *Service) UpdateUsers(users []User) {
+	names := make([]string, 0, len(users))
 	u := make(map[[32]byte]string)
 	for _, user := range users {
 		u[sha256.Sum256([]byte(user.Password))] = user.Name
+		names = append(names, user.Name)
 	}
 	s.usersMu.Lock()
 	s.users = u
+	s.sessions.Replace(names)
 	s.usersMu.Unlock()
 }
 
@@ -117,6 +120,11 @@ func (s *Service) NewConnection(ctx context.Context, conn net.Conn, source M.Soc
 		}
 	}
 
+	conn, err = s.sessions.Wrap(user, conn)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
 	session := session.NewServerSession(conn, func(stream *session.Stream) {
 		destination, err := M.SocksaddrSerializer.ReadAddrPort(stream)
 		if err != nil {

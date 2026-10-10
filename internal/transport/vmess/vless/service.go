@@ -3,6 +3,7 @@ package vless
 import (
 	"context"
 	"encoding/binary"
+	"github.com/lenaanderson5566-ops/v2box/internal/authconn"
 	"io"
 	"net"
 	"sync"
@@ -20,6 +21,7 @@ import (
 )
 
 type Service[T comparable] struct {
+	sessions authconn.Registry[T]
 	usersMu  sync.RWMutex
 	userMap  map[[16]byte]T
 	userFlow map[T]string
@@ -53,10 +55,11 @@ func (s *Service[T]) UpdateUsers(userList []T, userUUIDList []string, userFlowLi
 	s.usersMu.Lock()
 	s.userMap = userMap
 	s.userFlow = userFlowMap
+	s.sessions.Replace(userList)
 	s.usersMu.Unlock()
 }
 
-func (s *Service[T]) NewConnection(ctx context.Context, conn net.Conn, source M.Socksaddr, onClose N.CloseHandlerFunc) error {
+func (s *Service[T]) NewConnection(ctx context.Context, conn net.Conn, source M.Socksaddr, onClose N.CloseHandlerFunc) (err error) {
 	request, err := ReadRequest(conn)
 	if err != nil {
 		return err
@@ -68,6 +71,16 @@ func (s *Service[T]) NewConnection(ctx context.Context, conn net.Conn, source M.
 	if !loaded {
 		return E.New("unknown UUID: ", uuid.FromBytesOrNil(request.UUID[:]))
 	}
+	conn, err = s.sessions.Wrap(user, conn)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err != nil {
+			_ = conn.Close()
+		}
+	}()
+
 	ctx = auth.ContextWithUser(ctx, user)
 	if request.Flow == FlowVision && request.Command == vmess.NetworkUDP {
 		return E.New(FlowVision, " flow does not support UDP")

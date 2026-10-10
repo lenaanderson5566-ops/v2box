@@ -3,6 +3,7 @@ package hysteria2
 import (
 	"context"
 	"errors"
+	"github.com/lenaanderson5566-ops/v2box/internal/authconn"
 	"io"
 	"net"
 	"net/http"
@@ -56,6 +57,7 @@ type ServerHandler interface {
 }
 
 type Service[U comparable] struct {
+	sessions              authconn.Registry[U]
 	usersMu               sync.RWMutex
 	ctx                   context.Context
 	logger                logger.Logger
@@ -156,6 +158,7 @@ func (s *Service[U]) UpdateUsers(userList []U, passwordList []string) {
 	}
 	s.usersMu.Lock()
 	s.userMap = userMap
+	s.sessions.Replace(userList)
 	s.usersMu.Unlock()
 }
 
@@ -290,6 +293,12 @@ func (s *serverSession[U]) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			s.masqueradeHandler.ServeHTTP(w, r)
 			return
 		}
+		release, ok := s.sessions.Track(user, func() { _ = s.quicConn.CloseWithError(0, "account revoked") })
+		if !ok {
+			s.masqueradeHandler.ServeHTTP(w, r)
+			return
+		}
+		context.AfterFunc(s.quicConn.Context(), release)
 		s.authUser = user
 		s.authenticated = true
 		var rxAuto bool

@@ -11,7 +11,7 @@ binary. They retain the original GPL-3.0-or-later terms. Source snapshots:
 | transport/anytls | anytls/sing-anytls v0.0.11 |
 
 License texts and upstream copyright notices are retained in `licenses/`.
-Local changes, 2026-10-10:
+Local changes, 2026-10-10–2026-10-11:
 
 - Inbounds publish stable string authentication identities rather than array
   indices, and expose typed user updates without replacing their listeners.
@@ -19,7 +19,8 @@ Local changes, 2026-10-10:
   snapshots permit concurrent handshakes without holding locks over network I/O.
 - Shadowsocks uses the upstream concurrent multi-user service even for an empty
   list; it never falls back to a single-user listener.
-- AnyTLS stream closure errors are published atomically. Its outbound adapter
+- AnyTLS stream closure errors are published atomically and close hooks support
+  installation racing with remote closure. Its outbound adapter
   uses the same patched transport, so concurrent remote closure is safe on both
   sides. Other outbounds remain supplied by official sing-box.
 - Local transport imports are rewritten to keep the patched server services
@@ -28,9 +29,11 @@ Local changes, 2026-10-10:
 The outer core assigns an authentication generation to each UID/credential pair.
 Removing or replacing an account invalidates its generation, closes its tracked
 TCP/UDP streams, and rejects new streams on old authenticated multiplex sessions.
-Unchanged identities retain their connections and accounting. QUIC/multiplex
-transport containers may remain until their normal idle timeout, but revoked
-identities cannot forward traffic. Failed validation does not publish a table.
+Unchanged identities retain their connections and accounting. `authconn` also
+tracks the underlying authenticated TCP/QUIC transport and schedules closure
+when its identity is revoked, including idle transports with no routed streams.
+Transport closure runs outside the authentication publication barrier to avoid
+blocking updates on protocol callbacks. Failed validation does not publish a table.
 
 When upgrading sing-box or its transport dependencies, compare these snapshots
 with upstream and reapply the concurrency/identity changes. Run the full race

@@ -194,7 +194,7 @@ func TestProtocolConnectionsAndAccounting(t *testing.T) {
 			}
 			b := clientBox(t, n, testUUID)
 			exchange(t, b, echo.Addr())
-			traffic, _ := v.GetUserTrafficSlice(n.Tag, 0)
+			traffic := awaitTraffic(t, v, n.Tag, int64(len("sing-box-backend-echo")*256))
 			if len(traffic) != 1 || traffic[0].UID != 42 || traffic[0].Upload != int64(len("sing-box-backend-echo")*256) || traffic[0].Download != int64(len("sing-box-backend-echo")*256) {
 				t.Fatalf("bad traffic: %+v", traffic)
 			}
@@ -208,6 +208,39 @@ func TestProtocolConnectionsAndAccounting(t *testing.T) {
 			}
 			assertDenied(t, b, echo.Addr())
 		})
+	}
+}
+
+// A client can receive a write before the server goroutine records its result.
+// Accumulate drained reports until that write completes; never assume a sleep
+// or the client's Read creates a synchronization barrier for server counters.
+func awaitTraffic(t *testing.T, v *V2Core, tag string, expected int64) []panel.UserTraffic {
+	t.Helper()
+	totals := map[int]panel.UserTraffic{}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		batch, _ := v.GetUserTrafficSlice(tag, 0)
+		for _, u := range batch {
+			old := totals[u.UID]
+			old.UID = u.UID
+			old.Upload += u.Upload
+			old.Download += u.Download
+			totals[u.UID] = old
+		}
+		var up, down int64
+		var result []panel.UserTraffic
+		for _, u := range totals {
+			up += u.Upload
+			down += u.Download
+			result = append(result, u)
+		}
+		if up >= expected && down >= expected {
+			return result
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("accounting did not complete: %+v", result)
+		}
+		time.Sleep(time.Millisecond)
 	}
 }
 func TestRejectUnsupportedConfiguration(t *testing.T) {

@@ -28,7 +28,7 @@ type Session struct {
 
 	dieOnce sync.Once
 	die     chan struct{}
-	dieHook func()
+	dieHook closeHook
 
 	synDone     func()
 	synDoneLock sync.Mutex
@@ -114,10 +114,7 @@ func (s *Session) Close() error {
 		once = true
 	})
 	if once {
-		if s.dieHook != nil {
-			s.dieHook()
-			s.dieHook = nil
-		}
+		s.dieHook.run()
 		s.streamLock.Lock()
 		for _, stream := range s.streams {
 			stream.closeLocally()

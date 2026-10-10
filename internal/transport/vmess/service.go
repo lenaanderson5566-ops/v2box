@@ -9,6 +9,7 @@ import (
 	"crypto/md5"
 	"crypto/sha256"
 	"encoding/binary"
+	"github.com/lenaanderson5566-ops/v2box/internal/authconn"
 	"hash/crc32"
 	"io"
 	"math"
@@ -44,6 +45,7 @@ var (
 )
 
 type Service[U comparable] struct {
+	sessions             authconn.Registry[U]
 	usersMu              sync.RWMutex
 	userKey              map[U][16]byte
 	userIdCipher         map[U]cipher.Block
@@ -111,6 +113,7 @@ func (s *Service[U]) UpdateUsers(userList []U, userIdList []string, alterIdList 
 	s.alterIds = userAlterIds
 	s.alterIdUpdateTime = make(map[U]int64)
 	s.generateLegacyKeys()
+	s.sessions.Replace(userList)
 	s.usersMu.Unlock()
 	return nil
 }
@@ -176,7 +179,7 @@ func (s *Service[U]) generateLegacyKeys() {
 	s.alterIdMap = userAlterIdMap
 }
 
-func (s *Service[U]) NewConnection(ctx context.Context, conn net.Conn, source M.Socksaddr, onClose N.CloseHandlerFunc) error {
+func (s *Service[U]) NewConnection(ctx context.Context, conn net.Conn, source M.Socksaddr, onClose N.CloseHandlerFunc) (err error) {
 	s.usersMu.RLock()
 	userKey := s.userKey
 	userIdCipher := s.userIdCipher
@@ -245,13 +248,22 @@ func (s *Service[U]) NewConnection(ctx context.Context, conn net.Conn, source M.
 		return ErrBadRequest
 	}
 
+	conn, err = s.sessions.Wrap(user, conn)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err != nil {
+			_ = conn.Close()
+		}
+	}()
+
 	ctx = auth.ContextWithUser(ctx, user)
 	cmdKey := userKey[user]
 	var headerReader io.Reader
 	var headerBuffer []byte
 
 	var reader io.Reader
-	var err error
 	if legacyProtocol {
 		requestBuffer.Advance(16)
 		reader = io.MultiReader(bytes.NewReader(requestBuffer.Bytes()), conn)
