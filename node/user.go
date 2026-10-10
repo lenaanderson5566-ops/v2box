@@ -4,8 +4,8 @@ import (
 	"context"
 	"errors"
 
+	panel "github.com/lenaanderson5566-ops/v2box/api/v2board"
 	log "github.com/sirupsen/logrus"
-	panel "github.com/wyx2685/v2node/api/v2board"
 )
 
 func (c *Controller) reportUserTrafficTask(ctx context.Context) (err error) {
@@ -15,10 +15,12 @@ func (c *Controller) reportUserTrafficTask(ctx context.Context) (err error) {
 		reportmin = c.info.Common.BaseConfig.NodeReportMinTraffic
 		devicemin = c.info.Common.BaseConfig.DeviceOnlineMinTraffic
 	}
+	activity := c.server.TakeOnlineActivity(c.tag)
 	userTraffic, _ := c.server.GetUserTrafficSlice(c.tag, reportmin)
 	if len(userTraffic) > 0 {
 		err = c.apiClient.ReportUserTraffic(ctx, userTraffic)
 		if err != nil {
+			c.server.RestoreUserTraffic(c.tag, userTraffic)
 			log.WithFields(log.Fields{
 				"tag": c.tag,
 				"err": err,
@@ -39,15 +41,8 @@ func (c *Controller) reportUserTrafficTask(ctx context.Context) (err error) {
 		}).Info("Get online device failed")
 	} else if len(*onlineDevice) > 0 {
 		var result []panel.OnlineUser
-		var nocountUID = make(map[int]struct{})
-		for _, traffic := range userTraffic {
-			total := traffic.Upload + traffic.Download
-			if total < int64(devicemin*1000) {
-				nocountUID[traffic.UID] = struct{}{}
-			}
-		}
 		for _, online := range *onlineDevice {
-			if _, ok := nocountUID[online.UID]; !ok {
+			if activity[online.UID] >= int64(devicemin)*1000 {
 				result = append(result, online)
 			}
 		}
@@ -59,6 +54,7 @@ func (c *Controller) reportUserTrafficTask(ctx context.Context) (err error) {
 		if len(data) != 0 {
 			err := c.apiClient.ReportNodeOnlineUsers(ctx, &data)
 			if err != nil {
+
 				log.WithFields(log.Fields{
 					"tag": c.tag,
 					"err": err,
@@ -84,7 +80,10 @@ func compareUserList(old, new []panel.UserInfo) (deleted, added, modified []pane
 		if o, ok := oldMap[u.Uuid]; !ok {
 			added = append(added, u)
 		} else {
-			if o.SpeedLimit != u.SpeedLimit || o.DeviceLimit != u.DeviceLimit {
+			if o.Id != u.Id {
+				deleted = append(deleted, o)
+				added = append(added, u)
+			} else if o.SpeedLimit != u.SpeedLimit || o.DeviceLimit != u.DeviceLimit {
 				modified = append(modified, u)
 			}
 			delete(oldMap, u.Uuid)

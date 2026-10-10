@@ -16,3 +16,8 @@ output/*
 .idea/*
 new.sh
 quick_update.sh
+
+/build_assets/
+/v2box
+/v2box.exe
+/*.test

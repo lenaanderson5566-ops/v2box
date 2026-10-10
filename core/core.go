@@ -1,130 +1,182 @@
 package core
 
 import (
+	"context"
+	"errors"
+	"fmt"
+	"sort"
 	"sync"
 
-	log "github.com/sirupsen/logrus"
-	panel "github.com/wyx2685/v2node/api/v2board"
-	"github.com/wyx2685/v2node/conf"
-	"github.com/wyx2685/v2node/core/app/dispatcher"
-	_ "github.com/wyx2685/v2node/core/distro/all"
-	"github.com/xtls/xray-core/app/proxyman"
-	"github.com/xtls/xray-core/app/stats"
-	"github.com/xtls/xray-core/common/serial"
-	"github.com/xtls/xray-core/core"
-	"github.com/xtls/xray-core/features/inbound"
-	"github.com/xtls/xray-core/features/outbound"
-	"github.com/xtls/xray-core/features/routing"
-	coreConf "github.com/xtls/xray-core/infra/conf"
-	"google.golang.org/protobuf/proto"
+	panel "github.com/lenaanderson5566-ops/v2box/api/v2board"
+	"github.com/lenaanderson5566-ops/v2box/conf"
+	box "github.com/sagernet/sing-box"
+
+	"github.com/sagernet/sing-box/option"
 )
 
+// Each panel node owns a Box. User updates rebuild only that node; accounting
+// lives outside Box so counters survive replacement and failed updates.
+type V2Core struct {
+	Config   *conf.Conf
+	ReloadCh chan struct{}
+	access   sync.Mutex
+	nodes    map[string]*nodeState
+	tracker  *trafficTracker
+	closed   bool
+}
+type nodeState struct {
+	info   *panel.NodeInfo
+	users  []panel.UserInfo
+	server *box.Box
+	cancel context.CancelFunc
+}
 type AddUsersParams struct {
 	Tag   string
 	Users []panel.UserInfo
 	*panel.NodeInfo
 }
 
-type V2Core struct {
-	Config     *conf.Conf
-	ReloadCh   chan struct{}
-	access     sync.Mutex
-	Server     *core.Instance
-	users      *UserMap
-	ihm        inbound.Manager
-	ohm        outbound.Manager
-	dispatcher *dispatcher.DefaultDispatcher
+func New(c *conf.Conf) *V2Core {
+	return &V2Core{Config: c, nodes: make(map[string]*nodeState), tracker: newTrafficTracker()}
 }
-
-type UserMap struct {
-	uidMap  map[string]int
-	mapLock sync.RWMutex
-}
-
-func New(config *conf.Conf) *V2Core {
-	core := &V2Core{
-		Config: config,
-		users: &UserMap{
-			uidMap: make(map[string]int),
-		},
-	}
-	return core
-}
-
 func (v *V2Core) Start(infos []*panel.NodeInfo) error {
-	v.access.Lock()
-	defer v.access.Unlock()
-	v.Server = getCore(v.Config, infos)
-	if err := v.Server.Start(); err != nil {
-		return err
+	for _, n := range infos {
+		if _, err := buildOptions(n, nil, v.Config); err != nil {
+			return fmt.Errorf("node %s: %w", n.Tag, err)
+		}
 	}
-	v.ihm = v.Server.GetFeature(inbound.ManagerType()).(inbound.Manager)
-	v.ohm = v.Server.GetFeature(outbound.ManagerType()).(outbound.Manager)
-	v.dispatcher = v.Server.GetFeature(routing.DispatcherType()).(*dispatcher.DefaultDispatcher)
 	return nil
 }
-
+func (v *V2Core) AddNode(tag string, info *panel.NodeInfo) error {
+	v.access.Lock()
+	defer v.access.Unlock()
+	if v.closed {
+		return errors.New("core closed")
+	}
+	if _, ok := v.nodes[tag]; ok {
+		return fmt.Errorf("duplicate node %s", tag)
+	}
+	if _, err := buildOptions(info, nil, v.Config); err != nil {
+		return err
+	}
+	v.nodes[tag] = &nodeState{info: info}
+	return nil
+}
+func (v *V2Core) newBox(options option.Options) (*box.Box, context.CancelFunc, error) {
+	ctx, cancel := context.WithCancel(boxContext(context.Background()))
+	b, err := box.New(box.Options{Context: ctx, Options: options})
+	if err != nil {
+		cancel()
+		return nil, nil, err
+	}
+	b.Router().AppendTracker(v.tracker)
+	if err = b.Start(); err != nil {
+		cancel()
+		_ = b.Close()
+		return nil, nil, err
+	}
+	return b, cancel, nil
+}
+func (v *V2Core) SetUsers(tag string, users []panel.UserInfo) error {
+	v.access.Lock()
+	defer v.access.Unlock()
+	n, ok := v.nodes[tag]
+	if !ok || v.closed {
+		return fmt.Errorf("unknown or closed node %s", tag)
+	}
+	options, err := buildOptions(n.info, users, v.Config)
+	if err != nil {
+		return err
+	}
+	oldUsers := n.users
+	v.tracker.setUsers(tag, users)
+	if n.server != nil {
+		n.cancel()
+		_ = n.server.Close()
+		n.server = nil
+	}
+	v.tracker.closeNode(tag)
+	// An empty panel user list disables the listener, never anonymous access.
+	if len(users) == 0 {
+		n.users = nil
+		return nil
+	}
+	b, cancel, err := v.newBox(options)
+	if err != nil {
+		v.tracker.setUsers(tag, oldUsers)
+		if len(oldUsers) > 0 {
+			previous, buildErr := buildOptions(n.info, oldUsers, v.Config)
+			if buildErr == nil {
+				n.server, n.cancel, buildErr = v.newBox(previous)
+			}
+			if buildErr != nil {
+				return errors.Join(err, fmt.Errorf("rollback failed: %w", buildErr))
+			}
+		}
+		return err
+	}
+	n.server, n.cancel, n.users = b, cancel, append([]panel.UserInfo(nil), users...)
+	return nil
+}
+func (v *V2Core) AddUsers(p *AddUsersParams) (int, error) {
+	err := v.SetUsers(p.Tag, p.Users)
+	if err != nil {
+		return 0, err
+	}
+	return len(p.Users), nil
+}
+func (v *V2Core) DelNode(tag string) error {
+	v.access.Lock()
+	defer v.access.Unlock()
+	n, ok := v.nodes[tag]
+	if !ok {
+		return nil
+	}
+	delete(v.nodes, tag)
+	v.tracker.setUsers(tag, nil)
+	if n.cancel != nil {
+		n.cancel()
+	}
+	v.tracker.closeNode(tag)
+	if n.server != nil {
+		n.cancel()
+		return n.server.Close()
+	}
+	return nil
+}
 func (v *V2Core) Close() error {
 	v.access.Lock()
 	defer v.access.Unlock()
-	v.Config = nil
-	v.ihm = nil
-	v.ohm = nil
-	v.dispatcher = nil
-	err := v.Server.Close()
-	if err != nil {
-		return err
+	v.closed = true
+	var errs []error
+	for tag, n := range v.nodes {
+		v.tracker.setUsers(tag, nil)
+		if n.cancel != nil {
+			n.cancel()
+		}
+		v.tracker.closeNode(tag)
+		if n.server != nil {
+			n.cancel()
+			errs = append(errs, n.server.Close())
+		}
 	}
-	return nil
+	v.nodes = make(map[string]*nodeState)
+	return errors.Join(errs...)
+}
+func (v *V2Core) GetUserTrafficSlice(tag string, minTraffic int) ([]panel.UserTraffic, error) {
+	return v.tracker.takeTraffic(tag, minTraffic), nil
+}
+func (v *V2Core) RestoreUserTraffic(tag string, traffic []panel.UserTraffic) {
+	v.tracker.restoreTraffic(tag, traffic)
+}
+func sortedUsers(users []panel.UserInfo) []panel.UserInfo {
+	result := append([]panel.UserInfo(nil), users...)
+	sort.Slice(result, func(i, j int) bool { return result[i].Id < result[j].Id })
+	return result
 }
 
-func getCore(c *conf.Conf, infos []*panel.NodeInfo) *core.Instance {
-	// Log Config
-	coreLogConfig := &coreConf.LogConfig{
-		LogLevel:  c.LogConfig.Level,
-		AccessLog: c.LogConfig.Access,
-		ErrorLog:  c.LogConfig.Output,
-	}
-	// Custom config
-	dnsConfig, outBoundConfig, routeConfig, err := GetCustomConfig(infos)
-	if err != nil {
-		log.WithField("err", err).Panic("failed to build custom config")
-	}
-	// Inbound config
-	var inBoundConfig []*core.InboundHandlerConfig
+func (v *V2Core) TakeOnlineActivity(tag string) map[int]int64 { return v.tracker.takeActivity(tag) }
 
-	// Policy config
-	levelPolicyConfig := &coreConf.Policy{
-		StatsUserUplink:   true,
-		StatsUserDownlink: true,
-		Handshake:         proto.Uint32(4),
-		ConnectionIdle:    proto.Uint32(120),
-		UplinkOnly:        proto.Uint32(2),
-		DownlinkOnly:      proto.Uint32(4),
-		BufferSize:        proto.Int32(128),
-	}
-	corePolicyConfig := &coreConf.PolicyConfig{}
-	corePolicyConfig.Levels = map[uint32]*coreConf.Policy{0: levelPolicyConfig}
-	policyConfig, _ := corePolicyConfig.Build()
-	// Build Xray conf
-	config := &core.Config{
-		App: []*serial.TypedMessage{
-			serial.ToTypedMessage(coreLogConfig.Build()),
-			serial.ToTypedMessage(&dispatcher.Config{}),
-			serial.ToTypedMessage(&stats.Config{}),
-			serial.ToTypedMessage(&proxyman.InboundConfig{}),
-			serial.ToTypedMessage(&proxyman.OutboundConfig{}),
-			serial.ToTypedMessage(policyConfig),
-			serial.ToTypedMessage(dnsConfig),
-			serial.ToTypedMessage(routeConfig),
-		},
-		Inbound:  inBoundConfig,
-		Outbound: outBoundConfig,
-	}
-	server, err := core.New(config)
-	if err != nil {
-		log.WithField("err", err).Panic("failed to create instance")
-	}
-	log.Info("Xray Core Version: ", core.Version())
-	return server
-}
+// PreserveAccountingFrom is used only after old.Close has stopped its nodes.
+// Failed final reports for retained node tags can then retry after a reload.
+func (v *V2Core) PreserveAccountingFrom(old *V2Core) { v.tracker = old.tracker }

@@ -52,7 +52,10 @@ func (c *Client) GetUserList(ctx context.Context) ([]UserInfo, error) {
 	if r.StatusCode() == 304 {
 		return nil, nil
 	}
-	userlist := &UserListBody{}
+	if r.StatusCode() < 200 || r.StatusCode() >= 300 {
+		return nil, fmt.Errorf("user API returned HTTP %d", r.StatusCode())
+	}
+	userlist := &UserListBody{Users: make([]UserInfo, 0)}
 	if strings.Contains(r.Header().Get("Content-Type"), "application/x-msgpack") {
 		decoder := msgpack.NewDecoder(r.RawResponse.Body)
 		if err := decoder.Decode(userlist); err != nil {
@@ -87,6 +90,17 @@ func (c *Client) GetUserList(ctx context.Context) ([]UserInfo, error) {
 			}
 			userlist.Users = append(userlist.Users, u)
 		}
+	}
+	ids, uuids := map[int]bool{}, map[string]bool{}
+	for _, u := range userlist.Users {
+		if u.Id <= 0 || u.Uuid == "" || u.SpeedLimit < 0 || u.DeviceLimit < 0 || ids[u.Id] || uuids[u.Uuid] {
+			return nil, fmt.Errorf("invalid or duplicate panel user %d", u.Id)
+		}
+		ids[u.Id] = true
+		uuids[u.Uuid] = true
+	}
+	if userlist.Users == nil {
+		userlist.Users = make([]UserInfo, 0)
 	}
 	c.userEtag = r.Header().Get("ETag")
 	return userlist.Users, nil
@@ -133,20 +147,23 @@ func (c *Client) ReportUserTraffic(ctx context.Context, userTraffic []UserTraffi
 		data[userTraffic[i].UID] = []int64{userTraffic[i].Upload, userTraffic[i].Download}
 	}
 	const path = "/api/v1/server/UniProxy/push"
-	_, err := c.client.R().
+	r, err := c.client.R().
 		SetContext(ctx).
 		SetBody(data).
 		ForceContentType("application/json").
 		Post(path)
 	if err != nil {
 		return err
+	}
+	if r == nil || r.StatusCode() < 200 || r.StatusCode() >= 300 {
+		return fmt.Errorf("panel report rejected")
 	}
 	return nil
 }
 
 func (c *Client) ReportNodeOnlineUsers(ctx context.Context, data *map[int][]string) error {
 	const path = "/api/v1/server/UniProxy/alive"
-	_, err := c.client.R().
+	r, err := c.client.R().
 		SetContext(ctx).
 		SetBody(data).
 		ForceContentType("application/json").
@@ -156,5 +173,10 @@ func (c *Client) ReportNodeOnlineUsers(ctx context.Context, data *map[int][]stri
 		return err
 	}
 
+	if r == nil || r.StatusCode() < 200 || r.StatusCode() >= 300 {
+		return fmt.Errorf("panel report rejected")
+	}
 	return nil
 }
+
+func (c *Client) InvalidateUserCache() { c.userEtag = "" }

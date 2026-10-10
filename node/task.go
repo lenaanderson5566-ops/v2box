@@ -5,10 +5,9 @@ import (
 	"errors"
 	"time"
 
+	panel "github.com/lenaanderson5566-ops/v2box/api/v2board"
+	"github.com/lenaanderson5566-ops/v2box/common/task"
 	log "github.com/sirupsen/logrus"
-	panel "github.com/wyx2685/v2node/api/v2board"
-	"github.com/wyx2685/v2node/common/task"
-	vCore "github.com/wyx2685/v2node/core"
 )
 
 func (c *Controller) startTasks(node *panel.NodeInfo) {
@@ -73,6 +72,7 @@ func (c *Controller) nodeInfoMonitor(ctx context.Context) (err error) {
 		} else {
 			log.Panic("Reload failed")
 		}
+		return nil
 	}
 	log.WithField("tag", c.tag).Debug("Node info no change")
 
@@ -103,43 +103,25 @@ func (c *Controller) nodeInfoMonitor(ctx context.Context) (err error) {
 
 	// update alive list
 	if newA != nil {
-		c.limiter.AliveList = newA
+		c.limiter.SetAlive(newA)
 	}
 	// node no changed, check users
-	if len(newU) == 0 {
+	if newU == nil {
 		log.WithField("tag", c.tag).Debug("User list no change")
 		return nil
 	}
 	deleted, added, modified := compareUserList(c.userList, newU)
-	if len(deleted) > 0 {
-		// have deleted users
-		err = c.server.DelUsers(deleted, c.tag, c.info)
-		if err != nil {
-			log.WithFields(log.Fields{
-				"tag": c.tag,
-				"err": err,
-			}).Error("Delete users failed")
-			return nil
-		}
-	}
-	if len(added) > 0 {
-		// have added users
-		_, err = c.server.AddUsers(&vCore.AddUsersParams{
-			Tag:      c.tag,
-			NodeInfo: c.info,
-			Users:    added,
-		})
-		if err != nil {
-			log.WithFields(log.Fields{
-				"tag": c.tag,
-				"err": err,
-			}).Error("Add users failed")
-			return nil
-		}
-	}
-	if len(added) > 0 || len(deleted) > 0 || len(modified) > 0 {
-		// update Limiter
+	if len(added) > 0 || len(deleted) > 0 {
+		// Install limits before accepting new users; restore them on replacement failure.
 		c.limiter.UpdateUser(c.tag, added, deleted, modified)
+		if err = c.server.SetUsers(c.tag, newU); err != nil {
+			c.limiter.UpdateUser(c.tag, c.userList, added, nil)
+			c.apiClient.InvalidateUserCache()
+			log.WithField("tag", c.tag).WithError(err).Error("Replace node users failed")
+			return nil
+		}
+	} else if len(modified) > 0 {
+		c.limiter.UpdateUser(c.tag, nil, nil, modified)
 	}
 	c.userList = newU
 	log.WithField("tag", c.tag).Infof("%d user deleted, %d user added, %d user modified", len(deleted), len(added), len(modified))

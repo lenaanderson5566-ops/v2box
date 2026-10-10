@@ -1,0 +1,1 @@
+{"Log":{"Level":"info","Output":"","Access":"none"},"Nodes":[{"ApiHost":"https://panel.example.com","NodeID":1,"ApiKey":"REPLACE_ME","Timeout":15,"RetryCount":1}]}

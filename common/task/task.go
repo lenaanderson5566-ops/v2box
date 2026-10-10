@@ -2,99 +2,63 @@ package task
 
 import (
 	"context"
-	"errors"
+	log "github.com/sirupsen/logrus"
 	"sync"
 	"time"
-
-	log "github.com/sirupsen/logrus"
 )
 
+// Execute is synchronous within a task: timeout cancellation never starts an
+// overlapping invocation. Close waits for the active callback before teardown.
 type Task struct {
 	Name     string
 	Interval time.Duration
 	Execute  func(context.Context) error
-	Access   sync.RWMutex
-	Running  bool
 	ReloadCh chan struct{}
-	Stop     chan struct{}
+	mu       sync.Mutex
+	cancel   context.CancelFunc
+	done     chan struct{}
 }
 
 func (t *Task) Start(first bool) error {
-	t.Access.Lock()
-	if t.Running {
-		t.Access.Unlock()
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.cancel != nil {
 		return nil
 	}
-	t.Running = true
-	t.Stop = make(chan struct{})
-	t.Access.Unlock()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.cancel = cancel
+	t.done = make(chan struct{})
 	go func() {
-		timer := time.NewTimer(t.Interval)
-		defer timer.Stop()
+		defer close(t.done)
 		if first {
-			if err := t.ExecuteWithTimeout(); err != nil {
-				return
-			}
+			t.execute(ctx)
 		}
-
+		ticker := time.NewTicker(t.Interval)
+		defer ticker.Stop()
 		for {
-			timer.Reset(t.Interval)
 			select {
-			case <-timer.C:
-				// continue
-			case <-t.Stop:
+			case <-ctx.Done():
 				return
-			}
-
-			if err := t.ExecuteWithTimeout(); err != nil {
-				log.Errorf("Task %s execution error: %v", t.Name, err)
-				return
+			case <-ticker.C:
+				t.execute(ctx)
 			}
 		}
 	}()
-
 	return nil
 }
-
-func (t *Task) ExecuteWithTimeout() error {
-	ctx, cancel := context.WithTimeout(context.Background(), min(5*t.Interval, 5*time.Minute))
+func (t *Task) execute(parent context.Context) {
+	ctx, cancel := context.WithTimeout(parent, min(5*t.Interval, 5*time.Minute))
 	defer cancel()
-	done := make(chan error, 1)
-
-	go func() {
-		done <- t.Execute(ctx)
-	}()
-
-	select {
-	case <-ctx.Done():
-		log.Errorf("Task %s execution timed out, reloading", t.Name)
-		if t.ReloadCh != nil {
-			select {
-			case t.ReloadCh <- struct{}{}:
-			default:
-			}
-		} else {
-			log.Panic("Reload failed")
-		}
-		return nil
-	case err := <-done:
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			return nil
-		}
-		return err
+	if err := t.Execute(ctx); err != nil && parent.Err() == nil {
+		log.WithError(err).Warnf("Task %s failed", t.Name)
 	}
 }
-
-func (t *Task) safeStop() {
-	t.Access.Lock()
-	if t.Running {
-		t.Running = false
-		close(t.Stop)
-	}
-	t.Access.Unlock()
-}
-
 func (t *Task) Close() {
-	t.safeStop()
-	log.Warningf("Task %s stopped", t.Name)
+	t.mu.Lock()
+	cancel, done := t.cancel, t.done
+	t.mu.Unlock()
+	if cancel != nil {
+		cancel()
+		<-done
+	}
 }
