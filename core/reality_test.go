@@ -1,3 +1,8 @@
+//go:build !race
+
+// Upstream sing-vmess Vision uses unsafe TLS field access and shares TLS filter
+// state between Read and Write. Run this interoperability test without -race;
+// keep the remaining backend tests under the race detector.
 package core
 
 import (

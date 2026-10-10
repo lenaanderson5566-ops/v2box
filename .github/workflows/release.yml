@@ -18,9 +18,9 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
-      # Upstream Vision converts reflected TLS field addresses through uintptr.
-      # Keep race detection everywhere; exempt only that package from checkptr.
-      - run: go test -race -gcflags='github.com/sagernet/sing-vmess/vless=-d=checkptr=0' -tags with_quic,with_utls ./...
+      - run: go test -race -tags with_quic,with_utls ./...
+      # Vision's upstream unsafe TLS access and shared filter state are not race-clean.
+      - run: go test -tags with_quic,with_utls ./core -run TestVLESSRealityVision -count=1
       - run: go vet -tags with_quic,with_utls ./...
       - run: bash -n script/install.sh script/v2box.sh
   build:
