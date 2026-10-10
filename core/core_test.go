@@ -21,6 +21,7 @@ import (
 	"io"
 	"math/big"
 	"net"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -29,13 +30,27 @@ const testUUID = "b831381d-6324-4d53-ad4f-8cda48b30811"
 
 func testNode(t *testing.T, protocol string) *panel.NodeInfo {
 	t.Helper()
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
+	// A free TCP port can still be reserved for UDP on Windows. Probe both.
+	for attempt := 0; attempt < 64; attempt++ {
+		candidate, err := rand.Int(rand.Reader, big.NewInt(35000))
+		if err != nil {
+			t.Fatal(err)
+		}
+		port := 10000 + int(candidate.Int64())
+		u, err := net.ListenPacket("udp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
+		if err != nil {
+			continue
+		}
+		l, err := net.Listen("tcp", u.LocalAddr().String())
+		_ = u.Close()
+		if err != nil {
+			continue
+		}
+		_ = l.Close()
+		return &panel.NodeInfo{Tag: protocol, Type: protocol, Common: &panel.CommonNode{ListenIP: "127.0.0.1", ServerPort: port, Network: "tcp"}}
 	}
-	port := l.Addr().(*net.TCPAddr).Port
-	_ = l.Close()
-	return &panel.NodeInfo{Tag: protocol, Type: protocol, Common: &panel.CommonNode{ListenIP: "127.0.0.1", ServerPort: port, Network: "tcp"}}
+	t.Fatal("unable to allocate a free TCP/UDP test port")
+	return nil
 }
 func testCertificate(t *testing.T) *panel.CertInfo {
 	t.Helper()
@@ -191,9 +206,7 @@ func TestProtocolConnectionsAndAccounting(t *testing.T) {
 			if err := v.SetUsers(n.Tag, nil); err != nil {
 				t.Fatal(err)
 			}
-			if v.nodes[n.Tag].server != nil {
-				t.Fatal("empty users must stop listener")
-			}
+			assertDenied(t, b, echo.Addr())
 		})
 	}
 }

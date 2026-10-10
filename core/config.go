@@ -67,6 +67,7 @@ func buildInbound(n *panel.NodeInfo, users []panel.UserInfo) (object, error) {
 	list := []object{}
 	ids := map[int]bool{}
 	uuids := map[string]bool{}
+	credentials := map[string]bool{}
 	for _, u := range sortedUsers(users) {
 		if u.Id <= 0 || u.Uuid == "" || ids[u.Id] || uuids[u.Uuid] || u.SpeedLimit < 0 || u.DeviceLimit < 0 {
 			return nil, fmt.Errorf("invalid or duplicate user %d", u.Id)
@@ -105,6 +106,17 @@ func buildInbound(n *panel.NodeInfo, users []panel.UserInfo) (object, error) {
 			return nil, fmt.Errorf("unsupported protocol %q", n.Type)
 		}
 		list = append(list, user)
+		credential := u.Uuid
+		if n.Type == "vmess" || n.Type == "vless" || n.Type == "tuic" {
+			credential = strings.ToLower(credential)
+		}
+		if n.Type == "shadowsocks" {
+			credential = user["password"].(string)
+		}
+		if credentials[credential] {
+			return nil, fmt.Errorf("duplicate effective credential for user %d", u.Id)
+		}
+		credentials[credential] = true
 	}
 	in["users"] = list
 	switch n.Type {

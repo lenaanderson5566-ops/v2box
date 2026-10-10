@@ -14,21 +14,23 @@ import (
 	"github.com/sagernet/sing-box/option"
 )
 
-// Each panel node owns a Box. User updates rebuild only that node; accounting
-// lives outside Box so counters survive replacement and failed updates.
+// Each panel node owns a Box. Authentication updates preserve its listeners
+// and unaffected sessions; accounting lives independently of the Box.
 type V2Core struct {
-	Config   *conf.Conf
-	ReloadCh chan struct{}
-	access   sync.Mutex
-	nodes    map[string]*nodeState
-	tracker  *trafficTracker
-	closed   bool
+	Config     *conf.Conf
+	ReloadCh   chan struct{}
+	access     sync.Mutex
+	nodes      map[string]*nodeState
+	tracker    *trafficTracker
+	closed     bool
+	generation uint64
 }
 type nodeState struct {
-	info   *panel.NodeInfo
-	users  []panel.UserInfo
-	server *box.Box
-	cancel context.CancelFunc
+	info       *panel.NodeInfo
+	users      []panel.UserInfo
+	server     *box.Box
+	cancel     context.CancelFunc
+	identities map[string]panel.UserInfo
 }
 type AddUsersParams struct {
 	Tag   string
@@ -78,6 +80,12 @@ func (v *V2Core) newBox(options option.Options) (*box.Box, context.CancelFunc, e
 	return b, cancel, nil
 }
 func (v *V2Core) SetUsers(tag string, users []panel.UserInfo) error {
+	return v.SetUsersWithCommit(tag, users, nil)
+}
+
+// commit updates controller limits only after authentication validation succeeds.
+// It runs before new streams are admitted and must not call back into the core.
+func (v *V2Core) SetUsersWithCommit(tag string, users []panel.UserInfo, commit func()) error {
 	v.access.Lock()
 	defer v.access.Unlock()
 	n, ok := v.nodes[tag]
@@ -88,34 +96,42 @@ func (v *V2Core) SetUsers(tag string, users []panel.UserInfo) error {
 	if err != nil {
 		return err
 	}
-	oldUsers := n.users
-	v.tracker.setUsers(tag, users)
+	identities := v.identities(n, users)
+	nameUsers(options.Inbounds[0].Options, identities)
 	if n.server != nil {
-		n.cancel()
-		_ = n.server.Close()
-		n.server = nil
-	}
-	v.tracker.closeNode(tag)
-	// An empty panel user list disables the listener, never anonymous access.
-	if len(users) == 0 {
-		n.users = nil
+		in, found := n.server.Inbound().Get(tag)
+		if !found {
+			return fmt.Errorf("missing inbound %s", tag)
+		}
+		if err = v.tracker.updateUsers(tag, identities, func() error {
+			if e := updateInboundUsers(in, options.Inbounds[0].Options); e != nil {
+				return e
+			}
+			if commit != nil {
+				commit()
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+		n.users, n.identities = append([]panel.UserInfo(nil), users...), identities
 		return nil
+	}
+	// Keep an empty authentication table, including for Shadowsocks. An empty
+	// list never selects the upstream single-user/anonymous inbound variant.
+	if err = v.tracker.updateUsers(tag, identities, func() error { return nil }); err != nil {
+		return err
 	}
 	b, cancel, err := v.newBox(options)
 	if err != nil {
-		v.tracker.setUsers(tag, oldUsers)
-		if len(oldUsers) > 0 {
-			previous, buildErr := buildOptions(n.info, oldUsers, v.Config)
-			if buildErr == nil {
-				n.server, n.cancel, buildErr = v.newBox(previous)
-			}
-			if buildErr != nil {
-				return errors.Join(err, fmt.Errorf("rollback failed: %w", buildErr))
-			}
-		}
+		_ = v.tracker.updateUsers(tag, n.identities, func() error { return nil })
 		return err
 	}
 	n.server, n.cancel, n.users = b, cancel, append([]panel.UserInfo(nil), users...)
+	n.identities = identities
+	if commit != nil {
+		commit()
+	}
 	return nil
 }
 func (v *V2Core) AddUsers(p *AddUsersParams) (int, error) {

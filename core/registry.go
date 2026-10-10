@@ -2,6 +2,13 @@ package core
 
 import (
 	"context"
+	hotanytls "github.com/lenaanderson5566-ops/v2box/internal/inbound/anytls"
+	hothysteria2 "github.com/lenaanderson5566-ops/v2box/internal/inbound/hysteria2"
+	hotshadowsocks "github.com/lenaanderson5566-ops/v2box/internal/inbound/shadowsocks"
+	hottrojan "github.com/lenaanderson5566-ops/v2box/internal/inbound/trojan"
+	hottuic "github.com/lenaanderson5566-ops/v2box/internal/inbound/tuic"
+	hotvless "github.com/lenaanderson5566-ops/v2box/internal/inbound/vless"
+	hotvmess "github.com/lenaanderson5566-ops/v2box/internal/inbound/vmess"
 	box "github.com/sagernet/sing-box"
 	"github.com/sagernet/sing-box/adapter/certificate"
 	"github.com/sagernet/sing-box/adapter/endpoint"
@@ -11,7 +18,6 @@ import (
 	"github.com/sagernet/sing-box/dns"
 	"github.com/sagernet/sing-box/dns/transport"
 	"github.com/sagernet/sing-box/dns/transport/local"
-	"github.com/sagernet/sing-box/protocol/anytls"
 	"github.com/sagernet/sing-box/protocol/direct"
 	"github.com/sagernet/sing-box/protocol/http"
 	"github.com/sagernet/sing-box/protocol/hysteria2"
@@ -29,13 +35,13 @@ func boxContext(ctx context.Context) context.Context {
 	in := inbound.NewRegistry()
 	out := outbound.NewRegistry()
 	d := dns.NewTransportRegistry()
-	vmess.RegisterInbound(in)
-	vless.RegisterInbound(in)
-	trojan.RegisterInbound(in)
-	shadowsocks.RegisterInbound(in)
-	hysteria2.RegisterInbound(in)
-	tuic.RegisterInbound(in)
-	anytls.RegisterInbound(in)
+	hotvmess.RegisterInbound(in)
+	hotvless.RegisterInbound(in)
+	hottrojan.RegisterInbound(in)
+	hotshadowsocks.RegisterInbound(in)
+	hothysteria2.RegisterInbound(in)
+	hottuic.RegisterInbound(in)
+	hotanytls.RegisterInbound(in)
 	direct.RegisterOutbound(out)
 	socks.RegisterOutbound(out)
 	http.RegisterOutbound(out)
@@ -45,7 +51,7 @@ func boxContext(ctx context.Context) context.Context {
 	shadowsocks.RegisterOutbound(out)
 	hysteria2.RegisterOutbound(out)
 	tuic.RegisterOutbound(out)
-	anytls.RegisterOutbound(out)
+	hotanytls.RegisterOutbound(out)
 	local.RegisterTransport(d)
 	transport.RegisterUDP(d)
 	transport.RegisterTCP(d)

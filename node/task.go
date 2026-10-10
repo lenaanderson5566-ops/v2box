@@ -112,12 +112,11 @@ func (c *Controller) nodeInfoMonitor(ctx context.Context) (err error) {
 	}
 	deleted, added, modified := compareUserList(c.userList, newU)
 	if len(added) > 0 || len(deleted) > 0 {
-		// Install limits before accepting new users; restore them on replacement failure.
-		c.limiter.UpdateUser(c.tag, added, deleted, modified)
-		if err = c.server.SetUsers(c.tag, newU); err != nil {
-			c.limiter.UpdateUser(c.tag, c.userList, added, nil)
+		// Publish limits with the validated authentication table. Failed updates
+		// must not briefly revoke current users or discard their limiter state.
+		if err = c.server.SetUsersWithCommit(c.tag, newU, func() { c.limiter.UpdateUser(c.tag, added, deleted, modified) }); err != nil {
 			c.apiClient.InvalidateUserCache()
-			log.WithField("tag", c.tag).WithError(err).Error("Replace node users failed")
+			log.WithField("tag", c.tag).WithError(err).Error("Update node users failed")
 			return nil
 		}
 	} else if len(modified) > 0 {
