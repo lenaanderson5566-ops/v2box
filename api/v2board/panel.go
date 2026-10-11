@@ -15,6 +15,8 @@ import (
 // Panel is the interface for different panel's api.
 
 type Client struct {
+	v10              bool
+	landingPage      conf.LandingPage
 	client           *resty.Client
 	APIHost          string
 	Token            string
@@ -55,18 +57,35 @@ func New(c *conf.NodeConfig) (*Client, error) {
 		}
 	})
 	client.SetBaseURL(c.APIHost)
-	// set params
-	client.SetQueryParams(map[string]string{
-		"node_type": nodeType,
-		"node_id":   strconv.Itoa(c.NodeID),
-		"token":     c.Key,
-	})
+	version := c.APIVersion
+	if version == "" {
+		if nodeType == "v2box" {
+			version = "v10"
+		} else {
+			version = "legacy"
+		}
+	}
+	if version != "legacy" && version != "v10" {
+		return nil, fmt.Errorf("invalid ApiVersion %q", version)
+	}
+	if version == "v10" && nodeType != "v2box" {
+		return nil, fmt.Errorf("V10 requires NodeType v2box")
+	}
+	if version == "v10" {
+		client.SetAuthToken(c.Key)
+		client.SetHeader("X-V2Box-Capabilities", "native-routing-v1,dns-v1,outbounds-v1")
+	} else {
+		client.SetQueryParams(map[string]string{"node_type": nodeType, "node_id": strconv.Itoa(c.NodeID), "token": c.Key})
+	}
+
 	return &Client{
-		client:   client,
-		Token:    c.Key,
-		APIHost:  c.APIHost,
-		NodeId:   c.NodeID,
-		UserList: &UserListBody{},
-		AliveMap: &AliveMap{},
+		v10:         version == "v10",
+		landingPage: c.LandingPage,
+		client:      client,
+		Token:       c.Key,
+		APIHost:     c.APIHost,
+		NodeId:      c.NodeID,
+		UserList:    &UserListBody{},
+		AliveMap:    &AliveMap{},
 	}, nil
 }

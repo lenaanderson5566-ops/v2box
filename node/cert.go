@@ -17,16 +17,29 @@ import (
 )
 
 func (c *Controller) renewCertTask(_ context.Context) error {
-	l, err := NewLego(c.info.Common.CertInfo)
+	cert := c.info.Common.CertInfo
+	pem, err := os.ReadFile(cert.CertFile)
 	if err != nil {
-		log.WithField("tag", c.tag).Info("new lego error: ", err)
+		return err
+	}
+	due, err := (&Lego{}).CheckCert(pem)
+	if err != nil {
+		return err
+	}
+	if !due {
 		return nil
 	}
-	err = l.RenewCert()
+	err = guardedACME(cert, func() error {
+		l, err := NewLego(cert)
+		if err != nil {
+			return err
+		}
+		return l.RenewCert()
+	})
 	if err != nil {
-		log.WithField("tag", c.tag).Info("renew cert error: ", err)
-		return nil
+		log.WithField("tag", c.tag).WithError(err).Warn("Certificate renewal paused or failed; existing certificate retained")
 	}
+
 	return nil
 }
 
@@ -45,14 +58,16 @@ func (c *Controller) requestCert() error {
 		if file.IsExist(cert.CertFile) && file.IsExist(cert.KeyFile) {
 			return nil
 		}
-		l, err := NewLego(cert)
-		if err != nil {
-			return fmt.Errorf("create lego object error: %s", err)
+		if err := guardedACME(cert, func() error {
+			l, err := NewLego(cert)
+			if err != nil {
+				return err
+			}
+			return l.CreateCert()
+		}); err != nil {
+			return err
 		}
-		err = l.CreateCert()
-		if err != nil {
-			return fmt.Errorf("create lego cert error: %s", err)
-		}
+
 	case "self":
 		if cert.CertFile == "" || cert.KeyFile == "" {
 			return fmt.Errorf("cert file path or key file path not exist")

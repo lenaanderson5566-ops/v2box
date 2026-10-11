@@ -59,3 +59,15 @@ func (n *Node) Close() error {
 	n.controllers = nil
 	return nil
 }
+
+// PrepareCertificates runs before live nodes are stopped during a reload.
+func (n *Node) PrepareCertificates() error {
+	for _, c := range n.controllers {
+		if c.info.Security == panel.Tls {
+			if err := c.requestCert(); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}

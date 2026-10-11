@@ -100,13 +100,13 @@ func (l *Limiter) CheckLimit(user, ip string, _ bool) (*rate.DynamicBucket, bool
 		l.online[user] = map[string]time.Time{}
 	}
 	ips := l.online[user]
-	for addr, last := range ips {
-		if now.Sub(last) > 2*time.Minute {
-			delete(ips, addr)
+	// Established devices are the packet hot path. Scan for expiry only when
+	// admitting a new/expired device; reports also collect inactive user state.
+	if last, known := ips[ip]; !known || now.Sub(last) > 2*time.Minute {
+		pruneIPs(ips, now)
+		if u.DeviceLimit > 0 && max(len(ips), l.alive[u.UID]) >= u.DeviceLimit {
+			return nil, true
 		}
-	}
-	if _, known := ips[ip]; !known && u.DeviceLimit > 0 && max(len(ips), l.alive[u.UID]) >= u.DeviceLimit {
-		return nil, true
 	}
 	ips[ip] = now
 	if l.observed[user] == nil {
@@ -144,5 +144,20 @@ func (l *Limiter) GetOnlineDevice() (*[]panel.OnlineUser, error) {
 		}
 	}
 	l.observed = map[string]map[string]bool{}
+	now := time.Now()
+	for user, ips := range l.online {
+		pruneIPs(ips, now)
+		if len(ips) == 0 {
+			delete(l.online, user)
+		}
+	}
 	return &out, nil
+}
+
+func pruneIPs(ips map[string]time.Time, now time.Time) {
+	for ip, last := range ips {
+		if now.Sub(last) > 2*time.Minute {
+			delete(ips, ip)
+		}
+	}
 }

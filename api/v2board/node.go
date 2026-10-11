@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"encoding/json"
+	"github.com/lenaanderson5566-ops/v2box/conf"
 )
 
 // Security type
@@ -32,11 +33,13 @@ type NodeInfo struct {
 }
 
 type CommonNode struct {
-	Protocol   string      `json:"protocol"`
-	ListenIP   string      `json:"listen_ip"`
-	ServerPort int         `json:"server_port"`
-	Routes     []Route     `json:"routes"`
-	BaseConfig *BaseConfig `json:"base_config"`
+	SingBox     json.RawMessage  `json:"sing_box"`
+	LandingPage conf.LandingPage `json:"-"`
+	Protocol    string           `json:"protocol"`
+	ListenIP    string           `json:"listen_ip"`
+	ServerPort  int              `json:"server_port"`
+	Routes      []Route          `json:"routes"`
+	BaseConfig  *BaseConfig      `json:"base_config"`
 	//vless vmess trojan
 	Tls                  int         `json:"tls"`
 	TlsSettings          TlsSettings `json:"tls_settings"`
@@ -119,7 +122,13 @@ type EncSettings struct {
 }
 
 func (c *Client) GetNodeInfo(ctx context.Context) (node *NodeInfo, err error) {
-	const path = "/api/v2/server/config"
+	path := "/api/v2/server/config"
+	if c.v10 {
+		if err := c.announceCapabilities(ctx); err != nil {
+			return nil, err
+		}
+		path = c.nodePath("configuration")
+	}
 	r, err := c.client.
 		R().
 		SetContext(ctx).
@@ -159,12 +168,16 @@ func (c *Client) GetNodeInfo(ctx context.Context) (node *NodeInfo, err error) {
 	}
 	// parse protocol params
 	cm := &CommonNode{}
-	err = json.Unmarshal(r.Body(), cm)
+	if c.v10 {
+		err = decodeV10Config(r.Body(), cm)
+	} else {
+		err = json.Unmarshal(r.Body(), cm)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("decode node params error: %s", err)
 	}
 	switch cm.Protocol {
-	case "vmess", "trojan", "hysteria2", "tuic", "anytls", "vless":
+	case "naive", "vmess", "trojan", "hysteria2", "tuic", "anytls", "vless":
 		node.Type = cm.Protocol
 		node.Security = cm.Tls
 	case "shadowsocks":
@@ -216,6 +229,7 @@ func (c *Client) GetNodeInfo(ctx context.Context) (node *NodeInfo, err error) {
 		return nil, fmt.Errorf("invalid panel intervals")
 	}
 	node.Common = cm
+	cm.LandingPage = c.landingPage
 	c.responseBodyHash = newBodyHash
 	c.nodeEtag = r.Header().Get("ETag")
 

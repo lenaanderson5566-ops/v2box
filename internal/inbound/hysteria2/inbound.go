@@ -10,6 +10,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/lenaanderson5566-ops/v2box/internal/landing"
 	"github.com/lenaanderson5566-ops/v2box/internal/transport/quic/hysteria2"
 	"github.com/lenaanderson5566-ops/v2box/internal/transport/quic/hysteria2/realm"
 	"github.com/sagernet/sing-box/adapter"
@@ -75,11 +76,10 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		switch options.Masquerade.Type {
 		case C.Hysterai2MasqueradeTypeFile:
 			masqueradeDirectory := filemanager.BasePath(ctx, os.ExpandEnv(options.Masquerade.FileOptions.Directory))
-			_, err = filemanager.ReadDir(ctx, masqueradeDirectory)
-			if err != nil && !os.IsNotExist(err) {
+			masqueradeHandler, err = landing.New(masqueradeDirectory)
+			if err != nil {
 				return nil, E.Cause(err, "read masquerade directory")
 			}
-			masqueradeHandler = http.FileServer(http.Dir(masqueradeDirectory))
 		case C.Hysterai2MasqueradeTypeProxy:
 			masqueradeURL, err := url.Parse(options.Masquerade.ProxyOptions.URL)
 			if err != nil {
@@ -98,13 +98,16 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 			}
 		case C.Hysterai2MasqueradeTypeString:
 			masqueradeHandler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if options.Masquerade.StringOptions.StatusCode != 0 {
-					w.WriteHeader(options.Masquerade.StringOptions.StatusCode)
-				}
 				for key, values := range options.Masquerade.StringOptions.Headers {
 					for _, value := range values {
 						w.Header().Add(key, value)
 					}
+				}
+				if options.Masquerade.StringOptions.StatusCode != 0 {
+					w.WriteHeader(options.Masquerade.StringOptions.StatusCode)
+				}
+				if r.Method == http.MethodHead {
+					return
 				}
 				w.Write([]byte(options.Masquerade.StringOptions.Content))
 			})

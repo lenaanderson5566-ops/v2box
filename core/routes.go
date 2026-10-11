@@ -31,6 +31,9 @@ func domainMatch(matches []string) (object, error) {
 	return result, nil
 }
 func buildRoutes(config object, n *panel.NodeInfo) error {
+	if len(n.Common.SingBox) > 0 && string(n.Common.SingBox) != "null" {
+		return buildNativeRoutes(config, n.Common.SingBox)
+	}
 	rules := []object{{"action": "sniff"}}
 	outbounds := config["outbounds"].([]any)
 	known := map[string]string{"direct": ""}

@@ -3,6 +3,7 @@ package core
 import (
 	"fmt"
 	panel "github.com/lenaanderson5566-ops/v2box/api/v2board"
+	hotnaive "github.com/lenaanderson5566-ops/v2box/internal/inbound/naive"
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/option"
 )
@@ -33,6 +34,10 @@ func nameUsers(options any, identities map[string]panel.UserInfo) {
 		names[u.Uuid] = name
 	}
 	switch o := options.(type) {
+	case *hotnaive.InboundOptions:
+		for i := range o.Users {
+			o.Users[i].Name = names[o.Users[i].Name]
+		}
 	case *option.VMessInboundOptions:
 		for i := range o.Users {
 			o.Users[i].Name = names[o.Users[i].Name]
@@ -66,6 +71,8 @@ func nameUsers(options any, identities map[string]panel.UserInfo) {
 
 func updateInboundUsers(in adapter.Inbound, options any) error {
 	switch o := options.(type) {
+	case *hotnaive.InboundOptions:
+		return in.(interface{ UpdateUsers([]hotnaive.User) error }).UpdateUsers(o.Users)
 	case *option.VMessInboundOptions:
 		return in.(interface {
 			UpdateUsers([]option.VMessUser) error

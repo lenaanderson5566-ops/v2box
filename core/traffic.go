@@ -48,7 +48,11 @@ func (t *trafficTracker) updateUsers(tag string, users map[string]panel.UserInfo
 		t.mu.Unlock()
 		return err
 	}
-	t.users[tag] = users
+	if len(users) == 0 {
+		delete(t.users, tag)
+	} else {
+		t.users[tag] = users
+	}
 	var revoked []io.Closer
 	for c, m := range t.connections[tag] {
 		if u, ok := users[m.identity]; !ok || u.Id != m.uid {
@@ -64,6 +68,9 @@ func (t *trafficTracker) updateUsers(tag string, users map[string]panel.UserInfo
 	return nil
 }
 func (t *trafficTracker) account(tag string, uid int, up, down int) {
+	if up == 0 && down == 0 {
+		return
+	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	k := trafficKey{tag, uid}

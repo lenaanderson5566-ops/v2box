@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	_ "net/http/pprof"
@@ -108,22 +109,24 @@ func serverHandle(_ *cobra.Command, _ []string) error {
 	log.Info("Nodes started")
 	if watch {
 		// On file change, just signal reload; do not run reload concurrently here
-		err = c.Watch(config, func() {
+		stopWatch, watchErr := c.Watch(config, func() {
 			select {
 			case reloadCh <- struct{}{}:
 			default: // drop if a reload is already queued
 			}
 		})
-		if err != nil {
-			log.WithField("err", err).Error("start watch failed")
-			return err
+		if watchErr != nil {
+			log.WithField("err", watchErr).Error("start watch failed")
+			return watchErr
 		}
+		defer stopWatch()
 	}
 	// clear memory
 	runtime.GC()
 
 	osSignals := make(chan os.Signal, 1)
 	signal.Notify(osSignals, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(osSignals)
 
 	for {
 		select {
@@ -133,12 +136,22 @@ func serverHandle(_ *cobra.Command, _ []string) error {
 		case <-reloadCh:
 			log.Info("收到重启信号，正在重新加载配置...")
 			if err := reload(config, &nodes, &v2core); err != nil {
+				var rejected *reloadRejected
+				if errors.As(err, &rejected) {
+					log.WithError(err).Error("Configuration rejected; existing nodes retained")
+					continue
+				}
 				return fmt.Errorf("reload failed: %w", err)
 			}
 			log.Info("重启成功")
 		}
 	}
 }
+
+type reloadRejected struct{ err error }
+
+func (e *reloadRejected) Error() string { return e.err.Error() }
+func (e *reloadRejected) Unwrap() error { return e.err }
 
 func reload(config string, nodes **node.Node, v2core **core.V2Core) error {
 	// Preserve old reload channel so new core continues to receive signals
@@ -147,16 +160,27 @@ func reload(config string, nodes **node.Node, v2core **core.V2Core) error {
 		oldReloadCh = (*v2core).ReloadCh
 	}
 
+	newConf := conf.New()
+	if err := newConf.LoadFromPath(config); err != nil {
+		return &reloadRejected{err}
+	}
+	newNodes, err := node.New(newConf.NodeConfigs)
+	if err != nil {
+		return &reloadRejected{err}
+	}
+	newCore := core.New(newConf)
+	if err := newCore.Start(newNodes.NodeInfos); err != nil {
+		return &reloadRejected{err}
+	}
+	if err := newNodes.PrepareCertificates(); err != nil {
+		return &reloadRejected{err}
+	}
+	// Validate before stopping live listeners. Parsing failures and panel outages
+	// must not interrupt the currently applied configuration.
 	if err := (*nodes).Close(); err != nil {
 		return err
 	}
-
 	if err := (*v2core).Close(); err != nil {
-		return err
-	}
-
-	newConf := conf.New()
-	if err := newConf.LoadFromPath(config); err != nil {
 		return err
 	}
 
@@ -185,12 +209,6 @@ func reload(config string, nodes **node.Node, v2core **core.V2Core) error {
 		}
 	}
 
-	newNodes, err := node.New(newConf.NodeConfigs)
-	if err != nil {
-		return err
-	}
-
-	newCore := core.New(newConf)
 	newCore.PreserveAccountingFrom(*v2core)
 	// Reattach reload channel
 	newCore.ReloadCh = oldReloadCh

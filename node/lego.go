@@ -5,11 +5,14 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"os"
 	"path"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -37,7 +40,7 @@ func NewLego(config *panel.CertInfo) (*Lego, error) {
 		fmt.Sprintf("user-%s.json", config.Email)),
 		config.Email)
 	if err != nil {
-		return nil, fmt.Errorf("create user error: %s", err)
+		return nil, fmt.Errorf("create user error: %w", err)
 	}
 	c := lego.NewConfig(user)
 	c.Certificate.KeyType = certcrypto.RSA2048
@@ -51,7 +54,7 @@ func NewLego(config *panel.CertInfo) (*Lego, error) {
 	}
 	err = l.SetProvider()
 	if err != nil {
-		return nil, fmt.Errorf("set provider error: %s", err)
+		return nil, fmt.Errorf("set provider error: %w", err)
 	}
 	return &l, nil
 }
@@ -60,7 +63,7 @@ func checkPath(p string) error {
 	if !file.IsExist(path.Dir(p)) {
 		err := os.MkdirAll(path.Dir(p), 0755)
 		if err != nil {
-			return fmt.Errorf("create dir error: %s", err)
+			return fmt.Errorf("create dir error: %w", err)
 		}
 	}
 	return nil
@@ -74,16 +77,15 @@ func (l *Lego) SetProvider() error {
 			return err
 		}
 	case "dns":
-		for k, v := range l.config.DNSEnv {
-			os.Setenv(k, v)
-		}
+		// guardedACME keeps provider environment in scope for the entire challenge.
+
 		p, err := dns.NewDNSChallengeProviderByName(l.config.Provider)
 		if err != nil {
-			return fmt.Errorf("create dns challenge provider error: %s", err)
+			return fmt.Errorf("create dns challenge provider error: %w", err)
 		}
 		err = l.client.Challenge.SetDNS01Provider(p)
 		if err != nil {
-			return fmt.Errorf("set dns provider error: %s", err)
+			return fmt.Errorf("set dns provider error: %w", err)
 		}
 	}
 	return nil
@@ -96,11 +98,11 @@ func (l *Lego) CreateCert() (err error) {
 	}
 	certificates, err := l.client.Certificate.Obtain(request)
 	if err != nil {
-		return fmt.Errorf("obtain certificate error: %s", err)
+		return fmt.Errorf("obtain certificate error: %w", err)
 	}
 	err = l.writeCert(certificates)
 	if err != nil {
-		return fmt.Errorf("write certificate error: %s", err)
+		return fmt.Errorf("write certificate error: %w", err)
 	}
 	return nil
 }
@@ -108,12 +110,12 @@ func (l *Lego) CreateCert() (err error) {
 func (l *Lego) RenewCert() error {
 	file, err := os.ReadFile(l.config.CertFile)
 	if err != nil {
-		return fmt.Errorf("read cert file error: %s", err)
+		return fmt.Errorf("read cert file error: %w", err)
 	}
-	if e, err := l.CheckCert(file); !e {
+	if due, err := l.CheckCert(file); err != nil {
+		return fmt.Errorf("check cert error: %w", err)
+	} else if !due {
 		return nil
-	} else if err != nil {
-		return fmt.Errorf("check cert error: %s", err)
 	}
 	res, err := l.client.Certificate.Renew(certificate.Resource{
 		Domain:      l.config.CertDomain,
@@ -124,7 +126,7 @@ func (l *Lego) RenewCert() error {
 	}
 	err = l.writeCert(res)
 	if err != nil {
-		return fmt.Errorf("write certificate error: %s", err)
+		return fmt.Errorf("write certificate error: %w", err)
 	}
 	return nil
 }
@@ -145,22 +147,76 @@ func (l *Lego) parseParams(path string) string {
 		"{email}", l.config.Email)
 	return r.Replace(path)
 }
+func stageCertFile(name string, data []byte, mode os.FileMode) (string, error) {
+	if err := checkPath(name); err != nil {
+		return "", err
+	}
+	f, err := os.CreateTemp(filepath.Dir(name), ".acme-cert-*")
+	if err != nil {
+		return "", err
+	}
+	tmp := f.Name()
+	if err = f.Chmod(mode); err == nil {
+		_, err = f.Write(data)
+	}
+	if err == nil {
+		err = f.Sync()
+	}
+	closeErr := f.Close()
+	if err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		os.Remove(tmp)
+		return "", err
+	}
+	return tmp, nil
+}
+
 func (l *Lego) writeCert(certificates *certificate.Resource) error {
-	err := checkPath(l.config.CertFile)
-	if err != nil {
-		return fmt.Errorf("check path error: %s", err)
+	if _, err := tls.X509KeyPair(certificates.Certificate, certificates.PrivateKey); err != nil {
+		return err
 	}
-	err = os.WriteFile(l.parseParams(l.config.CertFile), certificates.Certificate, 0644)
+	certPath, keyPath := l.parseParams(l.config.CertFile), l.parseParams(l.config.KeyFile)
+	certAbs, _ := filepath.Abs(certPath)
+	keyAbs, _ := filepath.Abs(keyPath)
+	if certAbs == keyAbs {
+		return fmt.Errorf("certificate and key paths must differ")
+	}
+	certTmp, err := stageCertFile(certPath, certificates.Certificate, 0644)
 	if err != nil {
 		return err
 	}
-	err = checkPath(l.config.KeyFile)
-	if err != nil {
-		return fmt.Errorf("check path error: %s", err)
-	}
-	err = os.WriteFile(l.parseParams(l.config.KeyFile), certificates.PrivateKey, 0600)
+	defer os.Remove(certTmp)
+	keyTmp, err := stageCertFile(keyPath, certificates.PrivateKey, 0600)
 	if err != nil {
 		return err
+	}
+	defer os.Remove(keyTmp)
+	previous, err := os.ReadFile(keyPath)
+	existed := err == nil
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	backup := ""
+	if existed {
+		backup, err = stageCertFile(keyPath, previous, 0600)
+		if err != nil {
+			return err
+		}
+		defer os.Remove(backup)
+	}
+	if err = os.Rename(keyTmp, keyPath); err != nil {
+		return err
+	}
+	if err = os.Rename(certTmp, certPath); err != nil {
+		var restore error
+		if existed {
+			restore = os.Rename(backup, keyPath)
+		} else {
+			restore = os.Remove(keyPath)
+		}
+		return errors.Join(err, restore)
 	}
 	return nil
 }
@@ -210,13 +266,13 @@ func NewLegoUser(path string, email string) (*User, error) {
 func registerUser(user *User, path string) error {
 	privateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
-		return fmt.Errorf("generate key error: %s", err)
+		return fmt.Errorf("generate key error: %w", err)
 	}
 	user.key = privateKey
 	c := lego.NewConfig(user)
 	client, err := lego.NewClient(c)
 	if err != nil {
-		return fmt.Errorf("create lego client error: %s", err)
+		return fmt.Errorf("create lego client error: %w", err)
 	}
 	reg, err := client.Registration.Register(registration.RegisterOptions{TermsOfServiceAgreed: true})
 	if err != nil {
@@ -225,7 +281,7 @@ func registerUser(user *User, path string) error {
 	user.Registration = reg
 	err = user.Save(path)
 	if err != nil {
-		return fmt.Errorf("save user error: %s", err)
+		return fmt.Errorf("save user error: %w", err)
 	}
 	return nil
 }
@@ -241,16 +297,17 @@ func EncodePrivate(privKey *ecdsa.PrivateKey) (string, error) {
 func (u *User) Save(path string) error {
 	err := checkPath(path)
 	if err != nil {
-		return fmt.Errorf("check path error: %s", err)
+		return fmt.Errorf("check path error: %w", err)
 	}
 	u.KeyEncoded, _ = EncodePrivate(u.key.(*ecdsa.PrivateKey))
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0644)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
 	if err != nil {
 		return err
 	}
+	defer f.Close()
 	err = json.NewEncoder(f).Encode(u)
 	if err != nil {
-		return fmt.Errorf("marshal json error: %s", err)
+		return fmt.Errorf("marshal json error: %w", err)
 	}
 	u.KeyEncoded = ""
 	return nil
@@ -258,6 +315,9 @@ func (u *User) Save(path string) error {
 
 func (u *User) DecodePrivate(pemEncodedPriv string) (*ecdsa.PrivateKey, error) {
 	blockPriv, _ := pem.Decode([]byte(pemEncodedPriv))
+	if blockPriv == nil {
+		return nil, fmt.Errorf("invalid ACME account private key PEM")
+	}
 	x509EncodedPriv := blockPriv.Bytes
 	privateKey, err := x509.ParseECPrivateKey(x509EncodedPriv)
 	return privateKey, err
@@ -266,16 +326,16 @@ func (u *User) DecodePrivate(pemEncodedPriv string) (*ecdsa.PrivateKey, error) {
 func (u *User) Load(path string) error {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return fmt.Errorf("open file error: %s", err)
+		return fmt.Errorf("open file error: %w", err)
 	}
 
 	err = json.Unmarshal(data, u)
 	if err != nil {
-		return fmt.Errorf("unmarshal json error: %s", err)
+		return fmt.Errorf("unmarshal json error: %w", err)
 	}
 	u.key, err = u.DecodePrivate(u.KeyEncoded)
 	if err != nil {
-		return fmt.Errorf("decode private key error: %s", err)
+		return fmt.Errorf("decode private key error: %w", err)
 	}
 	return nil
 }

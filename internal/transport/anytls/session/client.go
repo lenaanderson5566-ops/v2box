@@ -17,8 +17,9 @@ import (
 )
 
 type Client struct {
-	die       context.Context
-	dieCancel context.CancelFunc
+	die         context.Context
+	dieCancel   context.CancelFunc
+	cleanupDone chan struct{}
 
 	dialOut util.DialOutFunc
 
@@ -48,6 +49,7 @@ func NewClient(ctx context.Context, logger logger.Logger, dialOut util.DialOutFu
 		idleSessionTimeout: idleSessionTimeout,
 		minIdleSession:     minIdleSession,
 		logger:             logger,
+		cleanupDone:        make(chan struct{}),
 	}
 	if idleSessionCheckInterval <= time.Second*5 {
 		idleSessionCheckInterval = time.Second * 30
@@ -58,13 +60,15 @@ func NewClient(ctx context.Context, logger logger.Logger, dialOut util.DialOutFu
 	c.die, c.dieCancel = context.WithCancel(ctx)
 	c.idleSession = skiplist.NewSkipList[uint64, *Session]()
 	go func() {
+		defer close(c.cleanupDone)
+		ticker := time.NewTicker(idleSessionCheckInterval)
+		defer ticker.Stop()
 		for {
-			time.Sleep(idleSessionCheckInterval)
-			c.idleCleanup()
 			select {
 			case <-c.die.Done():
 				return
-			default:
+			case <-ticker.C:
+				c.idleCleanup()
 			}
 		}
 	}()
@@ -165,6 +169,7 @@ func (c *Client) Close() error {
 	for _, session := range sessionToClose {
 		session.Close()
 	}
+	<-c.cleanupDone
 
 	return nil
 }

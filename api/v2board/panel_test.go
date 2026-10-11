@@ -18,7 +18,7 @@ func TestUserListAndFailedReport(t *testing.T) {
 		_, _ = w.Write([]byte(body))
 	}))
 	defer s.Close()
-	c, err := New(&conf.NodeConfig{APIHost: s.URL, NodeID: 1, Key: "test", RetryCount: new(int)})
+	c, err := New(&conf.NodeConfig{APIVersion: "legacy", APIHost: s.URL, NodeID: 1, Key: "test", RetryCount: new(int)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -53,7 +53,7 @@ func TestNodeTypeCompatibility(t *testing.T) {
 				_, _ = w.Write([]byte(`{"users":[]}`))
 			}))
 			defer server.Close()
-			client, err := New(&conf.NodeConfig{APIHost: server.URL, NodeID: 42, Key: "test", NodeType: tc.configured})
+			client, err := New(&conf.NodeConfig{APIVersion: "legacy", APIHost: server.URL, NodeID: 42, Key: "test", NodeType: tc.configured})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -62,7 +62,48 @@ func TestNodeTypeCompatibility(t *testing.T) {
 			}
 		})
 	}
-	if _, err := New(&conf.NodeConfig{NodeType: "unsupported"}); err == nil {
+	if _, err := New(&conf.NodeConfig{APIVersion: "legacy", NodeType: "unsupported"}); err == nil {
 		t.Fatal("invalid type accepted")
+	}
+}
+
+func TestNaiveNodeConfig(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v2/server/config" || r.URL.Query().Get("node_type") != "v2box" {
+			t.Error("incorrect Naive node request")
+		}
+		_, _ = w.Write([]byte(`{"protocol":"naive","network":"tcp","tls":1,"server_port":443,"tls_settings":{"cert_mode":"file","server_name":"naive.example","cert_file":"/cert.pem","key_file":"/key.pem"},"base_config":{"push_interval":60,"pull_interval":60}}`))
+	}))
+	defer server.Close()
+	client, err := New(&conf.NodeConfig{APIVersion: "legacy", APIHost: server.URL, NodeID: 42, NodeType: "v2box", Key: "test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	node, err := client.GetNodeInfo(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if node.Type != "naive" || node.Security != Tls || node.Common.CertInfo.CertDomain != "naive.example" || node.Common.Network != "tcp" {
+		t.Fatalf("Naive config not preserved: %+v", node)
+	}
+}
+
+func TestLandingPageUsesLocalConfigOnly(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"protocol":"naive","network":"tcp","tls":1,"server_port":443,"landing_page":{"enabled":true,"directory":"/etc"},"LandingPage":{"Enabled":true,"Directory":"/etc"},"base_config":{"push_interval":60,"pull_interval":60}}`))
+	}))
+	defer server.Close()
+	for _, local := range []conf.LandingPage{{}, {Enabled: true, Directory: "/site"}} {
+		client, err := New(&conf.NodeConfig{APIVersion: "legacy", APIHost: server.URL, LandingPage: local})
+		if err != nil {
+			t.Fatal(err)
+		}
+		node, err := client.GetNodeInfo(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if node.Common.LandingPage != local {
+			t.Fatal("panel response overrode local static directory")
+		}
 	}
 }

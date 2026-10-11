@@ -12,6 +12,7 @@ import (
 
 	panel "github.com/lenaanderson5566-ops/v2box/api/v2board"
 	"github.com/lenaanderson5566-ops/v2box/conf"
+	"github.com/lenaanderson5566-ops/v2box/internal/landing"
 
 	"github.com/sagernet/sing-box/option"
 	sj "github.com/sagernet/sing/common/json"
@@ -64,6 +65,24 @@ func buildInbound(n *panel.NodeInfo, users []panel.UserInfo) (object, error) {
 		return nil, fmt.Errorf("trusted_x_forwarded_for requires a separate sing-box-compatible proxy configuration")
 	}
 	in := object{"type": n.Type, "tag": n.Tag, "listen": listen, "listen_port": c.ServerPort}
+	if c.LandingPage.Enabled {
+		if n.Type != "naive" && n.Type != "hysteria2" {
+			return nil, fmt.Errorf("LandingPage is only supported for naive and hysteria2")
+		}
+		if n.Type == "hysteria2" && c.Obfs != "" {
+			return nil, fmt.Errorf("Hysteria2 LandingPage requires obfs to be disabled for ordinary HTTP3 clients")
+		}
+		if _, err := landing.New(c.LandingPage.Directory); err != nil {
+			return nil, err
+		}
+		if n.Type == "naive" {
+			in["landing_page"] = c.LandingPage
+		} else if c.LandingPage.Directory != "" {
+			in["masquerade"] = object{"type": "file", "directory": c.LandingPage.Directory}
+		} else {
+			in["masquerade"] = object{"type": "string", "status_code": 200, "content": landing.DefaultHTML, "headers": object{"Content-Type": "text/html; charset=utf-8", "X-Content-Type-Options": "nosniff"}}
+		}
+	}
 	list := []object{}
 	ids := map[int]bool{}
 	uuids := map[string]bool{}
@@ -84,6 +103,9 @@ func buildInbound(n *panel.NodeInfo, users []panel.UserInfo) (object, error) {
 		case "vless":
 			user["uuid"] = u.Uuid
 			user["flow"] = c.Flow
+		case "naive":
+			user["username"] = u.Uuid
+			user["password"] = u.Uuid
 		case "trojan", "anytls", "hysteria2":
 			user["password"] = u.Uuid
 		case "tuic":
@@ -149,6 +171,14 @@ func buildInbound(n *panel.NodeInfo, users []panel.UserInfo) (object, error) {
 			return nil, fmt.Errorf("unsupported multi-user Shadowsocks cipher %q", c.Cipher)
 		}
 		in["method"] = c.Cipher
+	case "naive":
+		if c.Network != "" && c.Network != "tcp" {
+			return nil, fmt.Errorf("Naive requires TCP (HTTPS/HTTP2)")
+		}
+		if err := plainSettings(c.NetworkSettings); err != nil {
+			return nil, err
+		}
+		in["network"] = "tcp"
 	case "hysteria2", "tuic", "anytls":
 		if c.Network != "" && c.Network != "tcp" && !(c.Network == "hysteria" && n.Type == "hysteria2") {
 			return nil, fmt.Errorf("%s does not support transport %q", n.Type, c.Network)
@@ -181,7 +211,7 @@ func buildInbound(n *panel.NodeInfo, users []panel.UserInfo) (object, error) {
 	if tls != nil {
 		in["tls"] = tls
 	}
-	if (n.Type == "hysteria2" || n.Type == "tuic" || n.Type == "anytls") && tls == nil {
+	if (n.Type == "naive" || n.Type == "hysteria2" || n.Type == "tuic" || n.Type == "anytls") && tls == nil {
 		return nil, fmt.Errorf("%s requires TLS", n.Type)
 	}
 	return in, nil

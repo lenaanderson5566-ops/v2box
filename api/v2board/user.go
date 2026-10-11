@@ -34,6 +34,9 @@ type AliveMap struct {
 
 // GetUserList will pull user from v2board
 func (c *Client) GetUserList(ctx context.Context) ([]UserInfo, error) {
+	if c.v10 {
+		return c.getV10Users(ctx)
+	}
 	const path = "/api/v1/server/UniProxy/user"
 	r, err := c.client.R().
 		SetContext(ctx).
@@ -108,6 +111,9 @@ func (c *Client) GetUserList(ctx context.Context) ([]UserInfo, error) {
 
 // GetUserAlive will fetch the alive_ip count for users
 func (c *Client) GetUserAlive(ctx context.Context) (map[int]int, error) {
+	if c.v10 {
+		return c.getV10Alive(ctx)
+	}
 	c.AliveMap = &AliveMap{}
 	const path = "/api/v1/server/UniProxy/alivelist"
 	r, err := c.client.R().
@@ -142,6 +148,9 @@ type UserTraffic struct {
 
 // ReportUserTraffic reports the user traffic
 func (c *Client) ReportUserTraffic(ctx context.Context, userTraffic []UserTraffic) error {
+	if c.v10 {
+		return c.reportV10Traffic(ctx, userTraffic)
+	}
 	data := make(map[int][]int64, len(userTraffic))
 	for i := range userTraffic {
 		data[userTraffic[i].UID] = []int64{userTraffic[i].Upload, userTraffic[i].Download}
@@ -162,6 +171,9 @@ func (c *Client) ReportUserTraffic(ctx context.Context, userTraffic []UserTraffi
 }
 
 func (c *Client) ReportNodeOnlineUsers(ctx context.Context, data *map[int][]string) error {
+	if c.v10 {
+		return c.reportV10Online(ctx, data)
+	}
 	const path = "/api/v1/server/UniProxy/alive"
 	r, err := c.client.R().
 		SetContext(ctx).

@@ -4,6 +4,7 @@ import (
 	"context"
 	hotanytls "github.com/lenaanderson5566-ops/v2box/internal/inbound/anytls"
 	hothysteria2 "github.com/lenaanderson5566-ops/v2box/internal/inbound/hysteria2"
+	hotnaive "github.com/lenaanderson5566-ops/v2box/internal/inbound/naive"
 	hotshadowsocks "github.com/lenaanderson5566-ops/v2box/internal/inbound/shadowsocks"
 	hottrojan "github.com/lenaanderson5566-ops/v2box/internal/inbound/trojan"
 	hottuic "github.com/lenaanderson5566-ops/v2box/internal/inbound/tuic"
@@ -42,6 +43,7 @@ func boxContext(ctx context.Context) context.Context {
 	hothysteria2.RegisterInbound(in)
 	hottuic.RegisterInbound(in)
 	hotanytls.RegisterInbound(in)
+	hotnaive.RegisterInbound(in)
 	direct.RegisterOutbound(out)
 	socks.RegisterOutbound(out)
 	http.RegisterOutbound(out)
