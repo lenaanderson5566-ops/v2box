@@ -137,3 +137,40 @@ docker run --rm --network host -v /etc/v2box:/etc/v2box:ro v2box
 独立 V2Box 一键安装参数：`--node-type v2box`。安装器保留已有配置；已有机器需手动核对并更新 `NodeType` 和面板对应的 `NodeID`。面板和包含 NodeType 支持的 V2Box 二进制须一起升级。
 
 V10 节点身份通过 `X-Node-Type: v2box` 和 `X-Node-ID: 节点编号` 请求头传递；URL 统一为 `/api/v10/server/...`。当前仅接受 v2box 类型，V2Node 继续使用旧接口。类型或编号缺失、非法时返回 422；未知节点返回 404。旧 `/api/v10/nodes/v2box/{id}/...` 路径已移除，面板与节点应同步升级。
+
+
+### Public IP and optional Cloudflare DDNS
+
+The Linux release includes `node-network.py` (Python 3.8+, standard library only).
+`v2box ip` queries and validates public IPv4/IPv6 addresses using HTTPS lookup services.
+For panel-managed DDNS, save the Cloudflare credential and bind the node under the
+panel's **Cloudflare DDNS** page, then generate a scoped report key. Run:
+
+```bash
+v2box ddns report-configure --family ipv4
+```
+
+Enter the HTTPS panel origin and report key at the hidden prompt. The node reports public
+addresses to `POST /api/v10/server/addresses` every five minutes; only the panel holds the
+Cloudflare token. The report key authorizes one configured node and cannot use other panel
+APIs. `--panel-url` and `--token-file` support unattended setup without putting the key in
+command arguments. Choose `ipv6` or `dual` as needed. Missing families are not sent as empty
+values. The panel refuses stale addresses and pauses/backoffs failed DNS operations.
+
+Legacy direct mode remains available with `v2box ddns configure --domain node.example.com
+--family ipv4` or installer `--ddns --ddns-domain node.example.com --ddns-family ipv4`.
+That mode prompts for the zone-scoped Cloudflare DNS Edit token on the node. Switching to
+`report-configure` replaces the local direct-mode credential after the panel accepts a report.
+
+Both modes use Python 3.8+, standard library only, and systemd or OpenRC with crontab/crond.
+Settings are mode 0600 under `/etc/node-network/`. HTTPS requests do not follow redirects.
+Authentication/configuration errors pause reporting until reconfiguration; 429 responses
+use bounded backoff. Existing DNS records are retained on disable or lookup failure.
+Use `v2box ddns status`, `v2box ddns disable`, or the independent `node-network` command,
+which also supports V2Node hosts. Ordinary reinstall preserves the configured mode.
+Allow DNS propagation before issuing an ACME certificate.
+
+Tests: `python3 -m unittest discover -s script -p '*_test.py'` (mock DNS APIs only).
+AnyTLS panel presets can be integration-tested with
+`V2BOX_PADDING_PRESETS=/path/to/v2board/resources/client/anytls-padding-presets.json`
+and `go test -tags with_quic,with_utls ./core -run TestPanelAnyTLSPresets`.

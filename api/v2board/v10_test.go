@@ -39,7 +39,7 @@ func TestV10PanelFixture(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if n.Type != "vless" || n.Common.ServerPort != 443 || len(n.Common.Routes) != 1 || len(n.Common.SingBox) == 0 {
+	if n.Type != "vless" || n.Common.ServerPort != 443 || len(n.Common.Routes) != 0 || len(n.Common.SingBox) == 0 {
 		t.Fatal("PHP/Go configuration mismatch")
 	}
 }

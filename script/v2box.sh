@@ -17,6 +17,8 @@ case "$1" in
   log)
     if command -v journalctl >/dev/null; then journalctl -u v2box -n 100 -f
     else tail -n 100 -f /var/log/v2box.log; fi;;
+  ip) exec python3 /usr/local/lib/v2box/node-network.py ip;;
+  ddns) shift; exec python3 /usr/local/lib/v2box/node-network.py "${@:-status}";;
   version|server|help) exec "$binary" "$@";;
-  *) echo 'Usage: v2box {start|stop|restart|status|enable|disable|log|version|server|help}'; exit 1;;
+  *) echo 'Usage: v2box {start|stop|restart|status|enable|disable|log|version|server|ip|ddns [report-configure|configure|run|status|disable]|help}'; exit 1;;
 esac

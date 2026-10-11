@@ -8,9 +8,14 @@ api_key=''
 node_type='v2box'
 landing_page=false
 landing_dir=''
+ddns=false
+ddns_domain=''
+ddns_zone=''
+ddns_token_file=''
+ddns_family='ipv4'
 while (($#)); do
   case "$1" in
-    --api-host|--node-id|--api-key|--node-type|--landing-dir)
+    --api-host|--node-id|--api-key|--node-type|--landing-dir|--ddns-domain|--ddns-zone-id|--ddns-token-file|--ddns-family)
       (($# >= 2)) || { echo "Missing value for $1" >&2; exit 1; }
       case "$1" in
         --api-host) api_host=$2;;
@@ -18,10 +23,15 @@ while (($#)); do
         --api-key) api_key=$2;;
         --node-type) node_type=$2;;
         --landing-dir) landing_dir=$2; landing_page=true;;
+        --ddns-domain) ddns_domain=$2; ddns=true;;
+        --ddns-zone-id) ddns_zone=$2;;
+        --ddns-token-file) ddns_token_file=$2;;
+        --ddns-family) ddns_family=$2;;
       esac
       shift 2;;
+    --ddns) ddns=true; shift;;
     --landing-page) landing_page=true; shift;;
-    -h|--help) echo "Usage: $0 [release-tag] [--api-host URL --node-id ID --api-key KEY] [--node-type v2node|v2box] [--landing-page | --landing-dir /path/to/site]"; exit 0;;
+    -h|--help) echo "Usage: $0 [release-tag] [--api-host URL --node-id ID --api-key KEY] [--node-type v2node|v2box] [--landing-page | --landing-dir /path/to/site] [--ddns --ddns-domain HOST --ddns-zone-id ZONE --ddns-token-file FILE --ddns-family ipv4|ipv6|dual]"; exit 0;;
     --*) echo "Unknown option: $1" >&2; exit 1;;
     *) [[ -z "$version" ]] || { echo 'Only one version is allowed' >&2; exit 1; }; version=$1; shift;;
   esac
@@ -32,6 +42,10 @@ if [[ -n "$landing_dir" ]]; then
 fi
 if [[ "$landing_page" == true && -z "$api_host" ]]; then
   echo 'Landing page flags require panel arguments when creating a config' >&2; exit 1
+fi
+if [[ "$ddns" == true ]]; then
+  command -v python3 >/dev/null || { echo 'Install python3 to configure Cloudflare DDNS' >&2; exit 1; }
+  [[ "$ddns_family" == ipv4 || "$ddns_family" == ipv6 || "$ddns_family" == dual ]] || { echo 'Invalid DDNS address family' >&2; exit 1; }
 fi
 [[ $EUID -eq 0 ]] || { echo 'Run as root' >&2; exit 1; }
 [[ $(uname -s) == Linux ]] || { echo 'This installer requires Linux' >&2; exit 1; }
@@ -60,6 +74,9 @@ base="https://github.com/$repo/releases/download/$version"
 curl -fSL "$base/$archive" -o "$stage/$archive"
 curl -fSL "$base/$archive.sha256" -o "$stage/$archive.sha256"
 (cd "$stage" && sha256sum -c "$archive.sha256" && unzip -q "$archive")
+if [[ "$ddns" == true && ! -f "$stage/node-network.py" ]]; then
+  echo 'This release does not include DDNS support; select a newer release' >&2; exit 1
+fi
 chmod +x "$stage/v2box"
 "$stage/v2box" version
 install -d -m 755 /usr/local/lib/v2box /etc/v2box
@@ -69,6 +86,17 @@ fi
 install -m 755 "$stage/v2box" /usr/local/lib/v2box/v2box.new
 mv -f /usr/local/lib/v2box/v2box.new /usr/local/lib/v2box/v2box
 install -m 755 "$stage/v2box.sh" /usr/local/bin/v2box
+if [[ -f "$stage/node-network.py" ]]; then
+  install -m 755 "$stage/node-network.py" /usr/local/lib/v2box/node-network.py
+  if [[ -f /usr/local/lib/node-network/node-network.py ]]; then
+    install -m 755 "$stage/node-network.py" /usr/local/lib/node-network/node-network.py
+  fi
+  if command -v python3 >/dev/null; then
+    python3 /usr/local/lib/v2box/node-network.py ip || echo 'Public IP lookup failed; deployment will continue.'
+  else
+    echo 'Install python3 to use: v2box ip'
+  fi
+fi
 for file in LICENSE LICENSE.sing-box NOTICE.md README.md; do
   install -m 644 "$stage/$file" "/usr/local/lib/v2box/$file"
 done
@@ -115,6 +143,13 @@ depend() { need net; }
 UNIT
   chmod +x /etc/init.d/v2box
   rc-update add v2box default
+fi
+if [[ "$ddns" == true ]]; then
+  ddns_args=(configure --family "$ddns_family")
+  [[ -z "$ddns_domain" ]] || ddns_args+=(--domain "$ddns_domain")
+  [[ -z "$ddns_zone" ]] || ddns_args+=(--zone-id "$ddns_zone")
+  [[ -z "$ddns_token_file" ]] || ddns_args+=(--token-file "$ddns_token_file")
+  python3 /usr/local/lib/v2box/node-network.py "${ddns_args[@]}"
 fi
 if jq -e '.Nodes | length > 0 and all(.[]; .ApiKey != "REPLACE_ME")' /etc/v2box/config.json >/dev/null; then
   v2box restart

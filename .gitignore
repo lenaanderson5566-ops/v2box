@@ -21,3 +21,6 @@ quick_update.sh
 /v2box
 /v2box.exe
 /*.test
+
+# Python deployment helper
+__pycache__/
