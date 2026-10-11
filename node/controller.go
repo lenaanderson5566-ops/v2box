@@ -20,6 +20,9 @@ type Controller struct {
 	tag                     string
 	limiter                 *limiter.Limiter
 	userList                []panel.UserInfo
+	usersPrepared           bool
+	preparedBudget          *panel.TrafficBudget
+	reloadPending           bool
 	aliveMap                map[int]int
 	conf                    *conf.NodeConfig
 	info                    *panel.NodeInfo
@@ -52,17 +55,13 @@ func (c *Controller) Start(x *core.V2Core) error {
 		}
 		node = c.info
 	}
-	// Update user
-	c.userList, err = c.apiClient.GetUserList(context.Background())
-	if err != nil {
-		return fmt.Errorf("get user list error: %s", err)
-	}
-
-	c.aliveMap, err = c.apiClient.GetUserAlive(context.Background())
-	if err != nil {
-		return fmt.Errorf("failed to get user alive list: %s", err)
+	if !c.usersPrepared {
+		if err := c.prepareUsers(); err != nil {
+			return err
+		}
 	}
 	c.tag = node.Tag
+	c.server.SetTrafficBudget(c.tag, c.preparedBudget)
 
 	// add limiter
 	l := limiter.AddLimiter(c.info.Type, c.tag, c.userList, c.aliveMap)
@@ -89,6 +88,25 @@ func (c *Controller) Start(x *core.V2Core) error {
 	log.WithField("tag", c.tag).Infof("Added %d new users", added)
 	c.info = node
 	c.startTasks(node)
+	return nil
+}
+
+// Fetch all authentication inputs before replacing live listeners.
+func (c *Controller) prepareUsers() error {
+	users, err := c.apiClient.GetUserList(context.Background())
+	if err != nil {
+		return fmt.Errorf("get user list error: %w", err)
+	}
+	alive, err := c.apiClient.GetUserAlive(context.Background())
+	if err != nil {
+		return fmt.Errorf("get user alive list error: %w", err)
+	}
+	budget, err := c.apiClient.GetTrafficBudget(context.Background())
+	if err != nil {
+		return fmt.Errorf("get traffic budget error: %w", err)
+	}
+	c.preparedBudget = budget
+	c.userList, c.aliveMap, c.usersPrepared = users, alive, true
 	return nil
 }
 

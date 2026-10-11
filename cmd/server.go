@@ -172,6 +172,9 @@ func reload(config string, nodes **node.Node, v2core **core.V2Core) error {
 	if err := newCore.Start(newNodes.NodeInfos); err != nil {
 		return &reloadRejected{err}
 	}
+	if err := newNodes.PrepareUsers(newCore); err != nil {
+		return &reloadRejected{err}
+	}
 	if err := newNodes.PrepareCertificates(); err != nil {
 		return &reloadRejected{err}
 	}

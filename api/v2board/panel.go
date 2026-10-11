@@ -4,6 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/sirupsen/logrus"
@@ -15,17 +17,21 @@ import (
 // Panel is the interface for different panel's api.
 
 type Client struct {
-	v10              bool
-	landingPage      conf.LandingPage
-	client           *resty.Client
-	APIHost          string
-	Token            string
-	NodeId           int
-	nodeEtag         string
-	userEtag         string
-	responseBodyHash string
-	UserList         *UserListBody
-	AliveMap         *AliveMap
+	trafficMu             sync.Mutex
+	trafficDedup          atomic.Bool
+	budgetSupported       atomic.Bool
+	trafficSpoolDirectory string
+	v10                   bool
+	landingPage           conf.LandingPage
+	client                *resty.Client
+	APIHost               string
+	Token                 string
+	NodeId                int
+	nodeEtag              string
+	userEtag              string
+	responseBodyHash      string
+	UserList              *UserListBody
+	AliveMap              *AliveMap
 }
 
 func New(c *conf.NodeConfig) (*Client, error) {
@@ -75,19 +81,20 @@ func New(c *conf.NodeConfig) (*Client, error) {
 		client.SetAuthToken(c.Key)
 		client.SetHeader("X-Node-Type", nodeType)
 		client.SetHeader("X-Node-ID", strconv.Itoa(c.NodeID))
-		client.SetHeader("X-Node-Capabilities", "native-routing-v1,dns-v1,outbounds-v1")
+		client.SetHeader("X-Node-Capabilities", "native-routing-v1,dns-v1,outbounds-v1,server-traffic-budget-v1")
 	} else {
 		client.SetQueryParams(map[string]string{"node_type": nodeType, "node_id": strconv.Itoa(c.NodeID), "token": c.Key})
 	}
 
 	return &Client{
-		v10:         version == "v10",
-		landingPage: c.LandingPage,
-		client:      client,
-		Token:       c.Key,
-		APIHost:     c.APIHost,
-		NodeId:      c.NodeID,
-		UserList:    &UserListBody{},
-		AliveMap:    &AliveMap{},
+		v10:                   version == "v10",
+		trafficSpoolDirectory: c.TrafficSpoolDirectory,
+		landingPage:           c.LandingPage,
+		client:                client,
+		Token:                 c.Key,
+		APIHost:               c.APIHost,
+		NodeId:                c.NodeID,
+		UserList:              &UserListBody{},
+		AliveMap:              &AliveMap{},
 	}, nil
 }

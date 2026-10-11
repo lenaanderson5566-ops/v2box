@@ -15,12 +15,20 @@ func (c *Controller) reportUserTrafficTask(ctx context.Context) (err error) {
 		reportmin = c.info.Common.BaseConfig.NodeReportMinTraffic
 		devicemin = c.info.Common.BaseConfig.DeviceOnlineMinTraffic
 	}
+	if snapshot := c.server.TrafficBudgetSnapshot(c.tag); snapshot != nil {
+		if saveErr := c.apiClient.SaveTrafficBudget(snapshot); saveErr != nil {
+			log.WithField("tag", c.tag).WithError(saveErr).Error("Save traffic budget failed")
+		}
+	}
 	activity := c.server.TakeOnlineActivity(c.tag)
 	userTraffic, _ := c.server.GetUserTrafficSlice(c.tag, reportmin)
-	if len(userTraffic) > 0 {
-		err = c.apiClient.ReportUserTraffic(ctx, userTraffic)
+	{
+		retained, reportErr := c.apiClient.ReportUserTrafficReliable(ctx, userTraffic)
+		err = reportErr
 		if err != nil {
-			c.server.RestoreUserTraffic(c.tag, userTraffic)
+			if !retained {
+				c.server.RestoreUserTraffic(c.tag, userTraffic)
+			}
 			log.WithFields(log.Fields{
 				"tag": c.tag,
 				"err": err,
@@ -28,7 +36,7 @@ func (c *Controller) reportUserTrafficTask(ctx context.Context) (err error) {
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				return err
 			}
-		} else {
+		} else if len(userTraffic) > 0 {
 			log.WithField("tag", c.tag).Infof("Report %d users traffic", len(userTraffic))
 			//log.WithField("tag", c.tag).Debugf("User traffic: %+v", userTraffic)
 		}

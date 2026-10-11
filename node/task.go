@@ -48,6 +48,15 @@ func (c *Controller) startTasks(node *panel.NodeInfo) {
 }
 
 func (c *Controller) nodeInfoMonitor(ctx context.Context) (err error) {
+	// A failed budget refresh preserves the last local restriction.
+	if budget, budgetErr := c.apiClient.GetTrafficBudget(ctx); budgetErr == nil {
+		snapshot := c.server.SetTrafficBudget(c.tag, budget)
+		if saveErr := c.apiClient.SaveTrafficBudget(snapshot); saveErr != nil {
+			log.WithField("tag", c.tag).WithError(saveErr).Error("Save traffic budget failed")
+		}
+	} else {
+		log.WithField("tag", c.tag).WithError(budgetErr).Error("Refresh traffic budget failed")
+	}
 	// get node info
 	newN, err := c.apiClient.GetNodeInfo(ctx)
 	if err != nil {
@@ -61,6 +70,11 @@ func (c *Controller) nodeInfoMonitor(ctx context.Context) (err error) {
 		return nil
 	}
 	if newN != nil {
+		c.reloadPending = true
+	}
+	// Keep requesting replacement after a rejected reload, even if the panel
+	// returns 304 for the configuration already fetched by this controller.
+	if c.reloadPending {
 		log.WithFields(log.Fields{
 			"tag": c.tag,
 		}).Error("Got new node info, reload")

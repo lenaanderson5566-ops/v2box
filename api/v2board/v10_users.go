@@ -76,7 +76,11 @@ func (c *Client) getV10Alive(ctx context.Context) (map[int]int, error) {
 }
 
 func (c *Client) postV10(ctx context.Context, resource string, records any) error {
-	r, err := c.client.R().SetContext(ctx).SetBody(map[string]any{"records": records}).Post(c.nodePath(resource))
+	return c.postV10Body(ctx, resource, map[string]any{"records": records})
+}
+
+func (c *Client) postV10Body(ctx context.Context, resource string, payload any) error {
+	r, err := c.client.R().SetContext(ctx).SetBody(payload).Post(c.nodePath(resource))
 	if err != nil {
 		return err
 	}

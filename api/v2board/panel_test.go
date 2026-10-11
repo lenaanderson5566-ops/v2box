@@ -107,3 +107,34 @@ func TestLandingPageUsesLocalConfigOnly(t *testing.T) {
 		}
 	}
 }
+
+func TestLegacyAliveErrorsAreNotEmptySuccess(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status int
+		body   string
+		fail   bool
+	}{
+		{"unavailable", 503, "", true},
+		{"unauthorized", 403, "", true},
+		{"malformed", 200, "not-json", true},
+		{"unsupported", 404, "", false},
+		{"valid", 200, `{"alive":{"1":2}}`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(tc.status); w.Write([]byte(tc.body)) }))
+			defer s.Close()
+			c, err := New(&conf.NodeConfig{APIVersion: "legacy", APIHost: s.URL, NodeID: 1, Key: "test", RetryCount: new(int)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			alive, err := c.GetUserAlive(context.Background())
+			if (err != nil) != tc.fail {
+				t.Fatalf("unexpected result: %v, %v", alive, err)
+			}
+			if tc.name == "valid" && alive[1] != 2 {
+				t.Fatalf("online counts lost: %v", alive)
+			}
+		})
+	}
+}

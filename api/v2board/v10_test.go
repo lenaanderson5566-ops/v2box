@@ -66,7 +66,7 @@ func TestV10Contract(t *testing.T) {
 			}
 			var body map[string]any
 			json.NewDecoder(r.Body).Decode(&body)
-			if len(body["features"].([]any)) != 3 {
+			if len(body["features"].([]any)) != 4 {
 				t.Error("capabilities missing")
 			}
 			w.Write([]byte(`{"data":{"accepted":true}}`))

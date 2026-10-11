@@ -22,6 +22,7 @@ type trafficKey struct {
 	uid int
 }
 type trafficTracker struct {
+	budgets     map[string]*panel.TrafficBudget
 	mu          sync.Mutex
 	users       map[string]map[string]panel.UserInfo
 	traffic     map[trafficKey]panel.UserTraffic
@@ -30,7 +31,7 @@ type trafficTracker struct {
 }
 
 func newTrafficTracker() *trafficTracker {
-	return &trafficTracker{users: map[string]map[string]panel.UserInfo{}, traffic: map[trafficKey]panel.UserTraffic{}, activity: map[trafficKey]int64{}, connections: map[string]map[io.Closer]*meter{}}
+	return &trafficTracker{budgets: map[string]*panel.TrafficBudget{}, users: map[string]map[string]panel.UserInfo{}, traffic: map[trafficKey]panel.UserTraffic{}, activity: map[trafficKey]int64{}, connections: map[string]map[io.Closer]*meter{}}
 }
 func (t *trafficTracker) setUsers(tag string, users []panel.UserInfo) {
 	m := map[string]panel.UserInfo{}
@@ -73,6 +74,31 @@ func (t *trafficTracker) account(tag string, uid int, up, down int) {
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	if b := t.budgets[tag]; b != nil {
+		wasBlocked := t.budgetBlockedLocked(tag)
+		if b.CountingMode != "download" {
+			b.UsedBytes += int64(up)
+		}
+		if b.CountingMode != "upload" {
+			b.UsedBytes += int64(down)
+		}
+		if !wasBlocked && t.budgetBlockedLocked(tag) {
+			var closeList []io.Closer
+			for other, quota := range t.budgets {
+				if quota == b {
+					for c, m := range t.connections[other] {
+						m.cancel()
+						closeList = append(closeList, c)
+					}
+				}
+			}
+			go func() {
+				for _, c := range closeList {
+					c.Close()
+				}
+			}()
+		}
+	}
 	k := trafficKey{tag, uid}
 	v := t.traffic[k]
 	v.UID = uid
@@ -117,7 +143,7 @@ func (t *trafficTracker) closeNode(tag string) {
 func (t *trafficTracker) register(tag string, c io.Closer, m *meter) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if m.ctx.Err() != nil || t.users[tag][m.identity].Id != m.uid {
+	if t.budgetBlockedLocked(tag) || m.ctx.Err() != nil || t.users[tag][m.identity].Id != m.uid {
 		return false
 	}
 	if t.connections[tag] == nil {
@@ -148,6 +174,9 @@ func (t *trafficTracker) newMeter(ctx context.Context, m adapter.InboundContext)
 	}
 	t.mu.Lock()
 	u := t.users[m.Inbound][m.User]
+	if t.budgetBlockedLocked(m.Inbound) {
+		u.Id = 0
+	}
 	t.mu.Unlock()
 	if u.Id == 0 {
 		return nil
@@ -165,6 +194,12 @@ func (t *trafficTracker) newMeter(ctx context.Context, m adapter.InboundContext)
 	return &meter{tracker: t, tag: m.Inbound, user: user, identity: m.User, ip: ip, uid: u.Id, ctx: ctx, cancel: cancel, limiter: l}
 }
 func (m *meter) wait(n int) error {
+	m.tracker.mu.Lock()
+	blocked := m.tracker.budgetBlockedLocked(m.tag)
+	m.tracker.mu.Unlock()
+	if blocked {
+		return net.ErrClosed
+	}
 	if err := m.ctx.Err(); err != nil {
 		return err
 	}

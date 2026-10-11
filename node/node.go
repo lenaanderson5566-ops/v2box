@@ -71,3 +71,16 @@ func (n *Node) PrepareCertificates() error {
 	}
 	return nil
 }
+
+// PrepareUsers validates panel authentication data while old nodes are still serving.
+func (n *Node) PrepareUsers(server *core.V2Core) error {
+	for _, c := range n.controllers {
+		if err := c.prepareUsers(); err != nil {
+			return err
+		}
+		if err := server.ValidateNodeUsers(c.info, c.userList); err != nil {
+			return err
+		}
+	}
+	return nil
+}

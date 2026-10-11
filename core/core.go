@@ -49,6 +49,13 @@ func (v *V2Core) Start(infos []*panel.NodeInfo) error {
 	}
 	return nil
 }
+
+// ValidateNodeUsers checks a replacement authentication table without opening listeners.
+func (v *V2Core) ValidateNodeUsers(info *panel.NodeInfo, users []panel.UserInfo) error {
+	_, err := buildOptions(info, users, v.Config)
+	return err
+}
+
 func (v *V2Core) AddNode(tag string, info *panel.NodeInfo) error {
 	v.access.Lock()
 	defer v.access.Unlock()

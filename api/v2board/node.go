@@ -170,6 +170,18 @@ func (c *Client) GetNodeInfo(ctx context.Context) (node *NodeInfo, err error) {
 	cm := &CommonNode{}
 	if c.v10 {
 		err = decodeV10Config(r.Body(), cm)
+		if err == nil {
+			var metadata struct {
+				Data struct {
+					TrafficBatchDedup      bool `json:"trafficBatchDedup"`
+					TrafficBudgetSupported bool `json:"trafficBudgetSupported"`
+				} `json:"data"`
+			}
+			if json.Unmarshal(r.Body(), &metadata) == nil {
+				c.trafficDedup.Store(metadata.Data.TrafficBatchDedup)
+				c.budgetSupported.Store(metadata.Data.TrafficBudgetSupported)
+			}
+		}
 	} else {
 		err = json.Unmarshal(r.Body(), cm)
 	}

@@ -115,8 +115,26 @@ func TestHotUsersPreserveUDP(t *testing.T) {
 			check(ca, "a-after-add")
 			cb := packetClient(t, clientBox(t, n, b.Uuid), echo.LocalAddr())
 			check(cb, "b-before")
-			// Ignore pre-update accounting; verify identity after array reordering/removal.
-			_, _ = v.GetUserTrafficSlice(n.Tag, 0)
+			// Receiving the echo does not guarantee its metered Write has returned.
+			// Drain only after the pre-update packet's accounting has completed.
+			deadline := time.Now().Add(2 * time.Second)
+			var beforeUp, beforeDown int64
+			for {
+				traffic, _ := v.GetUserTrafficSlice(n.Tag, 0)
+				for _, record := range traffic {
+					if record.UID == b.Id {
+						beforeUp += record.Upload
+						beforeDown += record.Download
+					}
+				}
+				if beforeUp >= int64(len("b-before")) && beforeDown >= int64(len("b-before")) {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatal("pre-update UDP accounting incomplete")
+				}
+				time.Sleep(time.Millisecond)
+			}
 			apply([]panel.UserInfo{a})
 			check(ca, "a-after-remove")
 			if packetRoundTrip(cb, echo.LocalAddr(), "b-revoked") == nil {
