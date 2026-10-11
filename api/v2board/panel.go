@@ -27,13 +27,20 @@ type Client struct {
 }
 
 func New(c *conf.NodeConfig) (*Client, error) {
+	nodeType := c.NodeType
+	if nodeType == "" {
+		nodeType = "v2node"
+	} // Preserve existing deployments.
+	if nodeType != "v2node" && nodeType != "v2box" {
+		return nil, fmt.Errorf("unsupported NodeType %q", nodeType)
+	}
 	client := resty.New()
 	retryCount := conf.DefaultNodeRetryCount
 	if c.RetryCount != nil {
 		retryCount = *c.RetryCount
 	}
 	client.SetRetryCount(retryCount)
-	client.SetHeader("User-Agent", fmt.Sprintf("v2node go-resty/%s (https://github.com/go-resty/resty)", resty.Version))
+	client.SetHeader("User-Agent", fmt.Sprintf("v2box go-resty/%s (https://github.com/go-resty/resty)", resty.Version))
 	if c.Timeout > 0 {
 		client.SetTimeout(time.Duration(c.Timeout) * time.Second)
 	} else {
@@ -50,7 +57,7 @@ func New(c *conf.NodeConfig) (*Client, error) {
 	client.SetBaseURL(c.APIHost)
 	// set params
 	client.SetQueryParams(map[string]string{
-		"node_type": "v2node",
+		"node_type": nodeType,
 		"node_id":   strconv.Itoa(c.NodeID),
 		"token":     c.Key,
 	})

@@ -23,6 +23,7 @@ type LogConfig struct {
 }
 
 type NodeConfig struct {
+	NodeType   string `mapstructure:"NodeType"`
 	APIHost    string `mapstructure:"ApiHost"`
 	NodeID     int    `mapstructure:"NodeID"`
 	Key        string `mapstructure:"ApiKey"`

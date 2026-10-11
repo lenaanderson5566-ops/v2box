@@ -4,7 +4,7 @@
 
 ## 面板兼容
 
-沿用上游 `/api/v2/server/config` 与 `/api/v1/server/UniProxy/{user,alivelist,push,alive}` 接口。请求参数 `node_type=v2node` 保持不变，这是面板的协议标识，不代表程序仍使用 Xray。支持 JSON / MessagePack 用户列表。
+沿用上游 `/api/v2/server/config` 与 `/api/v1/server/UniProxy/{user,alivelist,push,alive}` 接口。改进版面板支持独立 V2Box 节点：在对应 Nodes 配置项填写 `"NodeType": "v2box"`。未填写时保留 `node_type=v2node`，兼容原有部署；不要把已有 V2Node 的编号直接当成 V2Box 编号。支持 JSON / MessagePack 用户列表。
 
 节点协议：VMess、VLESS、Trojan、Shadowsocks AEAD / SS2022 AES、Hysteria2、TUIC、AnyTLS。VMess/VLESS/Trojan 支持 TCP、WebSocket、gRPC、HTTPUpgrade。支持 TLS 证书文件、面板远程证书、原有 ACME 申请/续期和 VLESS Reality。
 
@@ -61,3 +61,5 @@ docker run --rm --network host -v /etc/v2box:/etc/v2box:ro v2box
 ## 许可证
 
 原 v2node 的 MPL-2.0 许可证保存在 LICENSE。嵌入 sing-box 的版权及 GPL-3.0-or-later 许可证保存在 LICENSE.sing-box；分发组合二进制时须同时提供相应源码。参见 NOTICE.md。
+
+独立 V2Box 一键安装参数：`--node-type v2box`。安装器保留已有配置；已有机器需手动核对并更新 `NodeType` 和面板对应的 `NodeID`。面板和包含 NodeType 支持的 V2Box 二进制须一起升级。

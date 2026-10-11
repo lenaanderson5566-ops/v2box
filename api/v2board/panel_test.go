@@ -39,3 +39,30 @@ func TestUserListAndFailedReport(t *testing.T) {
 		t.Fatal("HTTP failure accepted as user list")
 	}
 }
+
+func TestNodeTypeCompatibility(t *testing.T) {
+	for _, tc := range []struct{ configured, expected string }{{"", "v2node"}, {"v2node", "v2node"}, {"v2box", "v2box"}} {
+		t.Run(tc.expected+tc.configured, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Query().Get("node_type") != tc.expected {
+					t.Errorf("wrong node type: %s", r.URL.RawQuery)
+				}
+				if r.URL.Query().Get("node_id") != "42" {
+					t.Error("node id lost")
+				}
+				_, _ = w.Write([]byte(`{"users":[]}`))
+			}))
+			defer server.Close()
+			client, err := New(&conf.NodeConfig{APIHost: server.URL, NodeID: 42, Key: "test", NodeType: tc.configured})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := client.GetUserList(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+	if _, err := New(&conf.NodeConfig{NodeType: "unsupported"}); err == nil {
+		t.Fatal("invalid type accepted")
+	}
+}

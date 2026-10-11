@@ -5,21 +5,24 @@ version=''
 api_host=''
 node_id=''
 api_key=''
+node_type='v2node'
 while (($#)); do
   case "$1" in
-    --api-host|--node-id|--api-key)
+    --api-host|--node-id|--api-key|--node-type)
       (($# >= 2)) || { echo "Missing value for $1" >&2; exit 1; }
       case "$1" in
         --api-host) api_host=$2;;
         --node-id) node_id=$2;;
         --api-key) api_key=$2;;
+        --node-type) node_type=$2;;
       esac
       shift 2;;
-    -h|--help) echo "Usage: $0 [release-tag] [--api-host URL --node-id ID --api-key KEY]"; exit 0;;
+    -h|--help) echo "Usage: $0 [release-tag] [--api-host URL --node-id ID --api-key KEY] [--node-type v2node|v2box]"; exit 0;;
     --*) echo "Unknown option: $1" >&2; exit 1;;
     *) [[ -z "$version" ]] || { echo 'Only one version is allowed' >&2; exit 1; }; version=$1; shift;;
   esac
 done
+[[ "$node_type" == v2node || "$node_type" == v2box ]] || { echo "Invalid node type" >&2; exit 1; }
 [[ $EUID -eq 0 ]] || { echo 'Run as root' >&2; exit 1; }
 [[ $(uname -s) == Linux ]] || { echo 'This installer requires Linux' >&2; exit 1; }
 case "$(uname -m)" in
@@ -62,8 +65,8 @@ done
 if [[ ! -f /etc/v2box/config.json ]]; then
   if [[ -n "$api_host" ]]; then
     umask 077
-    jq -n --arg host "$api_host" --argjson id "$node_id" --arg key "$api_key" \
-      '{Log:{Level:"info"},Nodes:[{ApiHost:$host,NodeID:$id,ApiKey:$key,Timeout:15,RetryCount:1}]}' > /etc/v2box/config.json
+    jq -n --arg host "$api_host" --argjson id "$node_id" --arg key "$api_key" --arg type "$node_type" \
+      '{Log:{Level:"info"},Nodes:[{NodeType:$type,ApiHost:$host,NodeID:$id,ApiKey:$key,Timeout:15,RetryCount:1}]}' > /etc/v2box/config.json
   else
     install -m 600 "$stage/config.example.json" /etc/v2box/config.json
   fi
