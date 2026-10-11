@@ -49,14 +49,17 @@ func TestV10Contract(t *testing.T) {
 	usersBody := `{"data":[{"id":42,"uuid":"user","speedLimit":10,"deviceLimit":2}]}`
 	badAck := false
 	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Node-Type") != "v2box" || r.Header.Get("X-Node-ID") != "7" {
+			t.Error("missing node identity headers")
+		}
 		if r.Header.Get("Authorization") != "Bearer test-secret" || r.URL.RawQuery != "" {
 			t.Error("V10 must use header credentials only")
 		}
-		if !strings.HasPrefix(r.URL.Path, "/api/v10/nodes/v2box/7/") {
+		if !strings.HasPrefix(r.URL.Path, "/api/v10/server/") {
 			t.Error(r.URL.Path)
 		}
 		w.Header().Set("Content-Type", "application/json")
-		switch strings.TrimPrefix(r.URL.Path, "/api/v10/nodes/v2box/7/") {
+		switch strings.TrimPrefix(r.URL.Path, "/api/v10/server/") {
 		case "capabilities":
 			if r.Method != "POST" {
 				t.Error("capabilities method")

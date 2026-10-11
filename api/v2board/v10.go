@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"runtime/debug"
-	"strconv"
 )
 
 var v10Fields = map[string]string{
@@ -108,7 +107,7 @@ func decodeV10Config(body []byte, out *CommonNode) error {
 	return json.Unmarshal(raw, out)
 }
 func (c *Client) nodePath(resource string) string {
-	return "/api/v10/nodes/v2box/" + strconv.Itoa(c.NodeId) + "/" + resource
+	return "/api/v10/server/" + resource
 }
 func (c *Client) announceCapabilities(ctx context.Context) error {
 	if !c.v10 {

@@ -73,7 +73,9 @@ func New(c *conf.NodeConfig) (*Client, error) {
 	}
 	if version == "v10" {
 		client.SetAuthToken(c.Key)
-		client.SetHeader("X-V2Box-Capabilities", "native-routing-v1,dns-v1,outbounds-v1")
+		client.SetHeader("X-Node-Type", nodeType)
+		client.SetHeader("X-Node-ID", strconv.Itoa(c.NodeID))
+		client.SetHeader("X-Node-Capabilities", "native-routing-v1,dns-v1,outbounds-v1")
 	} else {
 		client.SetQueryParams(map[string]string{"node_type": nodeType, "node_id": strconv.Itoa(c.NodeID), "token": c.Key})
 	}
