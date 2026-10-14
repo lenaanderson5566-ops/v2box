@@ -8,7 +8,9 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/lenaanderson5566-ops/v2box/conf"
 )
@@ -142,5 +144,87 @@ func TestTrafficSpoolBoundedReplayWithoutNewTraffic(t *testing.T) {
 	}
 	if hits != 17 {
 		t.Fatal("remaining traffic not replayed without new traffic")
+	}
+}
+
+func TestTrafficSpoolAppendWhileSenderBlocked(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var hits atomic.Int64
+	var billed atomic.Int64
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var batch trafficBatch
+		if err := json.NewDecoder(r.Body).Decode(&batch); err != nil {
+			t.Error(err)
+			return
+		}
+		if hits.Add(1) == 1 {
+			close(started)
+			select {
+			case <-release:
+			case <-r.Context().Done():
+				return
+			}
+		}
+		for _, record := range batch.Records {
+			billed.Add(record.Upload)
+		}
+		w.Write([]byte(`{"data":{"accepted":true}}`))
+	}))
+	defer server.Close()
+	defer close(release)
+	client, err := newTestPanel(t, server, &conf.NodeConfig{NodeType: "v2box", APIHost: server.URL, NodeID: 7, TrafficSpoolDirectory: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.trafficDedup.Store(true)
+	type result struct {
+		retained bool
+		err      error
+	}
+	first := make(chan result, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	go func() {
+		retained, err := client.ReportUserTrafficReliable(ctx, []UserTraffic{{UID: 1, Upload: 10}})
+		first <- result{retained, err}
+	}()
+	select {
+	case <-started:
+	case <-ctx.Done():
+		t.Fatal("sender did not start")
+	}
+	second := make(chan result, 1)
+	go func() {
+		retained, err := client.ReportUserTrafficReliable(ctx, []UserTraffic{{UID: 2, Upload: 20}})
+		second <- result{retained, err}
+	}()
+	select {
+	case got := <-second:
+		if !got.retained || got.err != nil {
+			t.Fatalf("append failed: %+v", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("network wait blocked durable append")
+	}
+	files, _ := filepath.Glob(filepath.Join(client.spoolPath(), "*.json"))
+	if len(files) != 2 {
+		t.Fatal("concurrent batches not durably retained")
+	}
+	release <- struct{}{}
+	select {
+	case got := <-first:
+		if !got.retained || got.err != nil {
+			t.Fatalf("send failed: %+v", got)
+		}
+	case <-ctx.Done():
+		t.Fatal("sender did not finish")
+	}
+	if _, err := client.ReportUserTrafficReliable(ctx, nil); err != nil {
+		t.Fatal(err)
+	}
+	files, _ = filepath.Glob(filepath.Join(client.spoolPath(), "*.json"))
+	if len(files) != 0 || billed.Load() != 30 || hits.Load() != 2 {
+		t.Fatal("concurrent replay lost or duplicated traffic")
 	}
 }

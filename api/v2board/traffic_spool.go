@@ -43,6 +43,12 @@ func (c *Client) ReportUserTrafficReliable(ctx context.Context, traffic []UserTr
 	}
 	c.trafficMu.Lock()
 	defer c.trafficMu.Unlock()
+	// Durable append is serialized, but network waits must not block new batches.
+	outsideStorageLock := func(send func() error) error {
+		c.trafficMu.Unlock()
+		defer c.trafficMu.Lock()
+		return send()
+	}
 	dir := c.spoolPath()
 	files, err := filepath.Glob(filepath.Join(dir, "*.json"))
 	if err != nil {
@@ -56,7 +62,7 @@ func (c *Client) ReportUserTrafficReliable(ctx context.Context, traffic []UserTr
 		if len(traffic) == 0 {
 			return false, nil
 		}
-		return false, c.ReportUserTraffic(ctx, traffic)
+		return false, outsideStorageLock(func() error { return c.ReportUserTraffic(ctx, traffic) })
 	}
 	if len(traffic) > 0 {
 		var size int64
@@ -77,7 +83,7 @@ func (c *Client) ReportUserTrafficReliable(ctx context.Context, traffic []UserTr
 		}
 		if size+int64(len(raw)) > 64*1024*1024 {
 			// Drain existing receipts even when no space remains for the current counters.
-			if e := c.drainTraffic(ctx, files); e != nil {
+			if e := outsideStorageLock(func() error { return c.drainTraffic(ctx) }); e != nil {
 				return false, e
 			}
 			return false, fmt.Errorf("traffic spool reached 64 MiB limit")
@@ -122,12 +128,23 @@ func (c *Client) ReportUserTrafficReliable(ctx context.Context, traffic []UserTr
 				}
 			}
 		}
-		files = append(files, path)
 	}
-	return retained, c.drainTraffic(ctx, files)
+	return retained, outsideStorageLock(func() error { return c.drainTraffic(ctx) })
 }
 
-func (c *Client) drainTraffic(ctx context.Context, files []string) error {
+func (c *Client) drainTraffic(ctx context.Context) error {
+	// One sender owns replay; concurrent reporters have already durably retained
+	// their batches and leave delivery to this sender or a subsequent report tick.
+	if !c.trafficDrainMu.TryLock() {
+		return nil
+	}
+	defer c.trafficDrainMu.Unlock()
+	c.trafficMu.Lock()
+	files, err := filepath.Glob(filepath.Join(c.spoolPath(), "*.json"))
+	c.trafficMu.Unlock()
+	if err != nil {
+		return err
+	}
 	sort.Strings(files)
 	// Bound work per tick; subsequent ticks drain the remaining backlog, even with no new traffic.
 	for i, path := range files {
@@ -148,7 +165,10 @@ func (c *Client) drainTraffic(ctx context.Context, files []string) error {
 		if e = c.postV10Body(ctx, "traffic", batch); e != nil {
 			return e
 		}
-		if e = os.Remove(path); e != nil && !os.IsNotExist(e) {
+		c.trafficMu.Lock()
+		e = os.Remove(path)
+		c.trafficMu.Unlock()
+		if e != nil && !os.IsNotExist(e) {
 			return e
 		}
 	}

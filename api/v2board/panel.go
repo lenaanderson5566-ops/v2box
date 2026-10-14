@@ -19,6 +19,7 @@ import (
 
 type Client struct {
 	trafficMu             sync.Mutex
+	trafficDrainMu        sync.Mutex
 	trafficDedup          atomic.Bool
 	budgetSupported       atomic.Bool
 	trafficSpoolDirectory string

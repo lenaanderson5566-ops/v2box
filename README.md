@@ -204,3 +204,40 @@ and `go test -tags with_quic,with_utls ./core -run TestPanelAnyTLSPresets`.
 新版 V2Box 根据 `/api/v10/server/traffic-budget` 执行本地准入和连接终止。同一进程的绑定节点共享计数，多个进程通过面板周期同步。提高或取消限额后下一次同步自动恢复，节点无需重装；新周期联网后自动恢复。面板断连时保留限制并继续计数，到期后等待面板确认新周期。
 
 额度状态随拉取/上报周期保存到 `TrafficSpoolDirectory` 下的 `quota-state`，重载保留内存计数，重启读取已保存状态。未保存的计数可能在进程崩溃后丢失。多个进程、同步间隔及网络缓冲存在少量超额风险；代理字节不含服务器其他流量及全部协议开销，应给服务商账单预留余量。旧节点通过用户列表同步限制。
+
+
+### 并发计量与验证
+
+限速和设备状态按用户分成 32 组锁，同一用户的所有连接仍共用一个速度桶。流量和在线活动计数分成 64 组锁，报告逐组取走计数，失败时仍可恢复。共享服务器额度使用原子计数；周期、额度配置和认证表更新继续使用准入同步屏障，耗尽额度时取消现有连接。
+
+可靠上报将落盘锁与发送锁分开：网络等待不会阻止另一个批次持久化，每个 Client 同时只有一个发送者，其他调用返回持久化结果，后续周期继续补报。64 MiB 容量、每周期最多 16 批、确认后删除和批次去重规则保持不变。节点拉取及上报在每次执行完成后，等待配置间隔再加 0–10% 的正向错峰延迟；证书更新任务保留原周期，所有任务仍串行执行。
+
+复用现有测试文件执行验证，不需要另建检查脚本：
+
+```bash
+GOEXPERIMENT=jsonv2 go test -tags with_quic,with_utls ./...
+GOEXPERIMENT=jsonv2 go test -race -tags with_quic,with_utls ./...
+go test ./limiter ./core -run '^$' -bench 'Benchmark(CheckLimit|TrafficAccount)' -benchmem -benchtime=500ms -count=3
+```
+
+2026-10-14 本机微基准对比原始提交 b2c0cda，Windows amd64、Go 1.27.1、8 个逻辑处理器，1024 用户并行调用，三次结果的中位数：
+
+| 场景 | 修改前 | 修改后 |
+| --- | ---: | ---: |
+| 限速检查 | 270.6 ns/次 | 63.3 ns/次 |
+| 流量计量，无共享额度 | 249.5 ns/次 | 42.6 ns/次 |
+| 流量计量，有共享额度 | 305.0 ns/次 | 83.8 ns/次 |
+
+以上场景均为 0 B/次、0 次分配。单用户无共享额度计量约为 188 → 196 ns/次，有共享额度约为 228 → 222 ns/次；分片优化主要收益来自多用户并行。上述结果不是网络吞吐或线上承载上限；部署时仍应按实际协议、带宽、连接数及服务器规格验证。生产诊断接口不要公开到互联网。
+
+
+本轮完整非 race 回归：128 项通过、1 项失败、4 项跳过；原始提交为 121 项通过、同一项失败、4 项跳过（统计包含子测试）。新增 7 项并发/调度回归均通过。完整 race 回归为 127 项通过、同一项失败、4 项跳过，未报告数据竞争；Vision 上游兼容测试按已有规则仅在非 race 模式执行。`go vet -tags with_quic,with_utls ./...` 通过。
+
+未解决的既有测试：`node/TestRejectedReloadIsRetriedWithoutConfigChange` 使用 HTTP 测试地址，与已启用的 HTTPS 地址校验冲突；原始提交与修改后均在相同位置失败。此次没有放宽 HTTPS 或跳过该测试，完整 CI 不能标为全通过。4 项跳过为既有按条件启用的测试，实际原因保留在测试输出中。
+
+
+现有 opt-in 压力回归在 race 模式通过：144 次跨 8 种协议的启动/关闭循环，以及 40 个 TLS 会话上的 1280 个 Naive CONNECT 流（约 50 MiB 回显）。goroutine 数未持续增长，堆内存增长符合现有回归阈值；此结果只覆盖有限循环，不证明长期负载无泄漏。
+
+```bash
+GOEXPERIMENT=jsonv2 V2BOX_SOAK=1 go test -race -tags with_quic,with_utls ./core -run 'Test(CoreLifecycleSoak|NaiveMultiplexChurnSoak)$' -count=1 -timeout=3m
+```

@@ -8,6 +8,7 @@ import (
 	"runtime"
 	"runtime/pprof"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -187,8 +188,10 @@ func TestTrackerEmptyNodesDoNotAccumulate(t *testing.T) {
 		t.Fatalf("retained %d empty node tables", len(tracker.users))
 	}
 	tracker.account("n", 1, 0, 0)
-	if len(tracker.traffic) != 0 || len(tracker.activity) != 0 {
-		t.Fatal("zero-byte I/O creates unreportable accounting entries")
+	for i := range tracker.counters {
+		if len(tracker.counters[i].traffic) != 0 || len(tracker.counters[i].activity) != 0 {
+			t.Fatal("zero-byte I/O creates unreportable accounting entries")
+		}
 	}
 }
 
@@ -200,4 +203,91 @@ func BenchmarkTrafficAccount(b *testing.B) {
 			tracker.account("node", 1, 16384, 0)
 		}
 	})
+}
+
+func BenchmarkTrafficAccountManyUsers(b *testing.B) {
+	tracker := newTrafficTracker()
+	var worker atomic.Uint64
+	b.ReportAllocs()
+	b.RunParallel(func(pb *testing.PB) {
+		i := int(worker.Add(1))
+		for pb.Next() {
+			tracker.account("node", i%1024+1, 16384, 0)
+			i++
+		}
+	})
+}
+func TestConcurrentTrafficCollectionPreservesCounters(t *testing.T) {
+	tracker := newTrafficTracker()
+	const workers = 64
+	const iterations = 1000
+	var wg sync.WaitGroup
+	for uid := 1; uid <= workers; uid++ {
+		wg.Add(1)
+		go func(uid int) {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				tracker.account("node", uid, 3, 7)
+			}
+		}(uid)
+	}
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	var upload, download int64
+	collect := func() {
+		for _, v := range tracker.takeTraffic("node", 0) {
+			upload += v.Upload
+			download += v.Download
+		}
+	}
+	for {
+		collect()
+		select {
+		case <-done:
+			collect()
+			goto complete
+		default:
+		}
+	}
+complete:
+	if upload != workers*iterations*3 || download != workers*iterations*7 {
+		t.Fatalf("lost counters: %d/%d", upload, download)
+	}
+	activity := tracker.takeActivity("node")
+	if len(activity) != workers {
+		t.Fatal("lost active users")
+	}
+	for _, bytes := range activity {
+		if bytes != iterations*10 {
+			t.Fatal("lost activity bytes")
+		}
+	}
+	if len(tracker.takeActivity("node")) != 0 {
+		t.Fatal("activity not drained")
+	}
+	tracker.restoreTraffic("node", []panel.UserTraffic{{UID: 1, Upload: upload, Download: download}})
+	items := tracker.takeTraffic("node", 0)
+	if len(items) != 1 || items[0].Upload != upload || items[0].Download != download {
+		t.Fatal("failed report restoration lost counters")
+	}
+}
+
+func BenchmarkTrafficAccountWithBudget(b *testing.B) {
+	for _, users := range []int{1, 1024} {
+		b.Run(fmt.Sprintf("Users=%d", users), func(b *testing.B) {
+			tracker := newTrafficTracker()
+			v := &V2Core{tracker: tracker}
+			v.SetTrafficBudget("node", &panel.TrafficBudget{ID: 1, CountingMode: "both"})
+			var worker atomic.Uint64
+			b.ReportAllocs()
+			b.ResetTimer()
+			b.RunParallel(func(pb *testing.PB) {
+				i := int(worker.Add(1))
+				for pb.Next() {
+					tracker.account("node", i%users+1, 16384, 0)
+					i++
+				}
+			})
+		})
+	}
 }

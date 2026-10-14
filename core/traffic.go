@@ -14,6 +14,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -22,16 +23,34 @@ type trafficKey struct {
 	uid int
 }
 type trafficTracker struct {
-	budgets     map[string]*panel.TrafficBudget
-	mu          sync.Mutex
+	budgets     map[string]*localTrafficBudget
+	hasBudgets  atomic.Bool
+	mu          sync.RWMutex
 	users       map[string]map[string]panel.UserInfo
-	traffic     map[trafficKey]panel.UserTraffic
-	activity    map[trafficKey]int64
+	counters    [64]trafficCounters
 	connections map[string]map[io.Closer]*meter
 }
 
+type trafficCounters struct {
+	mu       sync.Mutex
+	traffic  map[trafficKey]panel.UserTraffic
+	activity map[trafficKey]int64
+}
+
 func newTrafficTracker() *trafficTracker {
-	return &trafficTracker{budgets: map[string]*panel.TrafficBudget{}, users: map[string]map[string]panel.UserInfo{}, traffic: map[trafficKey]panel.UserTraffic{}, activity: map[trafficKey]int64{}, connections: map[string]map[io.Closer]*meter{}}
+	t := &trafficTracker{budgets: map[string]*localTrafficBudget{}, users: map[string]map[string]panel.UserInfo{}, connections: map[string]map[io.Closer]*meter{}}
+	for i := range t.counters {
+		t.counters[i].traffic = map[trafficKey]panel.UserTraffic{}
+		t.counters[i].activity = map[trafficKey]int64{}
+	}
+	return t
+}
+func (t *trafficTracker) counter(tag string, uid int) *trafficCounters {
+	hash := uint64(uid) * 11400714819323198485
+	for i := 0; i < len(tag); i++ {
+		hash = (hash ^ uint64(tag[i])) * 1099511628211
+	}
+	return &t.counters[hash%uint64(len(t.counters))]
 }
 func (t *trafficTracker) setUsers(tag string, users []panel.UserInfo) {
 	m := map[string]panel.UserInfo{}
@@ -72,18 +91,39 @@ func (t *trafficTracker) account(tag string, uid int, up, down int) {
 	if up == 0 && down == 0 {
 		return
 	}
-	t.mu.Lock()
-	defer t.mu.Unlock()
+	// When no budgets are configured, packet I/O skips admission locking.
+	if t.hasBudgets.Load() {
+		t.accountBudget(tag, up, down)
+	}
+	c := t.counter(tag, uid)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	k := trafficKey{tag, uid}
+	v := c.traffic[k]
+	v.UID = uid
+	v.Upload += int64(up)
+	v.Download += int64(down)
+	c.traffic[k] = v
+	c.activity[k] += int64(up + down)
+}
+
+// Metadata publication stays under the admission barrier. Byte increments use
+// the shared quota's atomic counter, allowing independent users to account in
+// parallel while a period/configuration update still excludes all increments.
+func (t *trafficTracker) accountBudget(tag string, up, down int) {
+	t.mu.RLock()
+	var closeList []io.Closer
 	if b := t.budgets[tag]; b != nil {
-		wasBlocked := t.budgetBlockedLocked(tag)
+		var bytes int64
 		if b.CountingMode != "download" {
-			b.UsedBytes += int64(up)
+			bytes += int64(up)
 		}
 		if b.CountingMode != "upload" {
-			b.UsedBytes += int64(down)
+			bytes += int64(down)
 		}
-		if !wasBlocked && t.budgetBlockedLocked(tag) {
-			var closeList []io.Closer
+		used := b.used.Add(bytes)
+		// Only the increment crossing the threshold schedules connection closure.
+		if b.LimitBytes > 0 && used-bytes < b.LimitBytes && used >= b.LimitBytes {
 			for other, quota := range t.budgets {
 				if quota == b {
 					for c, m := range t.connections[other] {
@@ -92,43 +132,43 @@ func (t *trafficTracker) account(tag string, uid int, up, down int) {
 					}
 				}
 			}
-			go func() {
-				for _, c := range closeList {
-					c.Close()
-				}
-			}()
 		}
 	}
-	k := trafficKey{tag, uid}
-	v := t.traffic[k]
-	v.UID = uid
-	v.Upload += int64(up)
-	v.Download += int64(down)
-	t.traffic[k] = v
-	t.activity[k] += int64(up + down)
+	t.mu.RUnlock()
+	if len(closeList) > 0 {
+		go func() {
+			for _, c := range closeList {
+				_ = c.Close()
+			}
+		}()
+	}
 }
 func (t *trafficTracker) takeTraffic(tag string, min int) []panel.UserTraffic {
-	t.mu.Lock()
-	defer t.mu.Unlock()
 	var out []panel.UserTraffic
-	for k, v := range t.traffic {
-		if k.tag == tag && v.Upload+v.Download > int64(min)*1000 {
-			out = append(out, v)
-			delete(t.traffic, k)
+	for i := range t.counters {
+		c := &t.counters[i]
+		c.mu.Lock()
+		for k, v := range c.traffic {
+			if k.tag == tag && v.Upload+v.Download > int64(min)*1000 {
+				out = append(out, v)
+				delete(c.traffic, k)
+			}
 		}
+		c.mu.Unlock()
 	}
 	return out
 }
 func (t *trafficTracker) restoreTraffic(tag string, items []panel.UserTraffic) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
 	for _, v := range items {
+		c := t.counter(tag, v.UID)
+		c.mu.Lock()
 		k := trafficKey{tag, v.UID}
-		old := t.traffic[k]
+		old := c.traffic[k]
 		old.UID = v.UID
 		old.Upload += v.Upload
 		old.Download += v.Download
-		t.traffic[k] = old
+		c.traffic[k] = old
+		c.mu.Unlock()
 	}
 }
 func (t *trafficTracker) closeNode(tag string) {
@@ -194,9 +234,9 @@ func (t *trafficTracker) newMeter(ctx context.Context, m adapter.InboundContext)
 	return &meter{tracker: t, tag: m.Inbound, user: user, identity: m.User, ip: ip, uid: u.Id, ctx: ctx, cancel: cancel, limiter: l}
 }
 func (m *meter) wait(n int) error {
-	m.tracker.mu.Lock()
+	m.tracker.mu.RLock()
 	blocked := m.tracker.budgetBlockedLocked(m.tag)
-	m.tracker.mu.Unlock()
+	m.tracker.mu.RUnlock()
 	if blocked {
 		return net.ErrClosed
 	}
@@ -364,14 +404,17 @@ func (c *meteredPacketConn) ReaderReplaceable() bool { return false }
 func (c *meteredPacketConn) WriterReplaceable() bool { return false }
 
 func (t *trafficTracker) takeActivity(tag string) map[int]int64 {
-	t.mu.Lock()
-	defer t.mu.Unlock()
 	out := map[int]int64{}
-	for k, n := range t.activity {
-		if k.tag == tag {
-			out[k.uid] = n
-			delete(t.activity, k)
+	for i := range t.counters {
+		c := &t.counters[i]
+		c.mu.Lock()
+		for k, n := range c.activity {
+			if k.tag == tag {
+				out[k.uid] = n
+				delete(c.activity, k)
+			}
 		}
+		c.mu.Unlock()
 	}
 	return out
 }

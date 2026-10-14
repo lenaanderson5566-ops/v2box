@@ -15,6 +15,7 @@ func (c *Controller) startTasks(node *panel.NodeInfo) {
 	c.nodeInfoMonitorPeriodic = &task.Task{
 		Name:     "nodeInfoMonitor",
 		Interval: node.PullInterval,
+		Jitter:   true,
 		Execute:  c.nodeInfoMonitor,
 		ReloadCh: c.server.ReloadCh,
 	}
@@ -22,6 +23,7 @@ func (c *Controller) startTasks(node *panel.NodeInfo) {
 	c.userReportPeriodic = &task.Task{
 		Name:     "reportUserTrafficTask",
 		Interval: node.PushInterval,
+		Jitter:   true,
 		Execute:  c.reportUserTrafficTask,
 		ReloadCh: c.server.ReloadCh,
 	}

@@ -3,6 +3,7 @@ package task
 import (
 	"context"
 	log "github.com/sirupsen/logrus"
+	"math/rand/v2"
 	"sync"
 	"time"
 )
@@ -12,6 +13,7 @@ import (
 type Task struct {
 	Name     string
 	Interval time.Duration
+	Jitter   bool
 	Execute  func(context.Context) error
 	ReloadCh chan struct{}
 	mu       sync.Mutex
@@ -33,7 +35,7 @@ func (t *Task) Start(first bool) error {
 		if first {
 			t.execute(ctx)
 		}
-		ticker := time.NewTicker(t.Interval)
+		ticker := time.NewTicker(t.nextInterval())
 		defer ticker.Stop()
 		for {
 			select {
@@ -41,6 +43,9 @@ func (t *Task) Start(first bool) error {
 				return
 			case <-ticker.C:
 				t.execute(ctx)
+				if t.Jitter {
+					ticker.Reset(t.nextInterval())
+				}
 			}
 		}
 	}()
@@ -61,4 +66,17 @@ func (t *Task) Close() {
 		cancel()
 		<-done
 	}
+}
+
+// Positive jitter spreads panel requests without polling more frequently than
+// configured. Each task still has exactly one synchronous callback at a time.
+func (t *Task) nextInterval() time.Duration {
+	if !t.Jitter {
+		return t.Interval
+	}
+	spread := t.Interval / 10
+	if spread <= 0 || t.Interval > time.Duration(1<<63-1)-spread {
+		return t.Interval
+	}
+	return t.Interval + time.Duration(rand.Int64N(int64(spread)))
 }

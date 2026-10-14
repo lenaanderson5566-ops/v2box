@@ -4,6 +4,7 @@ import (
 	"context"
 	panel "github.com/lenaanderson5566-ops/v2box/api/v2board"
 	"github.com/lenaanderson5566-ops/v2box/limiter"
+	"sync"
 	"testing"
 	"time"
 )
@@ -100,5 +101,49 @@ func TestTrafficBudgetUDPRecovery(t *testing.T) {
 	fresh := packetClient(t, client, echo.LocalAddr())
 	if err := packetRoundTrip(fresh, echo.LocalAddr(), "recovered"); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestConcurrentSharedBudgetAccounting(t *testing.T) {
+	v := &V2Core{tracker: newTrafficTracker()}
+	budget := &panel.TrafficBudget{ID: 1, CountingMode: "both", PeriodStart: "x"}
+	v.SetTrafficBudget("a", budget)
+	v.SetTrafficBudget("b", budget)
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 100; i++ {
+			v.SetTrafficBudget("a", budget)
+			v.SetTrafficBudget("b", budget)
+			v.TrafficBudgetSnapshot("a")
+		}
+	}()
+	for i := 0; i < 32; i++ {
+		wg.Add(1)
+		go func(uid int) {
+			defer wg.Done()
+			for n := 0; n < 1000; n++ {
+				tag := "a"
+				if uid%2 == 0 {
+					tag = "b"
+				}
+				v.tracker.account(tag, uid, 3, 7)
+			}
+		}(i + 1)
+	}
+	wg.Wait()
+	for _, tag := range []string{"a", "b"} {
+		if got := v.TrafficBudgetSnapshot(tag); got.UsedBytes != 32*1000*10 {
+			t.Fatalf("shared quota lost bytes: %+v", got)
+		}
+	}
+	v.SetTrafficBudget("a", nil)
+	if !v.tracker.hasBudgets.Load() {
+		t.Fatal("remaining shared budget was bypassed")
+	}
+	v.SetTrafficBudget("b", nil)
+	if v.tracker.hasBudgets.Load() {
+		t.Fatal("removed budgets still take exclusive lock")
 	}
 }
