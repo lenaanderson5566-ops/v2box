@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	_ "net/http/pprof"
@@ -9,12 +10,12 @@ import (
 	"runtime"
 	"syscall"
 
+	"github.com/lenaanderson5566-ops/v2box/conf"
+	"github.com/lenaanderson5566-ops/v2box/core"
+	"github.com/lenaanderson5566-ops/v2box/limiter"
+	"github.com/lenaanderson5566-ops/v2box/node"
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
-	"github.com/wyx2685/v2node/conf"
-	"github.com/wyx2685/v2node/core"
-	"github.com/wyx2685/v2node/limiter"
-	"github.com/wyx2685/v2node/node"
 )
 
 var (
@@ -24,22 +25,22 @@ var (
 
 var serverCommand = cobra.Command{
 	Use:   "server",
-	Short: "Run v2node server",
-	Run:   serverHandle,
+	Short: "Run v2box sing-box backend",
+	RunE:  serverHandle,
 	Args:  cobra.NoArgs,
 }
 
 func init() {
 	serverCommand.PersistentFlags().
 		StringVarP(&config, "config", "c",
-			"/etc/v2node/config.json", "config file path")
+			"/etc/v2box/config.json", "config file path")
 	serverCommand.PersistentFlags().
 		BoolVarP(&watch, "watch", "w",
 			true, "watch file path change")
 	command.AddCommand(&serverCommand)
 }
 
-func serverHandle(_ *cobra.Command, _ []string) {
+func serverHandle(_ *cobra.Command, _ []string) error {
 	showVersion()
 	c := conf.New()
 	err := c.LoadFromPath(config)
@@ -50,7 +51,7 @@ func serverHandle(_ *cobra.Command, _ []string) {
 	})
 	if err != nil {
 		log.WithField("err", err).Error("Load config file failed")
-		return
+		return err
 	}
 	switch c.LogConfig.Level {
 	case "debug":
@@ -67,7 +68,9 @@ func serverHandle(_ *cobra.Command, _ []string) {
 		if err != nil {
 			log.WithField("err", err).Error("Open log file failed, using stdout instead")
 		}
-		log.SetOutput(f)
+		if err == nil {
+			log.SetOutput(f)
+		}
 	}
 	// Enable pprof if configured
 	if c.PprofPort != 0 {
@@ -84,7 +87,7 @@ func serverHandle(_ *cobra.Command, _ []string) {
 	nodes, err := node.New(c.NodeConfigs)
 	if err != nil {
 		log.WithField("err", err).Error("Get node info failed")
-		return
+		return err
 	}
 	log.Info("Got nodes info from server")
 	//core
@@ -94,49 +97,61 @@ func serverHandle(_ *cobra.Command, _ []string) {
 	err = v2core.Start(nodes.NodeInfos)
 	if err != nil {
 		log.WithField("err", err).Error("Start core failed")
-		return
+		return err
 	}
-	defer v2core.Close()
+	defer func() { _ = nodes.Close(); _ = v2core.Close() }()
 	//node
 	err = nodes.Start(c.NodeConfigs, v2core)
 	if err != nil {
 		log.WithField("err", err).Error("Run nodes failed")
-		return
+		return err
 	}
 	log.Info("Nodes started")
 	if watch {
 		// On file change, just signal reload; do not run reload concurrently here
-		err = c.Watch(config, func() {
+		stopWatch, watchErr := c.Watch(config, func() {
 			select {
 			case reloadCh <- struct{}{}:
 			default: // drop if a reload is already queued
 			}
 		})
-		if err != nil {
-			log.WithField("err", err).Error("start watch failed")
-			return
+		if watchErr != nil {
+			log.WithField("err", watchErr).Error("start watch failed")
+			return watchErr
 		}
+		defer stopWatch()
 	}
 	// clear memory
 	runtime.GC()
 
 	osSignals := make(chan os.Signal, 1)
 	signal.Notify(osSignals, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(osSignals)
 
 	for {
 		select {
 		case <-osSignals:
 			log.Info("收到退出信号，正在关闭程序...")
-			os.Exit(0)
+			return nil
 		case <-reloadCh:
 			log.Info("收到重启信号，正在重新加载配置...")
 			if err := reload(config, &nodes, &v2core); err != nil {
-				log.WithField("err", err).Panic("重启失败")
+				var rejected *reloadRejected
+				if errors.As(err, &rejected) {
+					log.WithError(err).Error("Configuration rejected; existing nodes retained")
+					continue
+				}
+				return fmt.Errorf("reload failed: %w", err)
 			}
 			log.Info("重启成功")
 		}
 	}
 }
+
+type reloadRejected struct{ err error }
+
+func (e *reloadRejected) Error() string { return e.err.Error() }
+func (e *reloadRejected) Unwrap() error { return e.err }
 
 func reload(config string, nodes **node.Node, v2core **core.V2Core) error {
 	// Preserve old reload channel so new core continues to receive signals
@@ -145,16 +160,30 @@ func reload(config string, nodes **node.Node, v2core **core.V2Core) error {
 		oldReloadCh = (*v2core).ReloadCh
 	}
 
+	newConf := conf.New()
+	if err := newConf.LoadFromPath(config); err != nil {
+		return &reloadRejected{err}
+	}
+	newNodes, err := node.New(newConf.NodeConfigs)
+	if err != nil {
+		return &reloadRejected{err}
+	}
+	newCore := core.New(newConf)
+	if err := newCore.Start(newNodes.NodeInfos); err != nil {
+		return &reloadRejected{err}
+	}
+	if err := newNodes.PrepareUsers(newCore); err != nil {
+		return &reloadRejected{err}
+	}
+	if err := newNodes.PrepareCertificates(); err != nil {
+		return &reloadRejected{err}
+	}
+	// Validate before stopping live listeners. Parsing failures and panel outages
+	// must not interrupt the currently applied configuration.
 	if err := (*nodes).Close(); err != nil {
 		return err
 	}
-
 	if err := (*v2core).Close(); err != nil {
-		return err
-	}
-
-	newConf := conf.New()
-	if err := newConf.LoadFromPath(config); err != nil {
 		return err
 	}
 
@@ -177,16 +206,13 @@ func reload(config string, nodes **node.Node, v2core **core.V2Core) error {
 			if oldWriter, ok := log.StandardLogger().Out.(*os.File); ok && oldWriter != os.Stdout && oldWriter != os.Stderr {
 				oldWriter.Close()
 			}
-			log.SetOutput(f)
+			if err == nil {
+				log.SetOutput(f)
+			}
 		}
 	}
 
-	newNodes, err := node.New(newConf.NodeConfigs)
-	if err != nil {
-		return err
-	}
-
-	newCore := core.New(newConf)
+	newCore.PreserveAccountingFrom(*v2core)
 	// Reattach reload channel
 	newCore.ReloadCh = oldReloadCh
 	if err := newCore.Start(newNodes.NodeInfos); err != nil {
@@ -194,6 +220,8 @@ func reload(config string, nodes **node.Node, v2core **core.V2Core) error {
 	}
 
 	if err := newNodes.Start(newConf.NodeConfigs, newCore); err != nil {
+		_ = newNodes.Close()
+		_ = newCore.Close()
 		return err
 	}
 

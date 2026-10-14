@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"encoding/json"
+	"github.com/lenaanderson5566-ops/v2box/conf"
 )
 
 // Security type
@@ -32,11 +33,13 @@ type NodeInfo struct {
 }
 
 type CommonNode struct {
-	Protocol   string      `json:"protocol"`
-	ListenIP   string      `json:"listen_ip"`
-	ServerPort int         `json:"server_port"`
-	Routes     []Route     `json:"routes"`
-	BaseConfig *BaseConfig `json:"base_config"`
+	SingBox     json.RawMessage  `json:"sing_box"`
+	LandingPage conf.LandingPage `json:"-"`
+	Protocol    string           `json:"protocol"`
+	ListenIP    string           `json:"listen_ip"`
+	ServerPort  int              `json:"server_port"`
+	Routes      []Route          `json:"routes"`
+	BaseConfig  *BaseConfig      `json:"base_config"`
 	//vless vmess trojan
 	Tls                  int         `json:"tls"`
 	TlsSettings          TlsSettings `json:"tls_settings"`
@@ -119,7 +122,13 @@ type EncSettings struct {
 }
 
 func (c *Client) GetNodeInfo(ctx context.Context) (node *NodeInfo, err error) {
-	const path = "/api/v2/server/config"
+	path := "/api/v2/server/config"
+	if c.v10 {
+		if err := c.announceCapabilities(ctx); err != nil {
+			return nil, err
+		}
+		path = c.nodePath("configuration")
+	}
 	r, err := c.client.
 		R().
 		SetContext(ctx).
@@ -136,13 +145,14 @@ func (c *Client) GetNodeInfo(ctx context.Context) (node *NodeInfo, err error) {
 	if r.StatusCode() == 304 {
 		return nil, nil
 	}
+	if r.StatusCode() < 200 || r.StatusCode() >= 300 {
+		return nil, fmt.Errorf("node API returned HTTP %d", r.StatusCode())
+	}
 	hash := sha256.Sum256(r.Body())
 	newBodyHash := hex.EncodeToString(hash[:])
 	if c.responseBodyHash == newBodyHash {
 		return nil, nil
 	}
-	c.responseBodyHash = newBodyHash
-	c.nodeEtag = r.Header().Get("ETag")
 
 	if r != nil {
 		defer func() {
@@ -158,12 +168,28 @@ func (c *Client) GetNodeInfo(ctx context.Context) (node *NodeInfo, err error) {
 	}
 	// parse protocol params
 	cm := &CommonNode{}
-	err = json.Unmarshal(r.Body(), cm)
+	if c.v10 {
+		err = decodeV10Config(r.Body(), cm)
+		if err == nil {
+			var metadata struct {
+				Data struct {
+					TrafficBatchDedup      bool `json:"trafficBatchDedup"`
+					TrafficBudgetSupported bool `json:"trafficBudgetSupported"`
+				} `json:"data"`
+			}
+			if json.Unmarshal(r.Body(), &metadata) == nil {
+				c.trafficDedup.Store(metadata.Data.TrafficBatchDedup)
+				c.budgetSupported.Store(metadata.Data.TrafficBudgetSupported)
+			}
+		}
+	} else {
+		err = json.Unmarshal(r.Body(), cm)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("decode node params error: %s", err)
 	}
 	switch cm.Protocol {
-	case "vmess", "trojan", "hysteria2", "tuic", "anytls", "vless":
+	case "naive", "vmess", "trojan", "hysteria2", "tuic", "anytls", "vless":
 		node.Type = cm.Protocol
 		node.Security = cm.Tls
 	case "shadowsocks":
@@ -176,10 +202,10 @@ func (c *Client) GetNodeInfo(ctx context.Context) (node *NodeInfo, err error) {
 	cf := cm.TlsSettings.CertFile
 	kf := cm.TlsSettings.KeyFile
 	if cf == "" {
-		cf = filepath.Join("/etc/v2node/", cm.Protocol+strconv.Itoa(c.NodeId)+".cer")
+		cf = filepath.Join("/etc/v2box/", cm.Protocol+strconv.Itoa(c.NodeId)+".cer")
 	}
 	if kf == "" {
-		kf = filepath.Join("/etc/v2node/", cm.Protocol+strconv.Itoa(c.NodeId)+".key")
+		kf = filepath.Join("/etc/v2box/", cm.Protocol+strconv.Itoa(c.NodeId)+".key")
 	}
 	cm.CertInfo = &CertInfo{
 		CertMode:         cm.TlsSettings.CertMode,
@@ -204,16 +230,28 @@ func (c *Client) GetNodeInfo(ctx context.Context) (node *NodeInfo, err error) {
 		cm.CertInfo.TlsCert = cm.TlsSettings.TlsCert
 		cm.CertInfo.TlsKey = cm.TlsSettings.TlsKey
 	}
+	if cm.BaseConfig == nil {
+		return nil, fmt.Errorf("missing base_config")
+	}
 	// set interval
 	node.PushInterval = intervalToTime(cm.BaseConfig.PushInterval)
 	node.PullInterval = intervalToTime(cm.BaseConfig.PullInterval)
 
+	if node.PushInterval <= 0 || node.PullInterval <= 0 {
+		return nil, fmt.Errorf("invalid panel intervals")
+	}
 	node.Common = cm
+	cm.LandingPage = c.landingPage
+	c.responseBodyHash = newBodyHash
+	c.nodeEtag = r.Header().Get("ETag")
 
 	return node, nil
 }
 
 func intervalToTime(i interface{}) time.Duration {
+	if i == nil {
+		return 0
+	}
 	switch reflect.TypeOf(i).Kind() {
 	case reflect.Int:
 		return time.Duration(i.(int)) * time.Second
@@ -223,7 +261,7 @@ func intervalToTime(i interface{}) time.Duration {
 	case reflect.Float64:
 		return time.Duration(i.(float64)) * time.Second
 	default:
-		return time.Duration(reflect.ValueOf(i).Int()) * time.Second
+		return 0
 	}
 }
 

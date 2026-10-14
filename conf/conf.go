@@ -23,11 +23,21 @@ type LogConfig struct {
 }
 
 type NodeConfig struct {
-	APIHost    string `mapstructure:"ApiHost"`
-	NodeID     int    `mapstructure:"NodeID"`
-	Key        string `mapstructure:"ApiKey"`
-	Timeout    int    `mapstructure:"Timeout"`
-	RetryCount *int   `mapstructure:"RetryCount"`
+	TrafficSpoolDirectory string      `mapstructure:"TrafficSpoolDirectory"`
+	APIVersion            string      `mapstructure:"ApiVersion"`
+	LandingPage           LandingPage `mapstructure:"LandingPage"`
+	NodeType              string      `mapstructure:"NodeType"`
+	APIHost               string      `mapstructure:"ApiHost"`
+	NodeID                int         `mapstructure:"NodeID"`
+	Key                   string      `mapstructure:"ApiKey"`
+	Timeout               int         `mapstructure:"Timeout"`
+	RetryCount            *int        `mapstructure:"RetryCount"`
+}
+
+// LandingPage is local to the node; paths are never supplied by panel responses.
+type LandingPage struct {
+	Enabled   bool   `mapstructure:"Enabled" json:"enabled"`
+	Directory string `mapstructure:"Directory" json:"directory"`
 }
 
 func New() *Conf {
@@ -53,6 +63,9 @@ func (p *Conf) LoadFromPath(filePath string) error {
 	}
 	if err := v.Unmarshal(p); err != nil {
 		return fmt.Errorf("unmarshal config error: %s", err)
+	}
+	if len(p.NodeConfigs) == 0 {
+		return fmt.Errorf("at least one node is required")
 	}
 	for i := range p.NodeConfigs {
 		if p.NodeConfigs[i].RetryCount == nil {

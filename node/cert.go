@@ -12,21 +12,34 @@ import (
 	"os"
 	"time"
 
+	"github.com/lenaanderson5566-ops/v2box/common/file"
 	log "github.com/sirupsen/logrus"
-	"github.com/wyx2685/v2node/common/file"
 )
 
 func (c *Controller) renewCertTask(_ context.Context) error {
-	l, err := NewLego(c.info.Common.CertInfo)
+	cert := c.info.Common.CertInfo
+	pem, err := os.ReadFile(cert.CertFile)
 	if err != nil {
-		log.WithField("tag", c.tag).Info("new lego error: ", err)
+		return err
+	}
+	due, err := (&Lego{}).CheckCert(pem)
+	if err != nil {
+		return err
+	}
+	if !due {
 		return nil
 	}
-	err = l.RenewCert()
+	err = guardedACME(cert, func() error {
+		l, err := NewLego(cert)
+		if err != nil {
+			return err
+		}
+		return l.RenewCert()
+	})
 	if err != nil {
-		log.WithField("tag", c.tag).Info("renew cert error: ", err)
-		return nil
+		log.WithField("tag", c.tag).WithError(err).Warn("Certificate renewal paused or failed; existing certificate retained")
 	}
+
 	return nil
 }
 
@@ -45,14 +58,16 @@ func (c *Controller) requestCert() error {
 		if file.IsExist(cert.CertFile) && file.IsExist(cert.KeyFile) {
 			return nil
 		}
-		l, err := NewLego(cert)
-		if err != nil {
-			return fmt.Errorf("create lego object error: %s", err)
+		if err := guardedACME(cert, func() error {
+			l, err := NewLego(cert)
+			if err != nil {
+				return err
+			}
+			return l.CreateCert()
+		}); err != nil {
+			return err
 		}
-		err = l.CreateCert()
-		if err != nil {
-			return fmt.Errorf("create lego cert error: %s", err)
-		}
+
 	case "self":
 		if cert.CertFile == "" || cert.KeyFile == "" {
 			return fmt.Errorf("cert file path or key file path not exist")
@@ -68,22 +83,7 @@ func (c *Controller) requestCert() error {
 			return fmt.Errorf("generate self cert error: %s", err)
 		}
 	case "remote":
-		if cert.CertFile == "" || cert.KeyFile == "" {
-			return fmt.Errorf("cert file path or key file path not exist")
-		}
-		if file.IsExist(cert.CertFile) && file.IsExist(cert.KeyFile) {
-			return nil
-		}
-		if cert.TlsCert == "" || cert.TlsKey == "" {
-			return fmt.Errorf("tls cert or tls key not exist")
-		}
-		if err := os.WriteFile(cert.CertFile, []byte(cert.TlsCert), 0644); err != nil {
-			return fmt.Errorf("write remote cert error: %s", err)
-		}
-		if err := os.WriteFile(cert.KeyFile, []byte(cert.TlsKey), 0600); err != nil {
-			return fmt.Errorf("write remote key error: %s", err)
-		}
-
+		return nil // sing-box reads the certificate from memory
 	default:
 		return fmt.Errorf("unsupported certmode: %s", cert.CertMode)
 	}
@@ -91,7 +91,10 @@ func (c *Controller) requestCert() error {
 }
 
 func generateSelfSslCertificate(domain, certPath, keyPath string) error {
-	key, _ := rsa.GenerateKey(rand.Reader, 2048)
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		return err
+	}
 	tmpl := &x509.Certificate{
 		Version:      3,
 		SerialNumber: big.NewInt(time.Now().Unix()),
@@ -109,27 +112,14 @@ func generateSelfSslCertificate(domain, certPath, keyPath string) error {
 	if err != nil {
 		return err
 	}
-	f, err := os.OpenFile(certPath, os.O_CREATE|os.O_RDWR, 0644)
-	if err != nil {
+	if err := checkPath(certPath); err != nil {
 		return err
 	}
-	err = pem.Encode(f, &pem.Block{
-		Type:  "CERTIFICATE",
-		Bytes: cert,
-	})
-	if err != nil {
+	if err := checkPath(keyPath); err != nil {
 		return err
 	}
-	f, err = os.OpenFile(keyPath, os.O_CREATE|os.O_RDWR, 0644)
-	if err != nil {
+	if err := os.WriteFile(certPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert}), 0644); err != nil {
 		return err
 	}
-	err = pem.Encode(f, &pem.Block{
-		Type:  "EC PRIVATE KEY",
-		Bytes: x509.MarshalPKCS1PrivateKey(key),
-	})
-	if err != nil {
-		return err
-	}
-	return nil
+	return os.WriteFile(keyPath, pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)}), 0600)
 }

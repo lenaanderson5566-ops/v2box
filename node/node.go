@@ -4,10 +4,10 @@ import (
 	"context"
 	"fmt"
 
+	panel "github.com/lenaanderson5566-ops/v2box/api/v2board"
+	"github.com/lenaanderson5566-ops/v2box/conf"
+	"github.com/lenaanderson5566-ops/v2box/core"
 	log "github.com/sirupsen/logrus"
-	panel "github.com/wyx2685/v2node/api/v2board"
-	"github.com/wyx2685/v2node/conf"
-	"github.com/wyx2685/v2node/core"
 )
 
 type Node struct {
@@ -57,5 +57,30 @@ func (n *Node) Close() error {
 		}
 	}
 	n.controllers = nil
+	return nil
+}
+
+// PrepareCertificates runs before live nodes are stopped during a reload.
+func (n *Node) PrepareCertificates() error {
+	for _, c := range n.controllers {
+		if c.info.Security == panel.Tls {
+			if err := c.requestCert(); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// PrepareUsers validates panel authentication data while old nodes are still serving.
+func (n *Node) PrepareUsers(server *core.V2Core) error {
+	for _, c := range n.controllers {
+		if err := c.prepareUsers(); err != nil {
+			return err
+		}
+		if err := server.ValidateNodeUsers(c.info, c.userList); err != nil {
+			return err
+		}
+	}
 	return nil
 }
