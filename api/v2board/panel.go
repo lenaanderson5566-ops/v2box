@@ -3,6 +3,7 @@ package panel
 import (
 	"errors"
 	"fmt"
+	"net/url"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -35,6 +36,10 @@ type Client struct {
 }
 
 func New(c *conf.NodeConfig) (*Client, error) {
+	endpoint, err := url.Parse(c.APIHost)
+	if err != nil || endpoint.Scheme != "https" || endpoint.Hostname() == "" || endpoint.User != nil || endpoint.RawQuery != "" || endpoint.ForceQuery || endpoint.Fragment != "" || endpoint.Opaque != "" {
+		return nil, errors.New("ApiHost must be an HTTPS URL without credentials, query or fragment; update the panel address before upgrading this node")
+	}
 	nodeType := c.NodeType
 	if nodeType == "" {
 		nodeType = "v2node"
@@ -43,6 +48,7 @@ func New(c *conf.NodeConfig) (*Client, error) {
 		return nil, fmt.Errorf("unsupported NodeType %q", nodeType)
 	}
 	client := resty.New()
+	client.SetRedirectPolicy(resty.NoRedirectPolicy())
 	retryCount := conf.DefaultNodeRetryCount
 	if c.RetryCount != nil {
 		retryCount = *c.RetryCount

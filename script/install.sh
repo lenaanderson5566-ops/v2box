@@ -61,7 +61,13 @@ if command -v systemctl >/dev/null; then init=systemd
 elif command -v rc-service >/dev/null; then init=openrc
 else echo 'systemd or OpenRC is required' >&2; exit 1; fi
 if [[ -n "$api_host$node_id$api_key" ]]; then
-  [[ "$api_host" =~ ^https?:// && "$node_id" =~ ^[1-9][0-9]*$ && -n "$api_key" ]] || { echo 'Supply all three valid panel arguments' >&2; exit 1; }
+  [[ "$api_host" =~ ^https://[^/?#[:space:]@]+(/[^?#[:space:]]*)?$ && "$node_id" =~ ^[1-9][0-9]*$ && -n "$api_key" ]] || { echo 'Supply an HTTPS panel URL without credentials/query/fragment, a node ID and an API key' >&2; exit 1; }
+fi
+if [[ -f /etc/v2box/config.json ]]; then
+  jq -e '.Nodes | type == "array" and length > 0 and all(.[]; (.ApiHost | type == "string") and (.ApiHost | test("^https://[^/?#\\s@]+(/[^?#\\s]*)?$")))' /etc/v2box/config.json >/dev/null || {
+    echo 'Existing config requires HTTPS ApiHost for every node. Correct it before upgrading; the installed binary and service have not been changed.' >&2
+    exit 1
+  }
 fi
 if [[ -z "$version" ]]; then
   version=$(curl -fsSL "https://api.github.com/repos/$repo/releases/latest" | jq -er .tag_name)

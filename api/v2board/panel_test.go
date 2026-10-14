@@ -13,12 +13,12 @@ func TestUserListAndFailedReport(t *testing.T) {
 	var status atomic.Int64
 	status.Store(200)
 	body := `{"users":[]}`
-	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	s := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(int(status.Load()))
 		_, _ = w.Write([]byte(body))
 	}))
 	defer s.Close()
-	c, err := New(&conf.NodeConfig{APIVersion: "legacy", APIHost: s.URL, NodeID: 1, Key: "test", RetryCount: new(int)})
+	c, err := newTestPanel(t, s, &conf.NodeConfig{APIVersion: "legacy", APIHost: s.URL, NodeID: 1, Key: "test", RetryCount: new(int)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -40,10 +40,27 @@ func TestUserListAndFailedReport(t *testing.T) {
 	}
 }
 
+func TestPanelRejectsUnsafeEndpoints(t *testing.T) {
+	for _, endpoint := range []string{
+		"http://panel.example.test",
+		"https://user:fixture@panel.example.test",
+		"https://panel.example.test/?token=fixture",
+		"https://panel.example.test/#fragment",
+		"https://panel.example.test/?",
+		"https:///missing-host",
+	} {
+		t.Run(endpoint, func(t *testing.T) {
+			if _, err := New(&conf.NodeConfig{APIHost: endpoint}); err == nil {
+				t.Fatal("unsafe panel endpoint accepted")
+			}
+		})
+	}
+}
+
 func TestNodeTypeCompatibility(t *testing.T) {
 	for _, tc := range []struct{ configured, expected string }{{"", "v2node"}, {"v2node", "v2node"}, {"v2box", "v2box"}} {
 		t.Run(tc.expected+tc.configured, func(t *testing.T) {
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if r.URL.Query().Get("node_type") != tc.expected {
 					t.Errorf("wrong node type: %s", r.URL.RawQuery)
 				}
@@ -53,7 +70,7 @@ func TestNodeTypeCompatibility(t *testing.T) {
 				_, _ = w.Write([]byte(`{"users":[]}`))
 			}))
 			defer server.Close()
-			client, err := New(&conf.NodeConfig{APIVersion: "legacy", APIHost: server.URL, NodeID: 42, Key: "test", NodeType: tc.configured})
+			client, err := newTestPanel(t, server, &conf.NodeConfig{APIVersion: "legacy", APIHost: server.URL, NodeID: 42, Key: "test", NodeType: tc.configured})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -68,14 +85,14 @@ func TestNodeTypeCompatibility(t *testing.T) {
 }
 
 func TestNaiveNodeConfig(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/api/v2/server/config" || r.URL.Query().Get("node_type") != "v2box" {
 			t.Error("incorrect Naive node request")
 		}
 		_, _ = w.Write([]byte(`{"protocol":"naive","network":"tcp","tls":1,"server_port":443,"tls_settings":{"cert_mode":"file","server_name":"naive.example","cert_file":"/cert.pem","key_file":"/key.pem"},"base_config":{"push_interval":60,"pull_interval":60}}`))
 	}))
 	defer server.Close()
-	client, err := New(&conf.NodeConfig{APIVersion: "legacy", APIHost: server.URL, NodeID: 42, NodeType: "v2box", Key: "test"})
+	client, err := newTestPanel(t, server, &conf.NodeConfig{APIVersion: "legacy", APIHost: server.URL, NodeID: 42, NodeType: "v2box", Key: "test"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -89,12 +106,12 @@ func TestNaiveNodeConfig(t *testing.T) {
 }
 
 func TestLandingPageUsesLocalConfigOnly(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(`{"protocol":"naive","network":"tcp","tls":1,"server_port":443,"landing_page":{"enabled":true,"directory":"/etc"},"LandingPage":{"Enabled":true,"Directory":"/etc"},"base_config":{"push_interval":60,"pull_interval":60}}`))
 	}))
 	defer server.Close()
 	for _, local := range []conf.LandingPage{{}, {Enabled: true, Directory: "/site"}} {
-		client, err := New(&conf.NodeConfig{APIVersion: "legacy", APIHost: server.URL, LandingPage: local})
+		client, err := newTestPanel(t, server, &conf.NodeConfig{APIVersion: "legacy", APIHost: server.URL, LandingPage: local})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -122,9 +139,9 @@ func TestLegacyAliveErrorsAreNotEmptySuccess(t *testing.T) {
 		{"valid", 200, `{"alive":{"1":2}}`, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(tc.status); w.Write([]byte(tc.body)) }))
+			s := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(tc.status); w.Write([]byte(tc.body)) }))
 			defer s.Close()
-			c, err := New(&conf.NodeConfig{APIVersion: "legacy", APIHost: s.URL, NodeID: 1, Key: "test", RetryCount: new(int)})
+			c, err := newTestPanel(t, s, &conf.NodeConfig{APIVersion: "legacy", APIHost: s.URL, NodeID: 1, Key: "test", RetryCount: new(int)})
 			if err != nil {
 				t.Fatal(err)
 			}

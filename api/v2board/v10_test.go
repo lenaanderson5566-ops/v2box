@@ -22,7 +22,7 @@ func TestV10PanelFixture(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	s := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		if strings.HasSuffix(r.URL.Path, "/capabilities") {
 			w.Write([]byte(`{"data":{"accepted":true}}`))
@@ -31,7 +31,7 @@ func TestV10PanelFixture(t *testing.T) {
 		w.Write(data)
 	}))
 	defer s.Close()
-	c, err := New(&conf.NodeConfig{APIHost: s.URL, NodeType: "v2box", NodeID: 1, Key: "fixture"})
+	c, err := newTestPanel(t, s, &conf.NodeConfig{APIHost: s.URL, NodeType: "v2box", NodeID: 1, Key: "fixture"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -48,7 +48,7 @@ func TestV10Contract(t *testing.T) {
 	ctx := context.Background()
 	usersBody := `{"data":[{"id":42,"uuid":"user","speedLimit":10,"deviceLimit":2}]}`
 	badAck := false
-	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	s := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("X-Node-Type") != "v2box" || r.Header.Get("X-Node-ID") != "7" {
 			t.Error("missing node identity headers")
 		}
@@ -114,7 +114,7 @@ func TestV10Contract(t *testing.T) {
 		}
 	}))
 	defer s.Close()
-	c, err := New(&conf.NodeConfig{APIHost: s.URL, NodeType: "v2box", NodeID: 7, Key: "test-secret"})
+	c, err := newTestPanel(t, s, &conf.NodeConfig{APIHost: s.URL, NodeType: "v2box", NodeID: 7, Key: "test-secret"})
 	if err != nil {
 		t.Fatal(err)
 	}

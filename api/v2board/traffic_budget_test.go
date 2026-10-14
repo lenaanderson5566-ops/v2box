@@ -13,7 +13,7 @@ import (
 func TestTrafficBudgetPersistenceAndHigherLimit(t *testing.T) {
 	limit := 100
 	fail := false
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if fail {
 			w.WriteHeader(503)
 			return
@@ -22,7 +22,7 @@ func TestTrafficBudgetPersistenceAndHigherLimit(t *testing.T) {
 	}))
 	defer server.Close()
 	config := &conf.NodeConfig{NodeType: "v2box", NodeID: 7, APIHost: server.URL, TrafficSpoolDirectory: t.TempDir()}
-	c, _ := New(config)
+	c, _ := newTestPanel(t, server, config)
 	c.budgetSupported.Store(true)
 	budget, err := c.GetTrafficBudget(context.Background())
 	if err != nil {
@@ -32,7 +32,7 @@ func TestTrafficBudgetPersistenceAndHigherLimit(t *testing.T) {
 	if err = c.SaveTrafficBudget(budget); err != nil {
 		t.Fatal(err)
 	}
-	replacement, _ := New(config)
+	replacement, _ := newTestPanel(t, server, config)
 	replacement.budgetSupported.Store(true)
 	limit = 200
 	budget, err = replacement.GetTrafficBudget(context.Background())
@@ -46,9 +46,9 @@ func TestTrafficBudgetPersistenceAndHigherLimit(t *testing.T) {
 }
 
 func TestMalformedTrafficBudgetDoesNotDisableRestrictions(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.Write([]byte(`{}`)) }))
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.Write([]byte(`{}`)) }))
 	defer server.Close()
-	c, _ := New(&conf.NodeConfig{NodeType: "v2box", NodeID: 7, APIHost: server.URL, TrafficSpoolDirectory: t.TempDir()})
+	c, _ := newTestPanel(t, server, &conf.NodeConfig{NodeType: "v2box", NodeID: 7, APIHost: server.URL, TrafficSpoolDirectory: t.TempDir()})
 	c.budgetSupported.Store(true)
 	if _, err := c.GetTrafficBudget(context.Background()); err == nil {
 		t.Fatal("missing data silently disabled quota")

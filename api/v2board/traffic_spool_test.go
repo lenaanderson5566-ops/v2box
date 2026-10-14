@@ -18,7 +18,7 @@ func TestTrafficSpoolLostAcknowledgementAndRestart(t *testing.T) {
 	hits := 0
 	billed := 0
 	seen := map[string]bool{}
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var batch trafficBatch
 		if err := json.NewDecoder(r.Body).Decode(&batch); err != nil {
 			t.Error(err)
@@ -46,7 +46,7 @@ func TestTrafficSpoolLostAcknowledgementAndRestart(t *testing.T) {
 	defer server.Close()
 	zero := 0
 	cfg := &conf.NodeConfig{NodeType: "v2box", APIHost: server.URL, NodeID: 7, Key: "test", RetryCount: &zero, TrafficSpoolDirectory: t.TempDir()}
-	client, err := New(cfg)
+	client, err := newTestPanel(t, server, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -59,7 +59,7 @@ func TestTrafficSpoolLostAcknowledgementAndRestart(t *testing.T) {
 	if len(files) != 1 {
 		t.Fatal("missing durable batch")
 	}
-	replacement, err := New(cfg)
+	replacement, err := newTestPanel(t, server, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -77,10 +77,10 @@ func TestTrafficSpoolLostAcknowledgementAndRestart(t *testing.T) {
 func TestTrafficSpoolDowngradeAndStorageFailure(t *testing.T) {
 	zero := 0
 	hits := 0
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { hits++; w.Write([]byte(`{"data":{"accepted":true}}`)) }))
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { hits++; w.Write([]byte(`{"data":{"accepted":true}}`)) }))
 	defer server.Close()
 	cfg := &conf.NodeConfig{NodeType: "v2box", APIHost: server.URL, NodeID: 7, Key: "test", RetryCount: &zero, TrafficSpoolDirectory: t.TempDir()}
-	client, _ := New(cfg)
+	client, _ := newTestPanel(t, server, cfg)
 	os.MkdirAll(client.spoolPath(), 0700)
 	os.WriteFile(filepath.Join(client.spoolPath(), "pending.json"), []byte(`{}`), 0600)
 	retained, err := client.ReportUserTrafficReliable(context.Background(), []UserTraffic{{UID: 1, Upload: 5}})
@@ -98,7 +98,7 @@ func TestTrafficSpoolDowngradeAndStorageFailure(t *testing.T) {
 }
 
 func TestTrafficSpoolLegacyCompatibility(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var body map[string]json.RawMessage
 		json.NewDecoder(r.Body).Decode(&body)
 		if body["batchId"] != nil {
@@ -107,7 +107,7 @@ func TestTrafficSpoolLegacyCompatibility(t *testing.T) {
 		w.Write([]byte(`{"data":{"accepted":true}}`))
 	}))
 	defer server.Close()
-	client, _ := New(&conf.NodeConfig{NodeType: "v2box", APIHost: server.URL, NodeID: 7, TrafficSpoolDirectory: t.TempDir()})
+	client, _ := newTestPanel(t, server, &conf.NodeConfig{NodeType: "v2box", APIHost: server.URL, NodeID: 7, TrafficSpoolDirectory: t.TempDir()})
 	retained, err := client.ReportUserTrafficReliable(context.Background(), []UserTraffic{{UID: 1, Upload: 5}})
 	if retained || err != nil {
 		t.Fatal(err)
@@ -116,9 +116,9 @@ func TestTrafficSpoolLegacyCompatibility(t *testing.T) {
 
 func TestTrafficSpoolBoundedReplayWithoutNewTraffic(t *testing.T) {
 	hits := 0
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { hits++; w.Write([]byte(`{"data":{"accepted":true}}`)) }))
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { hits++; w.Write([]byte(`{"data":{"accepted":true}}`)) }))
 	defer server.Close()
-	client, _ := New(&conf.NodeConfig{NodeType: "v2box", APIHost: server.URL, NodeID: 7, TrafficSpoolDirectory: t.TempDir()})
+	client, _ := newTestPanel(t, server, &conf.NodeConfig{NodeType: "v2box", APIHost: server.URL, NodeID: 7, TrafficSpoolDirectory: t.TempDir()})
 	client.trafficDedup.Store(true)
 	if err := os.MkdirAll(client.spoolPath(), 0700); err != nil {
 		t.Fatal(err)

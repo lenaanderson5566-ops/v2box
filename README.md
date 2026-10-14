@@ -2,6 +2,14 @@
 
 面向修改版 V2board 的纯 sing-box 节点后端。基于 **sing-box v1.14.3**，不再使用 Xray。为支持用户热更新，仓库内维护了公开的入站适配和认证并发补丁，来源及修改范围见 `internal/README.md`。
 
+## 面板通讯 HTTPS
+
+节点的 `ApiHost` 必须使用 HTTPS，不接受 URL 内嵌账号、查询参数或片段。面板 API 请求不跟随重定向，请直接填写最终 HTTPS 地址。TLS 使用系统信任链校验证书，不提供跳过校验或 HTTP 回退开关；如使用私有 CA，需先安装到节点系统信任库。
+
+升级前先将每个节点的 `ApiHost` 改为已可用的 HTTPS 地址。安装脚本检查现有配置，发现 HTTP 地址会在替换程序与重启服务前退出。绕过安装脚本直接替换二进制时，HTTP 配置会被新程序拒绝。已运行的旧节点不会被本次后台更新主动断开。
+
+Cloudflare 公网 HTTPS 地址可用于节点通讯，后台不以源站连接是否为 HTTP 判断节点是否使用 HTTPS。Cloudflare 到源站的 TLS 需另行配置。旧接口暂时仍保留查询参数凭据格式，本次不更换密钥或迁移认证。
+
 ## 面板兼容
 
 V2Box 节点默认使用 `/api/v10/server/...`，包括 configuration、users、online-counts、traffic、online-users 和 capabilities。每个 `Nodes[]` 设置 `"NodeType": "v2box"`；`ApiVersion` 留空即使用 V10，也可显式填写 `"ApiVersion": "v10"`。凭据放在 Authorization Bearer 请求头，配置和用户列表支持 ETag。节点上报核心版本及能力，面板仅向声明支持原生路由的节点下发高级配置。
