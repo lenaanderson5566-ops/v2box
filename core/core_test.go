@@ -192,11 +192,16 @@ func TestProtocolConnectionsAndAccounting(t *testing.T) {
 			if err := v.SetUsers(n.Tag, users); err != nil {
 				t.Fatal(err)
 			}
+			v.SetTargetPolicy(n.Tag, panel.TargetPolicy{Enabled: true, Version: "test", LeaseSeconds: 120})
 			b := clientBox(t, n, testUUID)
 			exchange(t, b, echo.Addr())
 			traffic := awaitTraffic(t, v, n.Tag, int64(len("sing-box-backend-echo")*256))
 			if len(traffic) != 1 || traffic[0].UID != 42 || traffic[0].Upload != int64(len("sing-box-backend-echo")*256) || traffic[0].Download != int64(len("sing-box-backend-echo")*256) {
 				t.Fatalf("bad traffic: %+v", traffic)
+			}
+			targets := v.TargetBatch(n.Tag)
+			if targets == nil || len(targets.Records) != 1 || targets.Records[0].Target != "127.0.0.1" || targets.Records[0].UploadBytes != traffic[0].Upload || targets.Records[0].DownloadBytes != traffic[0].Download {
+				t.Fatalf("target accounting mismatch: %+v", targets)
 			}
 			v.RestoreUserTraffic(n.Tag, traffic)
 			restored, _ := v.GetUserTrafficSlice(n.Tag, 0)

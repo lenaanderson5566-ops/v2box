@@ -32,6 +32,13 @@ func (c *Controller) startTasks(node *panel.NodeInfo) {
 	_ = c.nodeInfoMonitorPeriodic.Start(false)
 	log.WithField("tag", c.tag).Info("Start report node status")
 	_ = c.userReportPeriodic.Start(false)
+	c.targetReportPeriodic = &task.Task{
+		Name:     "reportTargetStatistics",
+		Interval: max(10*time.Second, min(node.PushInterval, 30*time.Second)),
+		Jitter:   true,
+		Execute:  func(ctx context.Context) error { c.reportTargetStatistics(ctx); return nil },
+	}
+	_ = c.targetReportPeriodic.Start(true)
 	if node.Security == panel.Tls {
 		switch c.info.Common.CertInfo.CertMode {
 		case "none", "", "file", "self", "remote":

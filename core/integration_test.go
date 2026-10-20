@@ -111,8 +111,13 @@ func TestUDPAccounting(t *testing.T) {
 				n.Common.CertInfo = cert
 			}
 			v := startTestNode(t, n)
+			v.SetTargetPolicy(n.Tag, panel.TargetPolicy{Enabled: true, Version: "udp", LeaseSeconds: 120})
 			exchangeUDP(t, clientBox(t, n, testUUID), echo.LocalAddr())
 			traffic := awaitTraffic(t, v, n.Tag, int64(len("udp-accounting-echo")))
+			targets := v.TargetBatch(n.Tag)
+			if targets == nil || len(targets.Records) != 1 || targets.Records[0].Target != "127.0.0.1" || targets.Records[0].UploadBytes != traffic[0].Upload || targets.Records[0].DownloadBytes != traffic[0].Download {
+				t.Fatalf("UDP target mismatch: %+v", targets)
+			}
 			if len(traffic) != 1 || traffic[0].Upload == 0 || traffic[0].Download == 0 {
 				t.Fatalf("UDP traffic missing: %+v", traffic)
 			}

@@ -2,17 +2,22 @@ package node
 
 import (
 	"context"
+	"crypto/x509"
 	panel "github.com/lenaanderson5566-ops/v2box/api/v2board"
 	"github.com/lenaanderson5566-ops/v2box/conf"
 	"github.com/lenaanderson5566-ops/v2box/core"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"sync"
 	"testing"
 )
 
+var fixtureRootsOnce sync.Once
+
 func TestRejectedReloadIsRetriedWithoutConfigChange(t *testing.T) {
 	calls := 0
-	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	s := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls++
 		if calls > 1 {
 			w.WriteHeader(304)
@@ -21,6 +26,10 @@ func TestRejectedReloadIsRetriedWithoutConfigChange(t *testing.T) {
 		w.Write([]byte(`{"protocol":"vless","tls":0,"server_port":12345,"base_config":{"push_interval":60,"pull_interval":60}}`))
 	}))
 	defer s.Close()
+	roots := x509.NewCertPool()
+	roots.AddCert(s.Certificate())
+	t.Setenv("GODEBUG", os.Getenv("GODEBUG")+",x509usefallbackroots=1")
+	fixtureRootsOnce.Do(func() { x509.SetFallbackRoots(roots) })
 	retries := 0
 	api, err := panel.New(&conf.NodeConfig{APIHost: s.URL, NodeID: 1, Key: "test", APIVersion: "legacy", RetryCount: &retries})
 	if err != nil {

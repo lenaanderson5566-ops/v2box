@@ -5,6 +5,7 @@ version=''
 api_host=''
 node_id=''
 api_key=''
+prompt_api_key=false
 node_type='v2box'
 landing_page=false
 landing_dir=''
@@ -30,8 +31,9 @@ while (($#)); do
       esac
       shift 2;;
     --ddns) ddns=true; shift;;
+    --prompt-api-key) prompt_api_key=true; shift;;
     --landing-page) landing_page=true; shift;;
-    -h|--help) echo "Usage: $0 [release-tag] [--api-host URL --node-id ID --api-key KEY] [--node-type v2node|v2box] [--landing-page | --landing-dir /path/to/site] [--ddns --ddns-domain HOST --ddns-zone-id ZONE --ddns-token-file FILE --ddns-family ipv4|ipv6|dual]"; exit 0;;
+    -h|--help) echo "Usage: $0 [release-tag] [--api-host URL --node-id ID --prompt-api-key] [--node-type v2node|v2box] [--landing-page | --landing-dir /path/to/site] [--ddns --ddns-domain HOST --ddns-zone-id ZONE --ddns-token-file FILE --ddns-family ipv4|ipv6|dual]"; exit 0;;
     --*) echo "Unknown option: $1" >&2; exit 1;;
     *) [[ -z "$version" ]] || { echo 'Only one version is allowed' >&2; exit 1; }; version=$1; shift;;
   esac
@@ -60,7 +62,12 @@ done
 if command -v systemctl >/dev/null; then init=systemd
 elif command -v rc-service >/dev/null; then init=openrc
 else echo 'systemd or OpenRC is required' >&2; exit 1; fi
-if [[ -n "$api_host$node_id$api_key" ]]; then
+if [[ "$prompt_api_key" == true && ! -f /etc/v2box/config.json ]]; then
+  [[ -z "$api_key" ]] || { echo 'Choose either interactive key input or --api-key' >&2; exit 1; }
+  read -r -s -p 'Node API key: ' api_key < /dev/tty
+  echo
+fi
+if [[ -n "$api_host$node_id$api_key" && ! -f /etc/v2box/config.json ]]; then
   [[ "$api_host" =~ ^https://[^/?#[:space:]@]+(/[^?#[:space:]]*)?$ && "$node_id" =~ ^[1-9][0-9]*$ && -n "$api_key" ]] || { echo 'Supply an HTTPS panel URL without credentials/query/fragment, a node ID and an API key' >&2; exit 1; }
 fi
 if [[ -f /etc/v2box/config.json ]]; then
@@ -92,6 +99,9 @@ fi
 install -m 755 "$stage/v2box" /usr/local/lib/v2box/v2box.new
 mv -f /usr/local/lib/v2box/v2box.new /usr/local/lib/v2box/v2box
 install -m 755 "$stage/v2box.sh" /usr/local/bin/v2box
+if [[ -f "$stage/node-credentials.py" ]]; then
+  install -m 755 "$stage/node-credentials.py" /usr/local/lib/v2box/node-credentials.py
+fi
 if [[ -f "$stage/node-network.py" ]]; then
   install -m 755 "$stage/node-network.py" /usr/local/lib/v2box/node-network.py
   if [[ -f /usr/local/lib/node-network/node-network.py ]]; then
@@ -109,7 +119,8 @@ done
 if [[ ! -f /etc/v2box/config.json ]]; then
   if [[ -n "$api_host" ]]; then
     umask 077
-    jq -n --arg host "$api_host" --argjson id "$node_id" --arg key "$api_key" --arg type "$node_type" --argjson landing "$landing_page" --arg directory "$landing_dir" \
+    printf '%s' "$api_key" > "$stage/api-key"
+    jq -n --arg host "$api_host" --argjson id "$node_id" --rawfile key "$stage/api-key" --arg type "$node_type" --argjson landing "$landing_page" --arg directory "$landing_dir" \
       '{Log:{Level:"info"},Nodes:[{NodeType:$type,ApiHost:$host,NodeID:$id,ApiKey:$key,Timeout:15,RetryCount:1,LandingPage:{Enabled:$landing,Directory:$directory}}]}' > /etc/v2box/config.json
   else
     install -m 600 "$stage/config.example.json" /etc/v2box/config.json

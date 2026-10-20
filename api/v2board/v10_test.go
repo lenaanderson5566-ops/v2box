@@ -11,6 +11,24 @@ import (
 	"testing"
 )
 
+func TestIndependentLegacyCredentialNeverEntersURL(t *testing.T) {
+	s := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Has("token") || r.Header.Get("Authorization") != "Bearer nk_test" {
+			t.Error("independent credential must only use Authorization")
+		}
+		w.Write([]byte(`{"users":[]}`))
+	}))
+	defer s.Close()
+	c, err := newTestPanel(t, s, &conf.NodeConfig{APIHost: s.URL, NodeType: "v2box", NodeID: 1, Key: "nk_test", APIVersion: "legacy"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = c.GetUserList(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
 // Optional fixture exported by the actual panel HTTP contract test, never a
 // production response. This checks PHP/Go serialization interoperability.
 func TestV10PanelFixture(t *testing.T) {
@@ -66,7 +84,7 @@ func TestV10Contract(t *testing.T) {
 			}
 			var body map[string]any
 			json.NewDecoder(r.Body).Decode(&body)
-			if len(body["features"].([]any)) != 4 {
+			if len(body["features"].([]any)) != 5 {
 				t.Error("capabilities missing")
 			}
 			w.Write([]byte(`{"data":{"accepted":true}}`))
@@ -159,5 +177,82 @@ func TestV10Contract(t *testing.T) {
 		} else if err == nil {
 			t.Fatal("malformed response accepted")
 		}
+	}
+}
+
+func TestTargetStatisticsContract(t *testing.T) {
+	mode := "enabled"
+	var batches []string
+	s := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer fixture" || r.URL.Query().Get("token") != "" {
+			t.Error("bad node authentication")
+		}
+		if strings.HasSuffix(r.URL.Path, "/policy") {
+			switch mode {
+			case "oversized":
+				w.Write([]byte(strings.Repeat(" ", 4097)))
+			case "bad-version":
+				w.Write([]byte(`{"data":{"enabled":true,"version":"invalid","leaseSeconds":120}}`))
+			case "missing":
+				w.WriteHeader(404)
+			case "invalid":
+				w.Write([]byte(`{"data":{"enabled":true,"version":"a80e93b1-0cba-478a-b780-0d8eb6118267","leaseSeconds":121}}`))
+			case "disabled":
+				w.Write([]byte(`{"data":{"enabled":false,"version":"a80e93b1-0cba-478a-b780-0d8eb6118267","leaseSeconds":120}}`))
+			default:
+				w.Write([]byte(`{"data":{"enabled":true,"version":"a80e93b1-0cba-478a-b780-0d8eb6118267","leaseSeconds":120}}`))
+			}
+			return
+		}
+		var batch TargetBatch
+		if err := json.NewDecoder(r.Body).Decode(&batch); err != nil {
+			t.Error(err)
+		}
+		batches = append(batches, batch.BatchID)
+		if mode == "oversized-ack" {
+			w.Write([]byte(strings.Repeat(" ", 4097)))
+			return
+		}
+		w.Write([]byte(`{"data":{"accepted":false}}`))
+	}))
+	defer s.Close()
+	c, err := newTestPanel(t, s, &conf.NodeConfig{APIHost: s.URL, NodeType: "v2box", NodeID: 1, Key: "fixture"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p, err := c.GetTargetPolicy(context.Background()); err != nil || !p.Enabled {
+		t.Fatal("enabled policy", err)
+	}
+	mode = "disabled"
+	if p, err := c.GetTargetPolicy(context.Background()); err != nil || p.Enabled {
+		t.Fatal("disabled policy", err)
+	}
+	mode = "missing"
+	if p, err := c.GetTargetPolicy(context.Background()); err != nil || p.Enabled {
+		t.Fatal("legacy panel", err)
+	}
+	mode = "invalid"
+	if _, err := c.GetTargetPolicy(context.Background()); err == nil {
+		t.Fatal("unbounded lease accepted")
+	}
+	for _, invalid := range []string{"oversized", "bad-version"} {
+		mode = invalid
+		if _, err := c.GetTargetPolicy(context.Background()); err == nil {
+			t.Fatalf("accepted %s", invalid)
+		}
+	}
+	mode = "invalid"
+	batch := &TargetBatch{Version: "v", BatchID: "same", Records: []TargetRecord{}}
+	for i := 0; i < 2; i++ {
+		if accepted, err := c.ReportTargets(context.Background(), batch); err != nil || accepted {
+			t.Fatal("disable acknowledgement", err)
+		}
+	}
+	if len(batches) != 2 || batches[0] != batches[1] {
+		t.Fatal("retry ID changed")
+	}
+	mode = "oversized-ack"
+	if _, err := c.ReportTargets(context.Background(), batch); err == nil {
+		t.Fatal("accepted oversized acknowledgement")
 	}
 }

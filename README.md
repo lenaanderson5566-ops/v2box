@@ -241,3 +241,14 @@ go test ./limiter ./core -run '^$' -bench 'Benchmark(CheckLimit|TrafficAccount)'
 ```bash
 GOEXPERIMENT=jsonv2 V2BOX_SOAK=1 go test -race -tags with_quic,with_utls ./core -run 'Test(CoreLifecycleSoak|NaiveMultiplexChurnSoak)$' -count=1 -timeout=3m
 ```
+
+## Optional destination statistics
+
+Update both the panel and node binary, then enable the default-off switch in the panel log settings. Requires V10 API; older panels returning 404 leave collection disabled. Targets use the original domain or IP, without reverse DNS or replacing IPs with sniffed domains. No URL paths or payloads are collected. Policy sync runs in its own cancellable task every 10–30 seconds (plus up to 10% jitter), with a 120-second lease; failed policy reads disable collection. Each node holds at most 500 active rows and 500 pending rows; each connection caches at most 64 targets, ignoring ports. Per-node/user shards avoid a global packet-path lock. Batches retry with stable IDs for at most five minutes and are never spooled to disk. Statistics requests have a five-second deadline and a 4 KiB response limit, and do not delay billing reports. The panel displays short-lived hourly aggregates under access analytics; restarts, capacity limits and outages can lose this optional telemetry.
+
+
+## Independent node credentials (manual rotation)
+
+Upgrade the panel before migrating a node. Generate its scoped credential in the panel node's credentials dialog; the full value is displayed once. First issuance immediately blocks the shared token for that identity. Later manual rotations allow a 30-minute overlap. Confirm the new fingerprint's last authentication in the panel, then revoke the previous key. No scheduled rotation is implemented. Revoking API access does not terminate established proxy sessions.
+
+Fresh installs can use `--prompt-api-key` for hidden terminal input. For an existing configuration, use `v2box credential` (Python 3 required), select the node, paste the independent key, then run `v2box restart`. The helper updates only that entry atomically with mode 0600, creates no credential backup and does not restart automatically. Independent keys also use Authorization in legacy API mode; older shared-token deployments retain their compatibility behavior until migrated. The helper is included in new release archives and is installed by the updated installer.

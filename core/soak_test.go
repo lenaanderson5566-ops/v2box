@@ -78,6 +78,7 @@ func TestCoreLifecycleSoak(t *testing.T) {
 						n.Common.CertInfo = cert
 					}
 					v := startTestNode(t, n)
+					v.SetTargetPolicy(n.Tag, panel.TargetPolicy{Enabled: true, Version: "soak", LeaseSeconds: 120})
 					if protocol == "naive" {
 						client := naiveClient(t, n)
 						s, err := naiveConnect(client, testUUID, echo.Addr().String())

@@ -51,7 +51,7 @@ jobs:
           if [ "$GOOS" = windows ]; then suffix='.exe'; fi
           go build -tags with_quic,with_utls -trimpath -ldflags "-s -w -X github.com/lenaanderson5566-ops/v2box/cmd.version=${GITHUB_REF_NAME}" -o "build_assets/v2box${suffix}" .
           cp README.md LICENSE LICENSE.sing-box NOTICE.md config.example.json build_assets/
-          cp script/v2box.sh script/node-network.py build_assets/
+          cp script/v2box.sh script/node-network.py script/node-credentials.py build_assets/
           cp -r internal/licenses build_assets/
           cd build_assets
           zip -r "../v2box-${GOOS}-${GOARCH}.zip" .

@@ -23,6 +23,7 @@ type trafficKey struct {
 	uid int
 }
 type trafficTracker struct {
+	targets     targetTracker
 	budgets     map[string]*localTrafficBudget
 	hasBudgets  atomic.Bool
 	mu          sync.RWMutex
@@ -172,6 +173,7 @@ func (t *trafficTracker) restoreTraffic(tag string, items []panel.UserTraffic) {
 	}
 }
 func (t *trafficTracker) closeNode(tag string) {
+	t.targets.policy(tag, panel.TargetPolicy{})
 	t.mu.Lock()
 	connections := t.connections[tag]
 	delete(t.connections, tag)
@@ -199,13 +201,17 @@ func (t *trafficTracker) unregister(tag string, c io.Closer) {
 }
 
 type meter struct {
-	tracker       *trafficTracker
-	tag, user, ip string
-	uid           int
-	identity      string
-	ctx           context.Context
-	cancel        context.CancelFunc
-	limiter       *limiter.Limiter
+	target, resolvedTarget M.Socksaddr
+	targetGeneration       uint64
+	targetSeen             map[targetKey]bool // guarded by the active node/user shard
+	targetNames            map[M.Socksaddr]targetKey
+	tracker                *trafficTracker
+	tag, user, ip          string
+	uid                    int
+	identity               string
+	ctx                    context.Context
+	cancel                 context.CancelFunc
+	limiter                *limiter.Limiter
 }
 
 func (t *trafficTracker) newMeter(ctx context.Context, m adapter.InboundContext) *meter {
@@ -231,7 +237,8 @@ func (t *trafficTracker) newMeter(ctx context.Context, m adapter.InboundContext)
 		return nil
 	}
 	ctx, cancel := context.WithCancel(ctx)
-	return &meter{tracker: t, tag: m.Inbound, user: user, identity: m.User, ip: ip, uid: u.Id, ctx: ctx, cancel: cancel, limiter: l}
+	return &meter{tracker: t, tag: m.Inbound, user: user, identity: m.User, ip: ip, uid: u.Id, ctx: ctx, cancel: cancel, limiter: l,
+		target: originalTarget(m.Destination, m.RouteOriginalDestination, m.OriginDestination), resolvedTarget: m.Destination}
 }
 func (m *meter) wait(n int) error {
 	m.tracker.mu.RLock()
@@ -285,6 +292,7 @@ func (c *meteredConn) Read(p []byte) (int, error) {
 		n, err = c.Conn.Read(p)
 	}
 	if n > 0 {
+		c.m.tracker.targets.record(c.m, c.m.target, n, 0)
 		c.m.tracker.account(c.m.tag, c.m.uid, n, 0)
 		if e := c.m.wait(n); e != nil {
 			return 0, e
@@ -297,6 +305,9 @@ func (c *meteredConn) Write(p []byte) (int, error) {
 		return 0, err
 	}
 	n, err := c.Conn.Write(p)
+	if n > 0 {
+		c.m.tracker.targets.record(c.m, c.m.target, 0, n)
+	}
 	c.m.tracker.account(c.m.tag, c.m.uid, 0, n)
 	return n, err
 }
@@ -315,6 +326,7 @@ type meteredPacketConn struct {
 func (c *meteredPacketConn) ReadPacket(b *buf.Buffer) (M.Socksaddr, error) {
 	d, err := c.PacketConn.ReadPacket(b)
 	if err == nil {
+		c.m.tracker.targets.record(c.m, packetTarget(c.m, d), b.Len(), 0)
 		c.m.tracker.account(c.m.tag, c.m.uid, b.Len(), 0)
 		err = c.m.wait(b.Len())
 	}
@@ -328,6 +340,7 @@ func (c *meteredPacketConn) WritePacket(b *buf.Buffer, d M.Socksaddr) error {
 	}
 	err := c.PacketConn.WritePacket(b, d)
 	if err == nil {
+		c.m.tracker.targets.record(c.m, packetTarget(c.m, d), 0, n)
 		c.m.tracker.account(c.m.tag, c.m.uid, 0, n)
 	}
 	return err

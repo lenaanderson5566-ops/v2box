@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/url"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -88,9 +89,14 @@ func New(c *conf.NodeConfig) (*Client, error) {
 		client.SetAuthToken(c.Key)
 		client.SetHeader("X-Node-Type", nodeType)
 		client.SetHeader("X-Node-ID", strconv.Itoa(c.NodeID))
-		client.SetHeader("X-Node-Capabilities", "native-routing-v1,dns-v1,outbounds-v1,server-traffic-budget-v1")
+		client.SetHeader("X-Node-Capabilities", "native-routing-v1,dns-v1,outbounds-v1,server-traffic-budget-v1,target-statistics-v1")
 	} else {
-		client.SetQueryParams(map[string]string{"node_type": nodeType, "node_id": strconv.Itoa(c.NodeID), "token": c.Key})
+		client.SetQueryParams(map[string]string{"node_type": nodeType, "node_id": strconv.Itoa(c.NodeID)})
+		if strings.HasPrefix(c.Key, "nk_") {
+			client.SetAuthToken(c.Key)
+		} else {
+			client.SetQueryParam("token", c.Key)
+		}
 	}
 
 	return &Client{
