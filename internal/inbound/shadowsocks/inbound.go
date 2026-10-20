@@ -33,12 +33,13 @@ var (
 
 type MultiInbound struct {
 	inbound.Adapter
-	ctx      context.Context
-	router   adapter.ConnectionRouterEx
-	logger   logger.ContextLogger
-	listener *listener.Listener
-	service  shadowsocks.MultiService[string]
-	tracker  adapter.SSMTracker
+	ctx       context.Context
+	router    adapter.ConnectionRouterEx
+	logger    logger.ContextLogger
+	listener  *listener.Listener
+	service   shadowsocks.MultiService[string]
+	tracker   adapter.SSMTracker
+	safeClose bool
 }
 
 func newMultiInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.ShadowsocksInboundOptions) (*MultiInbound, error) {
@@ -61,6 +62,7 @@ func newMultiInbound(ctx context.Context, router adapter.Router, logger log.Cont
 	}
 	var service shadowsocks.MultiService[string]
 	if common.Contains(shadowaead_2022.List, options.Method) {
+		inbound.safeClose = true
 		service, err = shadowaead_2022.NewMultiServiceWithPassword[string](
 			options.Method,
 			options.Password,
@@ -123,6 +125,9 @@ func (h *MultiInbound) UpdateUsers(users []option.ShadowsocksUser) error {
 
 //nolint:staticcheck
 func (h *MultiInbound) NewConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
+	if h.safeClose {
+		ctx = context.WithValue(ctx, rawConnectionKey{}, conn)
+	}
 	err := h.service.NewConnection(ctx, conn, adapter.UpstreamMetadata(metadata))
 	N.CloseOnHandshakeFailure(conn, onClose, err)
 	if err != nil {
@@ -146,6 +151,9 @@ func (h *MultiInbound) newConnection(ctx context.Context, conn net.Conn, metadat
 	user, loaded := auth.UserFromContext[string](ctx)
 	if !loaded {
 		return os.ErrInvalid
+	}
+	if raw, ok := ctx.Value(rawConnectionKey{}).(net.Conn); ok {
+		conn = &closeSafeConn{Conn: conn, raw: raw}
 	}
 	metadata.User = user
 	h.logger.InfoContext(ctx, "[", user, "] inbound connection to ", metadata.Destination)

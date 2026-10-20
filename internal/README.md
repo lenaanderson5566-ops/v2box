@@ -18,7 +18,9 @@ Local changes, 2026-10-10–2026-10-11:
 - Authentication maps are built before publication. Short mutex-protected
   snapshots permit concurrent handshakes without holding locks over network I/O.
 - Shadowsocks uses the upstream concurrent multi-user service even for an empty
-  list; it never falls back to a single-user listener.
+  list; it never falls back to a single-user listener. SS2022 closes the raw TCP
+  transport first to interrupt I/O, then waits for encrypted reads/writes before
+  releasing upstream buffers, avoiding the lazy response-writer/Close race.
 - Naive adapts sing-box v1.14.3 inbound/padding code for HTTPS/HTTP2 only.
   Each authenticated HTTP2 transport is bound to one opaque account generation;
   atomic credential replacement revokes active and idle transports. Request
