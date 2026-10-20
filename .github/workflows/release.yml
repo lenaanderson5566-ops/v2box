@@ -3,6 +3,7 @@ on:
   workflow_dispatch:
   push:
     branches: [main, master]
+    tags: ["v*"]
   pull_request:
   release:
     types: [published]
@@ -26,8 +27,6 @@ jobs:
       - run: python3 -m unittest discover -s script -p '*_test.py'
   build:
     needs: test
-    permissions:
-      contents: write
     strategy:
       matrix:
         goos: [linux, windows, darwin]
@@ -51,7 +50,7 @@ jobs:
           if [ "$GOOS" = windows ]; then suffix='.exe'; fi
           go build -tags with_quic,with_utls -trimpath -ldflags "-s -w -X github.com/lenaanderson5566-ops/v2box/cmd.version=${GITHUB_REF_NAME}" -o "build_assets/v2box${suffix}" .
           cp README.md LICENSE LICENSE.sing-box NOTICE.md config.example.json build_assets/
-          cp script/v2box.sh script/node-network.py script/node-credentials.py build_assets/
+          cp script/install.sh script/v2box.sh script/node-network.py script/node-credentials.py build_assets/
           cp -r internal/licenses build_assets/
           cd build_assets
           zip -r "../v2box-${GOOS}-${GOARCH}.zip" .
@@ -61,7 +60,44 @@ jobs:
         with:
           name: v2box-${{ matrix.goos }}-${{ matrix.goarch }}
           path: v2box-*.zip*
-      - uses: softprops/action-gh-release@v2
-        if: github.event_name == 'release'
+  publish:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'release'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v6
         with:
-          files: v2box-*.zip*
+          pattern: v2box-*
+          merge-multiple: true
+          path: release-assets
+      - name: Verify complete release assets
+        shell: bash
+        run: |
+          cd release-assets
+          for os in linux windows darwin; do
+            for arch in amd64 arm64; do
+              test -s "v2box-${os}-${arch}.zip"
+              test -s "v2box-${os}-${arch}.zip.sha256"
+              sha256sum -c "v2box-${os}-${arch}.zip.sha256"
+              listing=$(unzip -Z1 "v2box-${os}-${arch}.zip")
+              grep -Fxq node-credentials.py <<< "$listing"
+              grep -Fxq install.sh <<< "$listing"
+            done
+          done
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: release-assets/v2box-*.zip*
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+          make_latest: true
+          body: |
+            V2Box sing-box 节点后端。面板请先更新至支持 V10 节点接口的版本。
+
+            - 新增可选域名/IP 访问统计，默认关闭，采集有容量、租约与重试期限限制；统计上报独立于计费。
+            - 支持节点独立凭据和手动更换密钥；无自动轮换。
+            - 包含统计热路径分锁优化、并发及资源回收修复。
+            - 提供 Linux/macOS/Windows 的 amd64、arm64 安装包及逐包 SHA-256 校验文件。
+
+            Linux 安装及升级请使用此版本标签下的 script/install.sh；已有 /etc/v2box/config.json 将保留。

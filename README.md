@@ -121,11 +121,11 @@ GOEXPERIMENT=jsonv2 go test ./limiter -run '^$' -bench BenchmarkCheckLimit -benc
 安装器支持 amd64/arm64，systemd 或 OpenRC。需要 curl、unzip、jq、sha256sum。**先发布本仓库构建出的 Release，再运行安装器**；上游 v2node 二进制不可代替。
 
 ```sh
-curl -fSL https://raw.githubusercontent.com/lenaanderson5566-ops/v2box/main/script/install.sh -o install.sh
-sudo bash install.sh <release-tag> --api-host https://panel.example.com --node-id 1 --api-key YOUR_KEY
+curl -fSL https://raw.githubusercontent.com/lenaanderson5566-ops/v2box/v1.0.0/script/install.sh -o install.sh
+sudo bash install.sh v1.0.0 --api-host https://panel.example.com --node-id 1 --prompt-api-key
 ```
 
-安装路径 `/usr/local/lib/v2box`；配置 `/etc/v2box/config.json`；服务 `v2box`。更新保留配置和上一份二进制 `v2box.previous`。检查日志使用 `v2box log`。
+安装路径 `/usr/local/lib/v2box`；配置 `/etc/v2box/config.json`；服务 `v2box`。更新保留配置和上一份二进制 `v2box.previous`。检查日志使用 `v2box log`。升级到本版可重新运行 `sudo bash install.sh v1.0.0`，不需要再次传入面板地址或密钥。
 
 旧 `v2node` 服务独立保留。迁移同一端口时先停止旧节点服务，再启动 v2box；回退时停止 v2box，启动旧服务。不要同时监听同一端口。
 
