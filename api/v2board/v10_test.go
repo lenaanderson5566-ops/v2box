@@ -3,12 +3,14 @@ package panel
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"github.com/lenaanderson5566-ops/v2box/conf"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestIndependentLegacyCredentialNeverEntersURL(t *testing.T) {
@@ -84,7 +86,7 @@ func TestV10Contract(t *testing.T) {
 			}
 			var body map[string]any
 			json.NewDecoder(r.Body).Decode(&body)
-			if len(body["features"].([]any)) != 5 {
+			if len(body["features"].([]any)) != 7 {
 				t.Error("capabilities missing")
 			}
 			w.Write([]byte(`{"data":{"accepted":true}}`))
@@ -191,6 +193,8 @@ func TestTargetStatisticsContract(t *testing.T) {
 			switch mode {
 			case "oversized":
 				w.Write([]byte(strings.Repeat(" ", 4097)))
+			case "bad-interval":
+				w.Write([]byte(`{"data":{"enabled":true,"version":"a80e93b1-0cba-478a-b780-0d8eb6118267","leaseSeconds":120,"reportIntervalSeconds":10}}`))
 			case "bad-version":
 				w.Write([]byte(`{"data":{"enabled":true,"version":"invalid","leaseSeconds":120}}`))
 			case "missing":
@@ -235,7 +239,7 @@ func TestTargetStatisticsContract(t *testing.T) {
 	if _, err := c.GetTargetPolicy(context.Background()); err == nil {
 		t.Fatal("unbounded lease accepted")
 	}
-	for _, invalid := range []string{"oversized", "bad-version"} {
+	for _, invalid := range []string{"oversized", "bad-version", "bad-interval"} {
 		mode = invalid
 		if _, err := c.GetTargetPolicy(context.Background()); err == nil {
 			t.Fatalf("accepted %s", invalid)
@@ -254,5 +258,82 @@ func TestTargetStatisticsContract(t *testing.T) {
 	mode = "oversized-ack"
 	if _, err := c.ReportTargets(context.Background(), batch); err == nil {
 		t.Fatal("accepted oversized acknowledgement")
+	}
+}
+
+func TestTargetPolicyConfigurationLeaseAndBodyLimit(t *testing.T) {
+	hits := 0
+	header := `{"enabled":true,"version":"a80e93b1-0cba-478a-b780-0d8eb6118267","leaseSeconds":120}`
+	s := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/configuration"):
+			w.Header().Set("X-Target-Statistics-Policy", header)
+			w.WriteHeader(304)
+		case strings.HasSuffix(r.URL.Path, "/policy"):
+			hits++
+			w.Write([]byte(`{"data":{"enabled":false,"version":"a80e93b1-0cba-478a-b780-0d8eb6118267","leaseSeconds":120}}`))
+		case strings.HasSuffix(r.URL.Path, "/capabilities"):
+			w.Write([]byte(`{"data":{"accepted":true}}`))
+		default:
+			t.Error("oversized batch reached HTTP")
+		}
+	}))
+	defer s.Close()
+	c, err := newTestPanel(t, s, &conf.NodeConfig{APIHost: s.URL, NodeType: "v2box", NodeID: 1, Key: "fixture"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = c.GetNodeInfo(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	p, err := c.GetTargetPolicy(context.Background())
+	if err != nil || !p.Enabled || p.LeaseSeconds > 120 || hits != 0 {
+		t.Fatalf("header lease not reused: %+v %v hits=%d", p, err, hits)
+	}
+	c.targetPolicy.Store(&cachedTargetPolicy{p, time.Now().Add(90 * time.Second)})
+	if reduced, _ := c.GetTargetPolicy(context.Background()); reduced.LeaseSeconds > 90 {
+		t.Fatal("cached lease was renewed")
+	}
+	c.targetPolicy.Store(&cachedTargetPolicy{p, time.Now().Add(69 * time.Second)})
+	if p, err = c.GetTargetPolicy(context.Background()); err != nil || p.Enabled || hits != 1 {
+		t.Fatal("stale lease was extended", err)
+	}
+	header = `{"enabled":false,"version":"a80e93b1-0cba-478a-b780-0d8eb6118267","leaseSeconds":120}`
+	c.GetNodeInfo(context.Background())
+	if p, err = c.GetTargetPolicy(context.Background()); err != nil || p.Enabled || hits != 1 {
+		t.Fatal("304 disable ignored", err)
+	}
+	header = "invalid"
+	c.GetNodeInfo(context.Background())
+	if _, err = c.GetTargetPolicy(context.Background()); err != nil || hits != 2 {
+		t.Fatal("invalid header did not fall back", err)
+	}
+	batch := &TargetBatch{Records: []TargetRecord{{Target: strings.Repeat("x", 262144)}}}
+	if _, err = c.ReportTargets(context.Background(), batch); err == nil {
+		t.Fatal("unbounded outgoing request")
+	}
+}
+
+func TestTargetIntervalCompatibility(t *testing.T) {
+	for _, seconds := range []int{0, 30, 60, 120, 300} {
+		p := TargetPolicy{ReportIntervalSeconds: seconds}
+		expected := seconds
+		if expected == 0 {
+			expected = 60
+		}
+		if p.ReportInterval() != time.Duration(expected)*time.Second {
+			t.Fatal("bad interval fallback")
+		}
+		c := &Client{}
+		raw := fmt.Sprintf(`{"enabled":true,"version":"a80e93b1-0cba-478a-b780-0d8eb6118267","leaseSeconds":120,"reportIntervalSeconds":%d}`, seconds)
+		c.captureTargetPolicy(raw)
+		if c.targetPolicy.Load() == nil || c.targetPolicy.Load().policy.ReportIntervalSeconds != seconds {
+			t.Fatal("cadence lost in policy header")
+		}
+	}
+	c := &Client{}
+	c.captureTargetPolicy(`{"enabled":true,"version":"a80e93b1-0cba-478a-b780-0d8eb6118267","leaseSeconds":120,"reportIntervalSeconds":301}`)
+	if c.targetPolicy.Load() != nil {
+		t.Fatal("unsafe cadence accepted from header")
 	}
 }

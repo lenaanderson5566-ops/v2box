@@ -33,10 +33,11 @@ func (c *Controller) startTasks(node *panel.NodeInfo) {
 	log.WithField("tag", c.tag).Info("Start report node status")
 	_ = c.userReportPeriodic.Start(false)
 	c.targetReportPeriodic = &task.Task{
-		Name:     "reportTargetStatistics",
-		Interval: max(10*time.Second, min(node.PushInterval, 30*time.Second)),
-		Jitter:   true,
-		Execute:  func(ctx context.Context) error { c.reportTargetStatistics(ctx); return nil },
+		Name:         "reportTargetStatistics",
+		NextInterval: func() time.Duration { return c.targetReportDelay(time.Now()) },
+		Interval:     60 * time.Second,
+		Jitter:       true,
+		Execute:      func(ctx context.Context) error { c.reportTargetStatistics(ctx); return nil },
 	}
 	_ = c.targetReportPeriodic.Start(true)
 	if node.Security == panel.Tls {

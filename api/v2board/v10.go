@@ -121,7 +121,7 @@ func (c *Client) announceCapabilities(ctx context.Context) error {
 			}
 		}
 	}
-	r, err := c.client.R().SetContext(ctx).SetBody(map[string]any{"coreVersion": version, "features": []string{"native-routing-v1", "dns-v1", "outbounds-v1", "server-traffic-budget-v1", "target-statistics-v1"}}).Post(c.nodePath("capabilities"))
+	r, err := c.client.R().SetContext(ctx).SetBody(map[string]any{"coreVersion": version, "features": []string{"native-routing-v1", "dns-v1", "outbounds-v1", "server-traffic-budget-v1", "target-statistics-v1", "target-statistics-policy-v2", "target-statistics-interval-v1"}}).Post(c.nodePath("capabilities"))
 	if err != nil {
 		return err
 	}

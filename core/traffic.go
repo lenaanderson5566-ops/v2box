@@ -202,6 +202,11 @@ func (t *trafficTracker) unregister(tag string, c io.Closer) {
 
 type meter struct {
 	target, resolvedTarget M.Socksaddr
+	targetFixed            bool
+	targetCached           bool
+	targetCounted          bool
+	targetKey              targetKey
+	targetClosed           atomic.Bool
 	targetGeneration       uint64
 	targetSeen             map[targetKey]bool // guarded by the active node/user shard
 	targetNames            map[M.Socksaddr]targetKey
@@ -312,7 +317,12 @@ func (c *meteredConn) Write(p []byte) (int, error) {
 	return n, err
 }
 func (c *meteredConn) Close() error {
-	c.once.Do(func() { c.m.cancel(); c.m.tracker.unregister(c.m.tag, c); c.closeErr = c.Conn.Close() })
+	c.once.Do(func() {
+		c.m.cancel()
+		c.m.tracker.targets.release(c.m)
+		c.m.tracker.unregister(c.m.tag, c)
+		c.closeErr = c.Conn.Close()
+	})
 	return c.closeErr
 }
 
@@ -346,7 +356,12 @@ func (c *meteredPacketConn) WritePacket(b *buf.Buffer, d M.Socksaddr) error {
 	return err
 }
 func (c *meteredPacketConn) Close() error {
-	c.once.Do(func() { c.m.cancel(); c.m.tracker.unregister(c.m.tag, c); c.closeErr = c.PacketConn.Close() })
+	c.once.Do(func() {
+		c.m.cancel()
+		c.m.tracker.targets.release(c.m)
+		c.m.tracker.unregister(c.m.tag, c)
+		c.closeErr = c.PacketConn.Close()
+	})
 	return c.closeErr
 }
 func (t *trafficTracker) RoutedConnection(ctx context.Context, c net.Conn, m adapter.InboundContext, _ adapter.Rule, _ adapter.Outbound) net.Conn {
@@ -370,6 +385,7 @@ func (t *trafficTracker) RoutedConnection(ctx context.Context, c net.Conn, m ada
 		_ = c.Close()
 		return &deniedConn{Conn: c}
 	}
+	meter.targetFixed = true
 	wrapped := &meteredConn{Conn: c, m: meter, prefix: prefix}
 	if !t.register(m.Inbound, wrapped, meter) {
 		_ = wrapped.Close()

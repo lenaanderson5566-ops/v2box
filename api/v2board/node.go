@@ -142,6 +142,9 @@ func (c *Client) GetNodeInfo(ctx context.Context) (node *NodeInfo, err error) {
 		return nil, fmt.Errorf("received nil response")
 	}
 
+	if c.v10 && (r.StatusCode() == 200 || r.StatusCode() == 304) {
+		c.captureTargetPolicy(r.Header().Get("X-Target-Statistics-Policy"))
+	}
 	if r.StatusCode() == 304 {
 		return nil, nil
 	}

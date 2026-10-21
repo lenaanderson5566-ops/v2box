@@ -29,7 +29,11 @@ type Controller struct {
 	nodeInfoMonitorPeriodic *task.Task
 	userReportPeriodic      *task.Task
 	targetReportPeriodic    *task.Task
-	renewCertPeriodic       *task.Task
+	// Owned solely by the target statistics task goroutine.
+	targetLastReport  time.Time
+	targetInterval    time.Duration
+	targetRetry       bool
+	renewCertPeriodic *task.Task
 }
 
 // NewController return a Node controller with default parameters.

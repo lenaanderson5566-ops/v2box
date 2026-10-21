@@ -49,3 +49,27 @@ func TestJitterDisabledPreservesInterval(t *testing.T) {
 		t.Fatal("jitter duration overflow")
 	}
 }
+
+func TestDynamicIntervalReevaluatedWithoutJitter(t *testing.T) {
+	var count atomic.Int64
+	ran := make(chan struct{})
+	task := &Task{Interval: time.Hour, NextInterval: func() time.Duration { return time.Millisecond }, Execute: func(ctx context.Context) error {
+		if count.Add(1) == 3 {
+			close(ran)
+		}
+		return nil
+	}}
+	task.Start(false)
+	defer task.Close()
+	select {
+	case <-ran:
+	case <-time.After(time.Second):
+		t.Fatal("dynamic non-jitter interval was not rescheduled")
+	}
+	for _, invalid := range []time.Duration{0, -time.Second} {
+		fallback := &Task{Interval: time.Minute, NextInterval: func() time.Duration { return invalid }}
+		if fallback.nextInterval() != time.Minute {
+			t.Fatal("invalid dynamic duration did not fall back")
+		}
+	}
+}

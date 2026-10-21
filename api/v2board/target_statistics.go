@@ -6,12 +6,49 @@ import (
 	"fmt"
 	"github.com/google/uuid"
 	"io"
+	"time"
 )
 
+type cachedTargetPolicy struct {
+	policy TargetPolicy
+	until  time.Time
+}
+
+func (c *Client) captureTargetPolicy(raw string) {
+	var p TargetPolicy
+	if len(raw) == 0 || len(raw) > 4096 || json.Unmarshal([]byte(raw), &p) != nil {
+		c.targetPolicy.Store(nil)
+		return
+	}
+	_, err := uuid.Parse(p.Version)
+	if err != nil || len(p.Version) != 36 || p.LeaseSeconds < 1 || p.LeaseSeconds > 120 || !validTargetInterval(p.ReportIntervalSeconds) {
+		c.targetPolicy.Store(nil)
+		return
+	}
+	c.targetPolicy.Store(&cachedTargetPolicy{p, time.Now().Add(time.Duration(p.LeaseSeconds) * time.Second)})
+}
+
+func validTargetInterval(seconds int) bool {
+	switch seconds {
+	case 0, 30, 60, 120, 300:
+		return true
+	default:
+		return false
+	}
+}
+
+func (p TargetPolicy) ReportInterval() time.Duration {
+	if p.ReportIntervalSeconds == 0 || !validTargetInterval(p.ReportIntervalSeconds) {
+		return time.Minute
+	}
+	return time.Duration(p.ReportIntervalSeconds) * time.Second
+}
+
 type TargetPolicy struct {
-	Enabled      bool   `json:"enabled"`
-	Version      string `json:"version"`
-	LeaseSeconds int    `json:"leaseSeconds"`
+	ReportIntervalSeconds int    `json:"reportIntervalSeconds,omitempty"`
+	Enabled               bool   `json:"enabled"`
+	Version               string `json:"version"`
+	LeaseSeconds          int    `json:"leaseSeconds"`
 }
 type TargetRecord struct {
 	UserID        int    `json:"userId"`
@@ -29,6 +66,14 @@ type TargetBatch struct {
 }
 
 func (c *Client) GetTargetPolicy(ctx context.Context) (TargetPolicy, error) {
+	if cached := c.targetPolicy.Load(); cached != nil {
+		remaining := int(time.Until(cached.until) / time.Second)
+		if remaining >= 70 {
+			p := cached.policy
+			p.LeaseSeconds = remaining
+			return p, nil
+		}
+	}
 	var body struct {
 		Data *TargetPolicy `json:"data"`
 	}
@@ -55,6 +100,9 @@ func (c *Client) GetTargetPolicy(ctx context.Context) (TargetPolicy, error) {
 	}
 	p := *body.Data
 	_, versionErr := uuid.Parse(p.Version)
+	if !validTargetInterval(p.ReportIntervalSeconds) {
+		return TargetPolicy{}, fmt.Errorf("invalid target interval")
+	}
 	if p.Enabled && (versionErr != nil || len(p.Version) != 36 || p.LeaseSeconds < 1 || p.LeaseSeconds > 120) {
 		return TargetPolicy{}, fmt.Errorf("invalid target lease")
 	}
@@ -64,7 +112,11 @@ func (c *Client) ReportTargets(ctx context.Context, batch *TargetBatch) (bool, e
 	if !c.v10 {
 		return false, nil
 	}
-	r, err := c.client.R().SetContext(ctx).SetDoNotParseResponse(true).SetBody(batch).Post(c.nodePath("target-statistics"))
+	payload, err := json.Marshal(batch)
+	if err != nil || len(payload) > 262144 {
+		return false, fmt.Errorf("target batch exceeds request limit")
+	}
+	r, err := c.client.R().SetContext(ctx).SetHeader("Content-Type", "application/json").SetDoNotParseResponse(true).SetBody(payload).Post(c.nodePath("target-statistics"))
 	if err != nil {
 		return false, err
 	}

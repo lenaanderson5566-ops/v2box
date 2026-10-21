@@ -13,12 +13,14 @@ import (
 type Task struct {
 	Name     string
 	Interval time.Duration
-	Jitter   bool
-	Execute  func(context.Context) error
-	ReloadCh chan struct{}
-	mu       sync.Mutex
-	cancel   context.CancelFunc
-	done     chan struct{}
+	// Called only on the task goroutine, after Execute; never mutate this callback at runtime.
+	NextInterval func() time.Duration
+	Jitter       bool
+	Execute      func(context.Context) error
+	ReloadCh     chan struct{}
+	mu           sync.Mutex
+	cancel       context.CancelFunc
+	done         chan struct{}
 }
 
 func (t *Task) Start(first bool) error {
@@ -43,7 +45,7 @@ func (t *Task) Start(first bool) error {
 				return
 			case <-ticker.C:
 				t.execute(ctx)
-				if t.Jitter {
+				if t.Jitter || t.NextInterval != nil {
 					ticker.Reset(t.nextInterval())
 				}
 			}
@@ -71,12 +73,18 @@ func (t *Task) Close() {
 // Positive jitter spreads panel requests without polling more frequently than
 // configured. Each task still has exactly one synchronous callback at a time.
 func (t *Task) nextInterval() time.Duration {
+	interval := t.Interval
+	if t.NextInterval != nil {
+		if next := t.NextInterval(); next > 0 {
+			interval = next
+		}
+	}
 	if !t.Jitter {
-		return t.Interval
+		return interval
 	}
-	spread := t.Interval / 10
-	if spread <= 0 || t.Interval > time.Duration(1<<63-1)-spread {
-		return t.Interval
+	spread := interval / 10
+	if spread <= 0 || interval > time.Duration(1<<63-1)-spread {
+		return interval
 	}
-	return t.Interval + time.Duration(rand.Int64N(int64(spread)))
+	return interval + time.Duration(rand.Int64N(int64(spread)))
 }

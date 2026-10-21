@@ -16,6 +16,8 @@ import (
 
 const targetShardCount = 32
 const targetRowLimit = 500
+const targetCacheEntryLimit = 8192
+const targetCacheMeterLimit = 1024
 const targetPendingTTL = 5 * time.Minute
 
 type targetKey struct {
@@ -23,17 +25,20 @@ type targetKey struct {
 	kind, target string
 }
 type targetShard struct {
-	mu   sync.Mutex
-	rows map[targetKey]panel.TargetRecord
+	mu     sync.Mutex
+	rows   map[targetKey]panel.TargetRecord
+	meters map[*meter]struct{}
 }
 type targetState struct {
-	version    string
-	generation uint64
-	until      atomic.Int64
-	enabled    atomic.Bool
-	count      atomic.Int64
-	dropped    atomic.Int64
-	shards     [targetShardCount]targetShard
+	version      string
+	generation   uint64
+	until        atomic.Int64
+	enabled      atomic.Bool
+	count        atomic.Int64
+	cacheEntries atomic.Int64
+	cacheMeters  atomic.Int64
+	dropped      atomic.Int64
+	shards       [targetShardCount]targetShard
 	// Pending batches are immutable and only managed under targetTracker.mu.
 	pending   *panel.TargetBatch
 	pendingAt time.Time
@@ -72,8 +77,15 @@ func (s *targetState) retire() {
 	s.enabled.Store(false)
 	for i := range s.shards {
 		s.shards[i].rows = nil
+		for m := range s.shards[i].meters {
+			m.targetNames = nil
+			m.targetSeen = nil
+		}
+		s.shards[i].meters = nil
 	}
 	s.pending = nil
+	s.cacheEntries.Store(0)
+	s.cacheMeters.Store(0)
 	s.unlock()
 }
 func (t *targetTracker) publish() {
@@ -157,28 +169,61 @@ func (t *targetTracker) recordActive(m *meter, d M.Socksaddr, up, down int) {
 	shard := &s.shards[(uint64(m.uid)*11400714819323198485)>>(64-5)]
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
-	if !s.enabled.Load() || time.Now().UnixNano() >= s.until.Load() {
+	if m.targetClosed.Load() || !s.enabled.Load() || time.Now().UnixNano() >= s.until.Load() {
 		return
 	}
 	if m.targetGeneration != s.generation {
 		m.targetGeneration = s.generation
-		m.targetSeen = map[targetKey]bool{}
-		m.targetNames = map[M.Socksaddr]targetKey{}
+		m.targetSeen = nil
+		m.targetNames = nil
+		m.targetCached = false
+		m.targetCounted = false
+		m.targetKey = targetKey{}
 	}
-	// Ports are not an aggregation dimension and must not consume the 64-target cap.
-	d.Port = 0
-	if d.Addr.IsValid() {
-		d.Addr = d.Addr.Unmap().WithZone("")
-	}
-	key, cached := m.targetNames[d]
-	if !cached {
-		if len(m.targetNames) >= 64 || len(d.Fqdn) > 1024 {
-			s.drop(1)
-			return
+	var key targetKey
+	var cached bool
+	if m.targetFixed {
+		if !m.targetCached {
+			target, kind := targetAddress(d)
+			m.targetKey = targetKey{m.uid, kind, target}
+			m.targetCached = true
 		}
-		target, kind := targetAddress(d)
-		key = targetKey{m.uid, kind, target}
-		m.targetNames[d] = key
+		key = m.targetKey
+	} else {
+		// Ports are not an aggregation dimension and must not consume the 64-target cap.
+		d.Port = 0
+		if d.Addr.IsValid() {
+			d.Addr = d.Addr.Unmap().WithZone("")
+		}
+		key, cached = m.targetNames[d]
+		if !cached {
+			if len(m.targetNames) >= 64 || len(d.Fqdn) > 1024 {
+				s.drop(1)
+				return
+			}
+			if s.cacheEntries.Add(1) > targetCacheEntryLimit {
+				s.cacheEntries.Add(-1)
+				s.drop(1)
+				return
+			}
+			if m.targetNames == nil {
+				if s.cacheMeters.Add(1) > targetCacheMeterLimit {
+					s.cacheMeters.Add(-1)
+					s.cacheEntries.Add(-1)
+					s.drop(1)
+					return
+				}
+				m.targetNames = map[M.Socksaddr]targetKey{}
+				m.targetSeen = map[targetKey]bool{}
+				if shard.meters == nil {
+					shard.meters = map[*meter]struct{}{}
+				}
+				shard.meters[m] = struct{}{}
+			}
+			target, kind := targetAddress(d)
+			key = targetKey{m.uid, kind, target}
+			m.targetNames[d] = key
+		}
 	}
 	if key.target == "" {
 		return
@@ -192,7 +237,12 @@ func (t *targetTracker) recordActive(m *meter, d M.Socksaddr, up, down int) {
 		}
 		row = panel.TargetRecord{UserID: m.uid, Target: key.target, Type: key.kind}
 	}
-	if !m.targetSeen[key] {
+	if m.targetFixed {
+		if !m.targetCounted {
+			m.targetCounted = true
+			row.Connections++
+		}
+	} else if !m.targetSeen[key] {
 		m.targetSeen[key] = true
 		row.Connections++
 	}
@@ -200,6 +250,33 @@ func (t *targetTracker) recordActive(m *meter, d M.Socksaddr, up, down int) {
 	row.DownloadBytes += int64(down)
 	shard.rows[key] = row
 }
+
+// Close and policy retirement release caches even when the connection never sends again.
+func (t *targetTracker) release(m *meter) {
+	m.targetClosed.Store(true)
+	view := t.view.Load()
+	if view == nil {
+		return
+	}
+	s := view.nodes[m.tag]
+	if s == nil {
+		return
+	}
+	shard := &s.shards[(uint64(m.uid)*11400714819323198485)>>(64-5)]
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
+	if !s.enabled.Load() || m.targetGeneration != s.generation {
+		return
+	}
+	if _, ok := shard.meters[m]; ok {
+		s.cacheEntries.Add(-int64(len(m.targetNames)))
+		s.cacheMeters.Add(-1)
+		delete(shard.meters, m)
+		m.targetNames = nil
+		m.targetSeen = nil
+	}
+}
+
 func (v *V2Core) SetTargetPolicy(tag string, p panel.TargetPolicy) { v.tracker.targets.policy(tag, p) }
 func (v *V2Core) TargetBatch(tag string) *panel.TargetBatch {
 	t := &v.tracker.targets

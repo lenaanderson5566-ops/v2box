@@ -198,3 +198,106 @@ func TestTargetStatisticsLifecycleResources(t *testing.T) {
 	}
 	checkResourceGrowth(t, baseline, sampleResources())
 }
+
+func TestTargetCacheNodeBudgetsCloseAndRetire(t *testing.T) {
+	v := New(conf.New())
+	v.SetTargetPolicy("n", panel.TargetPolicy{Enabled: true, Version: "v", LeaseSeconds: 120})
+	state := v.tracker.targets.nodes["n"]
+	meters := make([]*meter, 0, targetCacheMeterLimit)
+	for i := 0; i < targetCacheMeterLimit+100; i++ {
+		m := &meter{tag: "n", uid: 1}
+		v.tracker.targets.record(m, M.ParseSocksaddr("example.org:443"), 1, 2)
+		if i < targetCacheMeterLimit {
+			meters = append(meters, m)
+		}
+	}
+	if state.cacheMeters.Load() != targetCacheMeterLimit || state.cacheEntries.Load() != targetCacheMeterLimit {
+		t.Fatal("unbounded meter cache")
+	}
+	v.tracker.targets.release(meters[0])
+	v.tracker.targets.release(meters[0])
+	v.tracker.targets.record(meters[0], M.ParseSocksaddr("example.org:443"), 1, 2)
+	if meters[0].targetNames != nil || state.cacheMeters.Load() != targetCacheMeterLimit-1 {
+		t.Fatal("closed meter retained/repopulated cache")
+	}
+	for _, m := range meters[1:] {
+		for i := 0; i < 64; i++ {
+			v.tracker.targets.record(m, M.ParseSocksaddr(fmt.Sprintf("host%d.example:443", i)), 1, 2)
+		}
+	}
+	if state.cacheEntries.Load() != targetCacheEntryLimit {
+		t.Fatalf("entry limit %d", state.cacheEntries.Load())
+	}
+	v.SetTargetPolicy("n", panel.TargetPolicy{})
+	for _, m := range meters {
+		if m.targetSeen != nil || m.targetNames != nil {
+			t.Fatal("inactive connection retained retired targets")
+		}
+	}
+}
+
+func TestTargetCacheConcurrentCloseAndSwitch(t *testing.T) {
+	v := New(conf.New())
+	m := &meter{tag: "n", uid: 1}
+	var wg sync.WaitGroup
+	for i := 0; i < 3; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for n := 0; n < 1000; n++ {
+				v.tracker.targets.record(m, M.ParseSocksaddr("example.org:443"), 1, 2)
+			}
+		}()
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for n := 0; n < 100; n++ {
+			v.SetTargetPolicy("n", panel.TargetPolicy{Enabled: n%2 == 0, Version: fmt.Sprint(n), LeaseSeconds: 120})
+			v.tracker.targets.release(m)
+		}
+	}()
+	wg.Wait()
+	v.SetTargetPolicy("n", panel.TargetPolicy{})
+	if m.targetNames != nil {
+		t.Fatal("closed target cache retained")
+	}
+}
+
+func TestTargetTCPFixedCache(t *testing.T) {
+	v := New(conf.New())
+	p := panel.TargetPolicy{Enabled: true, Version: "v", LeaseSeconds: 120}
+	v.SetTargetPolicy("n", p)
+	m := &meter{tag: "n", uid: 1, targetFixed: true}
+	for i := 0; i < 1000; i++ {
+		v.tracker.targets.record(m, M.ParseSocksaddr("example.org:443"), 1, 2)
+	}
+	state := v.tracker.targets.nodes["n"]
+	batch := v.TargetBatch("n")
+	if m.targetSeen != nil || m.targetNames != nil || state.cacheEntries.Load() != 0 || len(batch.Records) != 1 || batch.Records[0].Connections != 1 || batch.Records[0].UploadBytes != 1000 {
+		t.Fatal("fixed TCP allocated maps or counted incorrectly")
+	}
+	v.AckTargets("n", batch.BatchID, true)
+	p.Version = "new"
+	v.SetTargetPolicy("n", p)
+	v.tracker.targets.record(m, M.ParseSocksaddr("example.org:443"), 1, 2)
+	if v.TargetBatch("n").Records[0].Connections != 1 {
+		t.Fatal("TCP generation not reset")
+	}
+	v.tracker.targets.release(m)
+	v.tracker.targets.record(m, M.ParseSocksaddr("example.org:443"), 1, 2)
+}
+
+func BenchmarkTargetStatisticsTCP(b *testing.B) {
+	v := New(conf.New())
+	v.SetTargetPolicy("n", panel.TargetPolicy{Enabled: true, Version: "v", LeaseSeconds: 120})
+	d := M.ParseSocksaddr("example.org:443")
+	var ids atomic.Int64
+	b.ReportAllocs()
+	b.RunParallel(func(pb *testing.PB) {
+		m := &meter{tag: "n", uid: int(ids.Add(1)), targetFixed: true}
+		for pb.Next() {
+			v.tracker.targets.record(m, d, 1024, 1024)
+		}
+	})
+}
