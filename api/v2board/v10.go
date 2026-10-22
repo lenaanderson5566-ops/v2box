@@ -2,9 +2,11 @@ package panel
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"runtime/debug"
+	"time"
 )
 
 var v10Fields = map[string]string{
@@ -121,7 +123,11 @@ func (c *Client) announceCapabilities(ctx context.Context) error {
 			}
 		}
 	}
-	r, err := c.client.R().SetContext(ctx).SetBody(map[string]any{"coreVersion": version, "features": []string{"native-routing-v1", "dns-v1", "outbounds-v1", "server-traffic-budget-v1", "target-statistics-v1", "target-statistics-policy-v2", "target-statistics-interval-v1"}}).Post(c.nodePath("capabilities"))
+	body := map[string]any{"coreVersion": version, "features": []string{"native-routing-v1", "dns-v1", "outbounds-v1", "server-traffic-budget-v1", "target-statistics-v1", "target-statistics-policy-v2", "target-statistics-interval-v1", "configuration-receipt-v1"}}
+	if report := c.configurationReport.Load(); report != nil {
+		body["configuration"] = report
+	}
+	r, err := c.client.R().SetContext(ctx).SetBody(body).Post(c.nodePath("capabilities"))
 	if err != nil {
 		return err
 	}
@@ -129,4 +135,35 @@ func (c *Client) announceCapabilities(ctx context.Context) error {
 		return fmt.Errorf("V10 capability registration returned HTTP %d", r.StatusCode())
 	}
 	return nil
+}
+
+// ConfigurationReport contains only a panel-issued version and a bounded error code.
+type ConfigurationReport struct {
+	Hash      string `json:"hash"`
+	State     string `json:"state"`
+	ErrorCode string `json:"errorCode,omitempty"`
+}
+
+// ReportConfiguration is best-effort; monitoring failures never stop forwarding.
+// The next ordinary capability announcement retries the latest receipt.
+func (c *Client) ReportConfiguration(ctx context.Context, hash, code string) {
+	if !c.v10 || len(hash) != 64 {
+		return
+	}
+	if _, err := hex.DecodeString(hash); err != nil {
+		return
+	}
+	switch code {
+	case "", "decode", "core", "users", "certificate", "start":
+	default:
+		return
+	}
+	state := "applied"
+	if code != "" {
+		state = "failed"
+	}
+	c.configurationReport.Store(&ConfigurationReport{Hash: hash, State: state, ErrorCode: code})
+	bounded, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	_ = c.announceCapabilities(bounded)
 }

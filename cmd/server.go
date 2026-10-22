@@ -96,6 +96,7 @@ func serverHandle(_ *cobra.Command, _ []string) error {
 	v2core.ReloadCh = reloadCh
 	err = v2core.Start(nodes.NodeInfos)
 	if err != nil {
+		nodes.ReportConfiguration("core")
 		log.WithField("err", err).Error("Start core failed")
 		return err
 	}
@@ -103,9 +104,11 @@ func serverHandle(_ *cobra.Command, _ []string) error {
 	//node
 	err = nodes.Start(c.NodeConfigs, v2core)
 	if err != nil {
+		nodes.ReportConfiguration("start")
 		log.WithField("err", err).Error("Run nodes failed")
 		return err
 	}
+	nodes.ReportConfiguration("")
 	log.Info("Nodes started")
 	if watch {
 		// On file change, just signal reload; do not run reload concurrently here
@@ -170,12 +173,15 @@ func reload(config string, nodes **node.Node, v2core **core.V2Core) error {
 	}
 	newCore := core.New(newConf)
 	if err := newCore.Start(newNodes.NodeInfos); err != nil {
+		newNodes.ReportConfiguration("core")
 		return &reloadRejected{err}
 	}
 	if err := newNodes.PrepareUsers(newCore); err != nil {
+		newNodes.ReportConfiguration("users")
 		return &reloadRejected{err}
 	}
 	if err := newNodes.PrepareCertificates(); err != nil {
+		newNodes.ReportConfiguration("certificate")
 		return &reloadRejected{err}
 	}
 	// Validate before stopping live listeners. Parsing failures and panel outages
@@ -216,15 +222,18 @@ func reload(config string, nodes **node.Node, v2core **core.V2Core) error {
 	// Reattach reload channel
 	newCore.ReloadCh = oldReloadCh
 	if err := newCore.Start(newNodes.NodeInfos); err != nil {
+		newNodes.ReportConfiguration("core")
 		return err
 	}
 
 	if err := newNodes.Start(newConf.NodeConfigs, newCore); err != nil {
+		newNodes.ReportConfiguration("start")
 		_ = newNodes.Close()
 		_ = newCore.Close()
 		return err
 	}
 
+	newNodes.ReportConfiguration("")
 	*nodes = newNodes
 	*v2core = newCore
 

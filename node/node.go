@@ -3,6 +3,7 @@ package node
 import (
 	"context"
 	"fmt"
+	"time"
 
 	panel "github.com/lenaanderson5566-ops/v2box/api/v2board"
 	"github.com/lenaanderson5566-ops/v2box/conf"
@@ -83,4 +84,16 @@ func (n *Node) PrepareUsers(server *core.V2Core) error {
 		}
 	}
 	return nil
+}
+
+// ReportConfiguration runs only after all controllers started, or on a failed
+// preparation stage. A shared deadline bounds the cost across multiple nodes.
+func (n *Node) ReportConfiguration(code string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	for _, c := range n.controllers {
+		if c != nil && c.info != nil {
+			c.apiClient.ReportConfiguration(ctx, c.info.ConfigurationHash, code)
+		}
+	}
 }

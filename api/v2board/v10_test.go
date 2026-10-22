@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -86,7 +87,7 @@ func TestV10Contract(t *testing.T) {
 			}
 			var body map[string]any
 			json.NewDecoder(r.Body).Decode(&body)
-			if len(body["features"].([]any)) != 7 {
+			if len(body["features"].([]any)) != 8 {
 				t.Error("capabilities missing")
 			}
 			w.Write([]byte(`{"data":{"accepted":true}}`))
@@ -335,5 +336,94 @@ func TestTargetIntervalCompatibility(t *testing.T) {
 	c.captureTargetPolicy(`{"enabled":true,"version":"a80e93b1-0cba-478a-b780-0d8eb6118267","leaseSeconds":120,"reportIntervalSeconds":301}`)
 	if c.targetPolicy.Load() != nil {
 		t.Fatal("unsafe cadence accepted from header")
+	}
+}
+
+func TestConfigurationReceiptRetryAndValidation(t *testing.T) {
+	reports := make(chan ConfigurationReport, 16)
+	var fail atomic.Bool
+	s := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer receipt-test" || r.URL.RawQuery != "" {
+			t.Error("receipt credentials must be headers only")
+		}
+		var body struct {
+			Configuration *ConfigurationReport `json:"configuration"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Error(err)
+		}
+		if body.Configuration != nil {
+			reports <- *body.Configuration
+		}
+		if fail.Load() {
+			w.WriteHeader(503)
+			return
+		}
+		w.Write([]byte(`{"data":{"accepted":true}}`))
+	}))
+	defer s.Close()
+	zero := 0
+	c, err := newTestPanel(t, s, &conf.NodeConfig{APIHost: s.URL, NodeType: "v2box", NodeID: 1, Key: "receipt-test", RetryCount: &zero})
+	if err != nil {
+		t.Fatal(err)
+	}
+	hash := strings.Repeat("a", 64)
+	c.ReportConfiguration(context.Background(), "invalid", "")
+	c.ReportConfiguration(context.Background(), hash, "arbitrary-secret")
+	if len(reports) != 0 {
+		t.Fatal("invalid receipt sent")
+	}
+	fail.Store(true)
+	c.ReportConfiguration(context.Background(), hash, "core")
+	report := <-reports
+	if report.State != "failed" || report.ErrorCode != "core" {
+		t.Fatal(report)
+	}
+	fail.Store(false)
+	if err := c.announceCapabilities(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if report = <-reports; report.Hash != hash || report.State != "failed" {
+		t.Fatal("latest receipt not retried", report)
+	}
+	c.ReportConfiguration(context.Background(), hash, "")
+	if report = <-reports; report.State != "applied" || report.ErrorCode != "" {
+		t.Fatal("success retains error", report)
+	}
+}
+
+func TestConfigurationDecodeFailureReceipt(t *testing.T) {
+	reports := make(chan ConfigurationReport, 4)
+	hash := strings.Repeat("b", 64)
+	s := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "capabilities") {
+			var body struct {
+				Configuration *ConfigurationReport `json:"configuration"`
+			}
+			json.NewDecoder(r.Body).Decode(&body)
+			if body.Configuration != nil {
+				reports <- *body.Configuration
+			}
+			w.Write([]byte(`{"data":{"accepted":true}}`))
+			return
+		}
+		w.Header().Set("ETag", `"`+hash+`"`)
+		w.Write([]byte(`{"data":{"protocol":"invalid","listenPort":443}}`))
+	}))
+	defer s.Close()
+	c, err := newTestPanel(t, s, &conf.NodeConfig{APIHost: s.URL, NodeType: "v2box", NodeID: 1, Key: "test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = c.GetNodeInfo(context.Background()); err == nil {
+		t.Fatal("invalid protocol accepted")
+	}
+	select {
+	case report := <-reports:
+		if report.Hash != hash || report.State != "failed" || report.ErrorCode != "decode" {
+			t.Fatal(report)
+		}
+	default:
+		t.Fatal("decode failure missing receipt")
 	}
 }

@@ -23,13 +23,14 @@ const (
 )
 
 type NodeInfo struct {
-	Id           int
-	Type         string
-	Security     int
-	PushInterval time.Duration
-	PullInterval time.Duration
-	Tag          string
-	Common       *CommonNode
+	ConfigurationHash string
+	Id                int
+	Type              string
+	Security          int
+	PushInterval      time.Duration
+	PullInterval      time.Duration
+	Tag               string
+	Common            *CommonNode
 }
 
 type CommonNode struct {
@@ -166,8 +167,17 @@ func (c *Client) GetNodeInfo(ctx context.Context) (node *NodeInfo, err error) {
 	} else {
 		return nil, fmt.Errorf("received nil response")
 	}
+	configurationHash := strings.Trim(r.Header().Get("ETag"), "\"")
+	if c.v10 {
+		defer func() {
+			if err != nil {
+				c.ReportConfiguration(ctx, configurationHash, "decode")
+			}
+		}()
+	}
 	node = &NodeInfo{
-		Id: c.NodeId,
+		ConfigurationHash: configurationHash,
+		Id:                c.NodeId,
 	}
 	// parse protocol params
 	cm := &CommonNode{}
