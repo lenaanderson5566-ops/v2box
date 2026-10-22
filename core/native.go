@@ -50,7 +50,7 @@ func buildNativeRoutes(config object, raw json.RawMessage) error {
 			}
 		}
 	}
-	route := object{"rules": []any{object{"action": "sniff"}}, "final": "direct"}
+	route := object{"rules": []any{}, "final": "direct"}
 	if value, ok := native["route"]; ok {
 		var valid bool
 		route, valid = value.(map[string]any)

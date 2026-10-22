@@ -34,7 +34,8 @@ func buildRoutes(config object, n *panel.NodeInfo) error {
 	if len(n.Common.SingBox) > 0 && string(n.Common.SingBox) != "null" {
 		return buildNativeRoutes(config, n.Common.SingBox)
 	}
-	rules := []object{{"action": "sniff"}}
+	rules := []object{}
+	needsSniff := false
 	outbounds := config["outbounds"].([]any)
 	known := map[string]string{"direct": ""}
 	dnsServers := []object{{"type": "local", "tag": "local"}}
@@ -44,6 +45,7 @@ func buildRoutes(config object, n *panel.NodeInfo) error {
 		var err error
 		switch r.Action {
 		case "block", "route", "dns":
+			needsSniff = true
 			match, err = domainMatch(r.Match)
 		case "block_ip", "route_ip":
 			cidrs := []string{}
@@ -93,6 +95,7 @@ func buildRoutes(config object, n *panel.NodeInfo) error {
 				match["port_range"] = ranges
 			}
 		case "protocol":
+			needsSniff = true
 			match = object{"protocol": r.Match}
 		case "default_out":
 			match = object{}
@@ -148,9 +151,16 @@ func buildRoutes(config object, n *panel.NodeInfo) error {
 			rules = append(rules, match)
 		}
 	}
-	if len(dnsRules) > 0 {
-		rules = append([]object{{"action": "sniff"}, {"action": "resolve"}}, rules[1:]...)
+	// Inspect payloads only when a policy needs the discovered domain/protocol.
+	// Plain forwarding and IP/port rules must not wait for a client first byte.
+	prefix := []object{}
+	if needsSniff {
+		prefix = append(prefix, object{"action": "sniff"})
 	}
+	if len(dnsRules) > 0 {
+		prefix = append(prefix, object{"action": "resolve"})
+	}
+	rules = append(prefix, rules...)
 	config["dns"] = object{"servers": dnsServers, "rules": dnsRules, "final": "local"}
 	config["route"] = object{"rules": rules, "final": "direct", "default_domain_resolver": "local"}
 	config["outbounds"] = outbounds

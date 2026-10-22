@@ -292,3 +292,24 @@ func BenchmarkTrafficAccountWithBudget(b *testing.B) {
 		})
 	}
 }
+
+// Compare resolving a tag's shard on each packet with the admitted connection's cache.
+func BenchmarkMeterAccounting(b *testing.B) {
+	for _, cached := range []bool{false, true} {
+		b.Run(fmt.Sprintf("Cached=%t", cached), func(b *testing.B) {
+			tracker := newTrafficTracker()
+			var ids atomic.Int64
+			b.ReportAllocs()
+			b.RunParallel(func(pb *testing.PB) {
+				uid := int(ids.Add(1))
+				m := &meter{tracker: tracker, tag: "v2box_node_123456_panel_example_org", uid: uid}
+				if cached {
+					m.counter = tracker.counter(m.tag, uid)
+				}
+				for pb.Next() {
+					m.account(16384, 0)
+				}
+			})
+		})
+	}
+}

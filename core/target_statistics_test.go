@@ -1,6 +1,7 @@
 package core
 
 import (
+	"encoding/json"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -300,4 +301,77 @@ func BenchmarkTargetStatisticsTCP(b *testing.B) {
 			v.tracker.targets.record(m, d, 1024, 1024)
 		}
 	})
+}
+
+func TestTargetConcurrentDrainPreservesExactCounters(t *testing.T) {
+	v := New(conf.New())
+	v.SetTargetPolicy("n", panel.TargetPolicy{Enabled: true, Version: "v", LeaseSeconds: 120})
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			m := &meter{tag: "n", uid: 1, targetFixed: true}
+			for j := 0; j < 2000; j++ {
+				v.tracker.targets.record(m, M.ParseSocksaddr("example.org:443"), 1, 2)
+			}
+		}()
+	}
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	var up, down, connections int64
+	drain := func() {
+		if b := v.TargetBatch("n"); b != nil {
+			for _, r := range b.Records {
+				up += r.UploadBytes
+				down += r.DownloadBytes
+				connections += r.Connections
+			}
+			v.AckTargets("n", b.BatchID, true)
+		}
+	}
+	for {
+		drain()
+		select {
+		case <-done:
+			drain()
+			if up != 16000 || down != 32000 || connections != 8 {
+				t.Fatalf("lost counters: %d %d %d", up, down, connections)
+			}
+			return
+		default:
+		}
+	}
+}
+
+func TestExpiredTargetBatchPreservesTruncationNotice(t *testing.T) {
+	v := New(conf.New())
+	v.SetTargetPolicy("n", panel.TargetPolicy{Enabled: true, Version: "v", LeaseSeconds: 120})
+	v.tracker.targets.record(&meter{tag: "n", uid: 1, targetFixed: true}, M.ParseSocksaddr("example.org:443"), 1, 2)
+	state := v.tracker.targets.nodes["n"]
+	state.drop(7)
+	old := v.TargetBatch("n")
+	state.pendingAt = time.Now().Add(-targetPendingTTL)
+	next := v.TargetBatch("n")
+	if next == nil || next.BatchID == old.BatchID || next.Dropped != 8 || len(next.Records) != 0 {
+		t.Fatalf("lost expiry/truncation notice: %+v", next)
+	}
+	if old.Records[0].UploadBytes != 1 || old.Dropped != 7 {
+		t.Fatal("pending snapshot mutated")
+	}
+}
+
+func TestTargetFullBatchWireBudget(t *testing.T) {
+	b := panel.TargetBatch{Version: "a80e93b1-0cba-478a-b780-0d8eb6118267", BatchID: "a80e93b1-0cba-478a-b780-0d8eb6118267"}
+	for i := 0; i < targetRowLimit; i++ {
+		b.Records = append(b.Records, panel.TargetRecord{UserID: i + 1, Target: fmt.Sprintf("cdn-%d.example.org", i), Type: "domain", Connections: 100, UploadBytes: 1048576, DownloadBytes: 10485760})
+	}
+	wire, err := json.Marshal(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(wire) > 262144 {
+		t.Fatal("bounded batch exceeds panel limit")
+	}
+	t.Logf("500 representative rows: %d JSON bytes; 20 nodes every 60 seconds: %.2f GiB/day at continuous full capacity (before HTTP/TLS)", len(wire), float64(len(wire))*20*1440/(1<<30))
 }

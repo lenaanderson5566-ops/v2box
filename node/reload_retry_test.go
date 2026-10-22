@@ -101,3 +101,35 @@ func TestLongTargetCadenceStillSynchronizesDisable(t *testing.T) {
 		t.Fatal("long report interval delayed stop policy")
 	}
 }
+
+func TestTargetBackoffStillRenewsLease(t *testing.T) {
+	now := time.Now()
+	c := &Controller{targetRetry: true, targetRetryAt: now.Add(2 * time.Minute), targetRetryDelay: 2 * time.Minute}
+	if c.targetReportDelay(now) != time.Minute || c.targetReportDelay(now.Add(100*time.Second)) != 20*time.Second {
+		t.Fatal("retry interferes with lease renewal")
+	}
+	c.clearTargetRetry()
+	if c.targetRetry || !c.targetRetryAt.IsZero() || c.targetRetryDelay != 0 {
+		t.Fatal("retry state survived recovery")
+	}
+}
+
+func TestTargetUploadRetryBackoffAndRecovery(t *testing.T) {
+	now := time.Now()
+	c := &Controller{}
+	for _, want := range []time.Duration{30 * time.Second, time.Minute, 2 * time.Minute, 2 * time.Minute} {
+		c.scheduleTargetRetry(now)
+		if !c.targetRetry || c.targetRetryAt.Sub(now) != want {
+			t.Fatalf("retry deadline %s want %s", c.targetRetryAt.Sub(now), want)
+		}
+		if c.targetReportDelay(now) > time.Minute {
+			t.Fatal("lease renewal delayed")
+		}
+		now = c.targetRetryAt
+	}
+	c.clearTargetRetry()
+	c.scheduleTargetRetry(now)
+	if c.targetRetryDelay != 30*time.Second {
+		t.Fatal("fresh failure inherited old backoff")
+	}
+}

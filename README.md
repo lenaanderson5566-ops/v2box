@@ -244,7 +244,7 @@ GOEXPERIMENT=jsonv2 V2BOX_SOAK=1 go test -race -tags with_quic,with_utls ./core 
 
 ## Optional destination statistics
 
-Update both the panel and node binary, then enable the default-off switch in the panel log settings. Requires V10 API; older panels returning 404 leave collection disabled. Targets use the original domain or IP, without reverse DNS or replacing IPs with sniffed domains. No URL paths or payloads are collected. The panel log settings offer reporting every 30/60/120/300 seconds (default 60). Nodes advertise target-statistics-interval-v1; older nodes keep their fixed cadence. Policy sync runs in its own cancellable task at most every 60 seconds (plus up to 10% jitter), independently of the upload interval, with a 120-second lease; failed policy reads disable collection. Each node holds at most 500 active rows and 500 pending rows; TCP retains a single fixed target without allocating target maps. UDP caches at most 64 targets per connection, ignoring ports, with per-node limits of 8,192 cached addresses and 1,024 cache-holding sessions. Close and policy retirement release these maps. Per-node/user shards avoid a global packet-path lock. Failed uploads retry after 30 seconds plus jitter rather than waiting the full report interval. Batches retry with stable IDs for at most five minutes and are never spooled to disk. Compatible panels attach a policy lease to configuration responses (including 304); the node reuses only the remaining lease and falls back to the policy endpoint when needed. Statistics requests have a five-second deadline, a 256 KiB outgoing body limit and a 4 KiB response limit, and do not delay billing reports. The panel displays short-lived hourly aggregates under access analytics; restarts, capacity limits and outages can lose this optional telemetry.
+Update both the panel and node binary, then enable the default-off switch in the panel log settings. Requires V10 API; older panels returning 404 leave collection disabled. Targets use the original domain or IP, without reverse DNS or replacing IPs with sniffed domains. No URL paths or payloads are collected. The panel log settings offer reporting every 30/60/120/300 seconds (default 60). Nodes advertise target-statistics-interval-v1; older nodes keep their fixed cadence. Policy sync runs in its own cancellable task at most every 60 seconds (plus up to 10% jitter), independently of the upload interval, with a 120-second lease; failed policy reads disable collection. Each node holds at most 500 active rows and 500 pending rows; TCP retains a single fixed target without allocating target maps. UDP caches at most 64 targets per connection, ignoring ports, with per-node limits of 8,192 cached addresses and 1,024 cache-holding sessions. Close and policy retirement release these maps. Per-node/user shards avoid a global packet-path lock. Failed uploads back off for 30, 60, then 120 seconds plus scheduling jitter, while policy/disable synchronization continues at most every 60 seconds plus jitter. Recovery resets the backoff. Batches retry with stable IDs for at most five minutes and are never spooled to disk. Compatible panels attach a policy lease to configuration responses (including 304); the node reuses only the remaining lease and falls back to the policy endpoint when needed. Statistics requests have a five-second deadline, a 256 KiB outgoing body limit and a 4 KiB response limit, and do not delay billing reports. The panel displays recent detailed aggregates and optional daily summaries under Logs → Node destinations; restarts, capacity limits and outages can lose this optional telemetry.
 
 
 ## Independent node credentials (manual rotation)
@@ -252,3 +252,37 @@ Update both the panel and node binary, then enable the default-off switch in the
 Upgrade the panel before migrating a node. Generate its scoped credential in the panel node's credentials dialog; the full value is displayed once. First issuance immediately blocks the shared token for that identity. Later manual rotations allow a 30-minute overlap. Confirm the new fingerprint's last authentication in the panel, then revoke the previous key. No scheduled rotation is implemented. Revoking API access does not terminate established proxy sessions.
 
 Fresh installs can use `--prompt-api-key` for hidden terminal input. For an existing configuration, use `v2box credential` (Python 3 required), select the node, paste the independent key, then run `v2box restart`. The helper updates only that entry atomically with mode 0600, creates no credential backup and does not restart automatically. Independent keys also use Authorization in legacy API mode; older shared-token deployments retain their compatibility behavior until migrated. The helper is included in new release archives and is installed by the updated installer.
+
+
+### 转发与访问目标统计的性能边界
+
+共用 TCP/UDP 计量层在连接准入时缓存流量计数分片，避免每次收发重复计算节点标签哈希；没有共享服务器额度时跳过额度读锁，已配置额度仍实时检查，撤权、设备限制、动态限速和按用户共享速度桶保持生效。
+
+兼容路由只在域名、协议和定制 DNS 规则需要时添加嗅探；纯直连及仅 IP/端口规则不等待客户端应用首包。原生 sing-box 路由完整保留管理员显式配置的 sniff 动作；未提供路由规则时不隐式添加。这项优化作用于各代理协议共用的路由流程，尤其是服务器先发送欢迎消息的连接；不是修改加密、拥塞控制或协议兼容参数。
+
+目标聚合在现有分片锁内原位增加计数，避免每个包反复复制整条记录及写回映射；切批次时复制成独立快照，重试期间仍保持不可变。新目标会分配一条记录，稳定目标的每包更新不分配内存。保留每节点 500 活动行 + 500 待确认行、UDP 8192 地址/1024 会话缓存及关闭时释放的限制；不会将统计写入节点磁盘。过期批次会携带原有截断提示，避免丢失容量不足信息。这些提示是截断/丢弃信号，不是精确的用户请求数。
+
+持续上报失败按 30/60/120 秒退避，正常后台上报周期仍为 30/60/120/300 秒（默认 60 秒），采集租约单独保持同步。120/300 秒减少请求频率，但单个周期仍只收集最多 500 个用户与目标组合，高基数节点更容易截断；不能把降低上报频率理解为统计完整性不变。面板近期明细保留期与日汇总保留期独立，延长保留期仍需要日汇总全局行数预算，不能单靠减少上传次数解决数据库增长。本轮没有更改面板的已配置保留期或增加数据维度。
+
+本机 Windows amd64 / Go 1.27.1、8 逻辑 CPU，目标统计 300ms、连接计量 500ms，各 3 次微基准中位数：
+
+| 计量路径 | 修改前 | 修改后 |
+| --- | ---: | ---: |
+| TCP 固定目标统计 | 31.53 ns/次 | 17.52 ns/次 |
+| UDP 域名目标统计 | 47.88 ns/次 | 35.70 ns/次 |
+| 连接计量分片（长节点标签，缓存与每次计算对照） | 34.80 ns/次 | 27.50 ns/次 |
+
+稳态场景均为 0 B/次、0 allocs/次；新连接、新目标和生成批次仍有受上限约束的分配。结果衡量计量函数，不是外网吞吐、网络时延或节点容量保证。复用 `core/target_statistics_test.go`、`core/soak_test.go`、`core/config_test.go`、`core/integration_test.go` 和 `node/reload_retry_test.go` 验证并发切批、失败退避、嗅探规则和各协议首包；运行日志及本地构建产物保存在工作区 outputs，不纳入发布源码。
+
+
+带宽容量样例（不是实际站点预测）：500 条常见长度域名、连接数 100、上行 1 MiB/下行 10 MiB 的完整批次，JSON 为 63,405 字节。20 个节点始终每分钟装满并发送，约 1.70 GiB/天（不含 HTTP/TLS）；按两分钟满批约减半，但长域名、更大的计数和重试会增加实际值。这说明即使数据库以小时或日聚合存储，网络开销仍由节点批次决定，不能用数据库行数推算上传带宽。正常未满批时按实际记录发送，没有填充到 500 条。
+
+验证结果：`GOEXPERIMENT=jsonv2 go test -tags with_quic,with_utls ./... -count=1`、完整 `-race` 回归和 `go vet` 通过。额外执行生命周期/Naive 多路复用/目标缓存压力回归与最后的退避、真实域名拦截测试，均通过；域名黑名单仍能阻止发往 IP、但 HTTP Host 命中规则的连接。上述压力回归复用已有资源增长阈值，只覆盖有限测试时段，不能证明生产长期运行绝无泄漏。
+
+Linux amd64 与 arm64 均以 `CGO_ENABLED=0 GOEXPERIMENT=jsonv2 go build -tags with_quic,with_utls -trimpath` 交叉构建通过；未在真实 Linux 节点运行本轮压测。需要发布并更新节点二进制才能应用转发及统计优化，仅更新面板静态资源不会改变运行中的节点。
+
+### 依赖安全复核
+
+构建最低 Go 版本已提升到 1.27.3，修复标准库证书信任、HTTP/2 与 TLS 等安全问题；x/net 更新至 0.60.0，gRPC 更新至 1.83.2，Chi 更新至 5.3.0，并同步其必要传递依赖。现有 CI 从 go.mod 读取版本，无需修改节点配置。已有二进制不会自动获得源码或工具链修复，需要发布并安装新构建。
+
+官方 Go 1.27.3 Linux 容器中的全包 `go test -race -tags with_quic,with_utls ./...`、`go vet` 和单独的 `TestVLESSRealityVision` 通过。govulncheck v1.9.0 从 16 项静态可达告警降到 0；导入包告警为 0；仍有 1 项所需模块告警，来自未导入的 x/crypto/openpgp（GO-2026-5932，废弃包无修复版本）。项目其他密码功能仍需要 x/crypto 模块。静态扫描不等于生产可利用性证明或零漏洞保证。安装脚本 Python 测试 20 项执行、2 项平台相关跳过；Windows 新工具链包解析未完成，中止后改在 Linux 验证。本轮未发布 Release 或执行生产部署。

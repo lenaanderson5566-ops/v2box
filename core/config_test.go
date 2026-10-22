@@ -50,3 +50,58 @@ func TestBillingAndOnlineThresholdsAreIndependent(t *testing.T) {
 		t.Fatal("online reporting consumed billing data")
 	}
 }
+
+func TestSniffOnlyWhenRoutingNeedsPayload(t *testing.T) {
+	outbound := `{"type":"direct","tag":"alternate"}`
+	dns := "1.1.1.1"
+	for _, tc := range []struct {
+		name   string
+		routes []panel.Route
+		prefix []string
+	}{
+		{"direct", nil, nil},
+		{"ip", []panel.Route{{Action: "block_ip", Match: []string{"192.0.2.1"}}}, []string{"reject"}},
+		{"port", []panel.Route{{Action: "block_port", Match: []string{"25"}}}, []string{"reject"}},
+		{"default", []panel.Route{{Action: "default_out", ActionValue: &outbound}}, []string{"route"}},
+		{"domain", []panel.Route{{Action: "block", Match: []string{"full:blocked.example"}}}, []string{"sniff", "reject"}},
+		{"protocol", []panel.Route{{Action: "protocol", Match: []string{"bittorrent"}}}, []string{"sniff", "reject"}},
+		{"dns", []panel.Route{{Action: "dns", Match: []string{"full:example.org"}, ActionValue: &dns}}, []string{"sniff", "resolve"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			n := testNode(t, "vless")
+			n.Common.Routes = tc.routes
+			config := object{"outbounds": []any{object{"type": "direct", "tag": "direct"}}}
+			if err := buildRoutes(config, n); err != nil {
+				t.Fatal(err)
+			}
+			rules := config["route"].(object)["rules"].([]object)
+			if len(rules) != len(tc.prefix) {
+				t.Fatalf("rules: %+v", rules)
+			}
+			for i, action := range tc.prefix {
+				if rules[i]["action"] != action {
+					t.Fatalf("routing inspection changed: %+v", rules)
+				}
+			}
+		})
+	}
+}
+
+func TestNativeDefaultDoesNotInjectInspection(t *testing.T) {
+	for _, tc := range []struct {
+		raw   string
+		count int
+	}{
+		{`{"dns":{"servers":[{"type":"local","tag":"local"}]}}`, 0},
+		{`{"route":{"rules":[{"action":"sniff"}],"final":"direct"}}`, 1},
+	} {
+		config := object{}
+		if err := buildNativeRoutes(config, json.RawMessage(tc.raw)); err != nil {
+			t.Fatal(err)
+		}
+		rules := config["route"].(object)["rules"].([]any)
+		if len(rules) != tc.count {
+			t.Fatalf("explicit native policy changed: %+v", rules)
+		}
+	}
+}

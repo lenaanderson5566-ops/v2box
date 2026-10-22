@@ -26,7 +26,7 @@ type targetKey struct {
 }
 type targetShard struct {
 	mu     sync.Mutex
-	rows   map[targetKey]panel.TargetRecord
+	rows   map[targetKey]*panel.TargetRecord
 	meters map[*meter]struct{}
 }
 type targetState struct {
@@ -119,7 +119,7 @@ func (t *targetTracker) policy(tag string, p panel.TargetPolicy) {
 		t.generation++
 		old = &targetState{version: p.Version, generation: t.generation}
 		for i := range old.shards {
-			old.shards[i].rows = make(map[targetKey]panel.TargetRecord)
+			old.shards[i].rows = make(map[targetKey]*panel.TargetRecord)
 		}
 		old.until.Store(now.Add(time.Duration(p.LeaseSeconds) * time.Second).UnixNano())
 		old.enabled.Store(true)
@@ -235,7 +235,8 @@ func (t *targetTracker) recordActive(m *meter, d M.Socksaddr, up, down int) {
 			s.drop(1)
 			return
 		}
-		row = panel.TargetRecord{UserID: m.uid, Target: key.target, Type: key.kind}
+		row = &panel.TargetRecord{UserID: m.uid, Target: key.target, Type: key.kind}
+		shard.rows[key] = row
 	}
 	if m.targetFixed {
 		if !m.targetCounted {
@@ -248,7 +249,6 @@ func (t *targetTracker) recordActive(m *meter, d M.Socksaddr, up, down int) {
 	}
 	row.UploadBytes += int64(up)
 	row.DownloadBytes += int64(down)
-	shard.rows[key] = row
 }
 
 // Close and policy retirement release caches even when the connection never sends again.
@@ -295,7 +295,7 @@ func (v *V2Core) TargetBatch(tag string) *panel.TargetBatch {
 	}
 	if s.pending != nil && now.Sub(s.pendingAt) >= targetPendingTTL {
 		// Never retry past the panel deduplication horizon (one hour).
-		s.drop(int64(len(s.pending.Records)))
+		s.drop(int64(len(s.pending.Records)) + s.pending.Dropped)
 		s.pending = nil
 	}
 	if s.pending == nil {
@@ -307,7 +307,7 @@ func (v *V2Core) TargetBatch(tag string) *panel.TargetBatch {
 		b := &panel.TargetBatch{Version: s.version, BatchID: uuid.NewString(), Records: make([]panel.TargetRecord, 0, s.count.Load()), Dropped: s.dropped.Swap(0)}
 		for i := range s.shards {
 			for _, row := range s.shards[i].rows {
-				b.Records = append(b.Records, row)
+				b.Records = append(b.Records, *row)
 			}
 			clear(s.shards[i].rows)
 		}

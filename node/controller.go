@@ -33,6 +33,8 @@ type Controller struct {
 	targetLastReport  time.Time
 	targetInterval    time.Duration
 	targetRetry       bool
+	targetRetryAt     time.Time
+	targetRetryDelay  time.Duration
 	renewCertPeriodic *task.Task
 }
 

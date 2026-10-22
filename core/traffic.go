@@ -89,6 +89,9 @@ func (t *trafficTracker) updateUsers(tag string, users map[string]panel.UserInfo
 	return nil
 }
 func (t *trafficTracker) account(tag string, uid int, up, down int) {
+	t.accountCounter(t.counter(tag, uid), tag, uid, up, down)
+}
+func (t *trafficTracker) accountCounter(c *trafficCounters, tag string, uid int, up, down int) {
 	if up == 0 && down == 0 {
 		return
 	}
@@ -96,7 +99,6 @@ func (t *trafficTracker) account(tag string, uid int, up, down int) {
 	if t.hasBudgets.Load() {
 		t.accountBudget(tag, up, down)
 	}
-	c := t.counter(tag, uid)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	k := trafficKey{tag, uid}
@@ -210,6 +212,7 @@ type meter struct {
 	targetGeneration       uint64
 	targetSeen             map[targetKey]bool // guarded by the active node/user shard
 	targetNames            map[M.Socksaddr]targetKey
+	counter                *trafficCounters // immutable, selected once at admission
 	tracker                *trafficTracker
 	tag, user, ip          string
 	uid                    int
@@ -242,15 +245,24 @@ func (t *trafficTracker) newMeter(ctx context.Context, m adapter.InboundContext)
 		return nil
 	}
 	ctx, cancel := context.WithCancel(ctx)
-	return &meter{tracker: t, tag: m.Inbound, user: user, identity: m.User, ip: ip, uid: u.Id, ctx: ctx, cancel: cancel, limiter: l,
+	return &meter{tracker: t, counter: t.counter(m.Inbound, u.Id), tag: m.Inbound, user: user, identity: m.User, ip: ip, uid: u.Id, ctx: ctx, cancel: cancel, limiter: l,
 		target: originalTarget(m.Destination, m.RouteOriginalDestination, m.OriginDestination), resolvedTarget: m.Destination}
 }
+func (m *meter) account(up, down int) {
+	counter := m.counter
+	if counter == nil { // Synthetic meters used by tests and internal callers.
+		counter = m.tracker.counter(m.tag, m.uid)
+	}
+	m.tracker.accountCounter(counter, m.tag, m.uid, up, down)
+}
 func (m *meter) wait(n int) error {
-	m.tracker.mu.RLock()
-	blocked := m.tracker.budgetBlockedLocked(m.tag)
-	m.tracker.mu.RUnlock()
-	if blocked {
-		return net.ErrClosed
+	if m.tracker.hasBudgets.Load() {
+		m.tracker.mu.RLock()
+		blocked := m.tracker.budgetBlockedLocked(m.tag)
+		m.tracker.mu.RUnlock()
+		if blocked {
+			return net.ErrClosed
+		}
 	}
 	if err := m.ctx.Err(); err != nil {
 		return err
@@ -298,7 +310,7 @@ func (c *meteredConn) Read(p []byte) (int, error) {
 	}
 	if n > 0 {
 		c.m.tracker.targets.record(c.m, c.m.target, n, 0)
-		c.m.tracker.account(c.m.tag, c.m.uid, n, 0)
+		c.m.account(n, 0)
 		if e := c.m.wait(n); e != nil {
 			return 0, e
 		}
@@ -313,7 +325,7 @@ func (c *meteredConn) Write(p []byte) (int, error) {
 	if n > 0 {
 		c.m.tracker.targets.record(c.m, c.m.target, 0, n)
 	}
-	c.m.tracker.account(c.m.tag, c.m.uid, 0, n)
+	c.m.account(0, n)
 	return n, err
 }
 func (c *meteredConn) Close() error {
@@ -337,7 +349,7 @@ func (c *meteredPacketConn) ReadPacket(b *buf.Buffer) (M.Socksaddr, error) {
 	d, err := c.PacketConn.ReadPacket(b)
 	if err == nil {
 		c.m.tracker.targets.record(c.m, packetTarget(c.m, d), b.Len(), 0)
-		c.m.tracker.account(c.m.tag, c.m.uid, b.Len(), 0)
+		c.m.account(b.Len(), 0)
 		err = c.m.wait(b.Len())
 	}
 	return d, err
@@ -351,7 +363,7 @@ func (c *meteredPacketConn) WritePacket(b *buf.Buffer, d M.Socksaddr) error {
 	err := c.PacketConn.WritePacket(b, d)
 	if err == nil {
 		c.m.tracker.targets.record(c.m, packetTarget(c.m, d), 0, n)
-		c.m.tracker.account(c.m.tag, c.m.uid, 0, n)
+		c.m.account(0, n)
 	}
 	return err
 }
