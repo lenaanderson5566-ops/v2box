@@ -238,7 +238,7 @@ func (c *Client) GetNodeInfo(ctx context.Context) (node *NodeInfo, err error) {
 		CertMode:         cm.TlsSettings.CertMode,
 		CertFile:         cf,
 		KeyFile:          kf,
-		Email:            "node@v2board.com",
+		Email:            "fastdog.ltd@gmail.com",
 		CertDomain:       cm.TlsSettings.PrimaryServerName(),
 		DNSEnv:           make(map[string]string),
 		Provider:         cm.TlsSettings.Provider,

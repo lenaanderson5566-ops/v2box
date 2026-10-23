@@ -44,7 +44,7 @@ func verifyTransitionDNS(t *panel.DomainTransition) error {
 	}
 }
 func lookupTransitionDNS(ctx context.Context, t *panel.DomainTransition) error {
-	client := &http.Client{Timeout: 5 * time.Second}
+	client := &http.Client{Timeout: 5 * time.Second, CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }}
 	for _, resolver := range []string{"https://cloudflare-dns.com/dns-query", "https://dns.google/resolve"} {
 		for _, family := range []string{"ipv4", "ipv6"} {
 			kind := "A"

@@ -1,13 +1,17 @@
 package node
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/x509"
 	"encoding/pem"
 	"errors"
+	"io"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -241,5 +245,41 @@ func TestTransitionDNSAddresses(t *testing.T) {
 	}
 	if verifyTransitionDNS(&panel.DomainTransition{Domain: "example.test"}) == nil {
 		t.Fatal("empty addresses accepted")
+	}
+}
+
+type transitionDNSRoundTrip func(*http.Request) (*http.Response, error)
+
+func (f transitionDNSRoundTrip) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+func TestRelayCertificateDNSUsesEntryAndRejectsRedirects(t *testing.T) {
+	previous := http.DefaultTransport
+	t.Cleanup(func() { http.DefaultTransport = previous })
+	calls := 0
+	http.DefaultTransport = transitionDNSRoundTrip(func(r *http.Request) (*http.Response, error) {
+		calls++
+		if r.URL.Query().Get("name") != "entry.example.test" {
+			t.Fatal("origin hostname used for entry certificate")
+		}
+		body := `{"Status":0,"Answer":[]}`
+		if r.URL.Query().Get("type") == "A" {
+			body = `{"Status":0,"Answer":[{"Type":1,"Data":"1.1.1.1"}]}`
+		}
+		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header), Request: r}, nil
+	})
+	transition := &panel.DomainTransition{Domain: "entry.example.test", Addresses: map[string]string{"ipv4": "1.1.1.1"}}
+	if err := lookupTransitionDNS(context.Background(), transition); err != nil || calls != 4 {
+		t.Fatalf("relay entry verification: %v, calls %d", err, calls)
+	}
+	transition.Addresses["ipv4"] = "8.8.8.8"
+	if lookupTransitionDNS(context.Background(), transition) == nil {
+		t.Fatal("origin IP substituted for ingress IP")
+	}
+	calls = 0
+	http.DefaultTransport = transitionDNSRoundTrip(func(r *http.Request) (*http.Response, error) {
+		calls++
+		return &http.Response{StatusCode: 302, Body: io.NopCloser(strings.NewReader("{}")), Header: http.Header{"Location": []string{"https://unexpected.example.test/"}}, Request: r}, nil
+	})
+	if lookupTransitionDNS(context.Background(), transition) == nil || calls != 1 {
+		t.Fatal("DNS resolver redirect followed")
 	}
 }

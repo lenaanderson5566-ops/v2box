@@ -54,6 +54,8 @@ DNS 支持 local、UDP、TCP、TLS、HTTPS，以及原生 DNS 规则和解析策
 
 ## ACME 失败保护
 
+本版证书申请联系邮箱为 `fastdog.ltd@gmail.com`，独立于面板站点和发信邮箱。新 ACME 账户使用该联系邮箱；现有证书和旧账户文件不会被删除，也不会仅为了更换邮箱强制重签证书。节点需要升级到包含本次修改的正式版本后生效。
+
 首次签发或续签失败后，会在证书所在目录记录 `.acme-<域名摘要>.json`，同目录同域名共享保护状态；重启、重载、修改 DNS 凭据不会自动清除它。
 
 - 验证失败、DNS 提供商配置错误及无法分类的错误：立即暂停，修复后人工恢复。
@@ -126,6 +128,23 @@ sudo bash install.sh v1.0.1 --api-host https://panel.example.com --node-id 1 --p
 ```
 
 安装路径 `/usr/local/lib/v2box`；配置 `/etc/v2box/config.json`；服务 `v2box`。更新保留配置和上一份二进制 `v2box.previous`。检查日志使用 `v2box log`。升级到本版可重新运行 `sudo bash install.sh v1.0.1`，不需要再次传入面板地址或密钥。
+
+### 更新与卸载
+
+包含本次运维功能的安装包会同时安装更新器。旧版先使用面板提供的升级命令升级到对应正式版，之后执行：
+
+```sh
+v2box update             # 更新至 GitHub 最新正式版
+v2box update RELEASE_TAG # 指定已有正式版本
+v2box uninstall         # 交互确认后卸载，保留独立 IP 上报服务
+v2box uninstall --stop-network # 同时停用本机共享的 IP 上报 / DDNS 调度
+```
+
+更新校验包摘要与必需文件，保留配置、证书、自定义 systemd/OpenRC 服务文件及原服务启用状态；运行中的节点更新后重启，原本停止的节点不会被自动启动。重启或短时服务存活检查失败时恢复旧程序并尝试恢复原服务，失败返回非零；存活检查不等于所有协议、面板通讯或实际客户端连接均通过。更新与卸载互斥，部署未完成时拒绝更新，应先按部署提示恢复。独立 `node-network` 安装副本不由节点更新器覆盖，修复入口管理它的配置与版本。
+
+卸载影响服务器上同一 V2Box 服务的所有节点，需要输入 `uninstall` 确认；自动化可以显式传入 `--yes`。移除程序和服务入口，保留 `/etc/v2box` 配置、证书、部署恢复状态及 `/etc/node-network` 配置，不调用 Cloudflare 删除解析，也不自动撤销面板凭据。`--stop-network` 会停用共享的独立上报服务，其他程序仍依赖该服务时不要添加此选项。卸载后在面板撤销凭据、解除不再使用的域名绑定；重新安装可复用保留的配置。
+
+生命周期测试复用实际安装器与命令包装脚本，在临时目录内模拟 Release 下载及服务管理：`python3 -m unittest discover -s script -p '*_test.py'`。需要 Linux、bash、jq、unzip、flock 和 sha256sum；测试不会运行真实系统服务或调用证书服务。
 
 旧 `v2node` 服务独立保留。迁移同一端口时先停止旧节点服务，再启动 v2box；回退时停止 v2box，启动旧服务。不要同时监听同一端口。
 
@@ -303,3 +322,12 @@ v1.0.5 reads the panel-issued SHA-256 from `meta.configurationHash` and accepts 
 The `certificate-transition-v1` capability accepts a candidate domain from the panel without changing published subscriptions first. V2Box waits up to two minutes for both public DNS address families to match, verifies the certificate identity, lifetime, server usage and key pair (including public trust for HTTP/DNS/file modes), and prepares replacement users before closing existing listeners. Domain-specific ACME/self-signed files preserve the old certificate; remote certificates remain in memory. Failed listener startup restores the previous controllers, authentication snapshot and traffic budget. Successful startup reports the candidate ID, configuration hash and leaf SHA-256 fingerprint; the panel explicitly acknowledges publication, with bounded retries for lost acknowledgements. A rejected or unconfirmed publication restores the previous listener. Subsequent configuration polling reconciles an ambiguous acknowledgement loss with the panel's committed state.
 
 Reality identities are not changed. Manual files must cover the new hostname with a trusted chain. Reloads can interrupt existing sessions; clients must refresh subscriptions when domain/SNI/pins change. Old certificate files are retained, and managed DNS removal remains panel-owned. This capability is included in v1.0.4; upgrade nodes running v1.0.3 or older before enabling TLS domain transitions.
+
+
+### 四层中转与服务器上报
+
+面板的服务器记录代表实际机器。入口机仅执行服务器 IP 上报命令，V2Box 安装在回源节点。共享入口由面板引用管理，入口域名指向入口 IP、回源域名指向节点 IP；上报凭据不会在每次新增同机节点时自动轮换。
+
+TLS 在节点终止时，证书及普通 TLS SNI 覆盖连接入口域名。自动签发使用单独配置的 DNS 验证凭据，不依赖入口将 HTTP 80 端口转发到节点。域名候选验证的预期 IP 是入口 IP，不能替换为本机回源 IP。DNS 校验只访问固定解析器并拒绝 HTTP 重定向。失败保留原配置，成功验证及面板确认后完成切换；Reality 身份不随入口域名改变。
+
+面板可生成 Nginx 1.27.3+ stream 转发片段，采用动态 DNS 回源。管理员需在入口应用并测试该片段；V2Box 本机监听就绪不能证明入口转发或防火墙已经正确。更换回源域名时，确认入口更新后才允许面板延迟清理旧解析。停止共享服务器的上报服务会影响该服务器的全部关联域名。

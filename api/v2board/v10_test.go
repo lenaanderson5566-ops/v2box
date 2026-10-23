@@ -155,6 +155,9 @@ func TestV10Contract(t *testing.T) {
 	if n.Common.ServerPort != 443 || n.Common.TlsSettings.ServerName != "example.org" || len(n.Common.Routes) != 1 || len(n.Common.SingBox) == 0 {
 		t.Fatal("configuration mapping")
 	}
+	if n.Common.CertInfo.Email != "fastdog.ltd@gmail.com" {
+		t.Fatal("certificate contact must be independent of the original panel mailbox")
+	}
 	u, err := c.GetUserList(ctx)
 	if err != nil || len(u) != 1 || u[0].SpeedLimit != 10 {
 		t.Fatalf("users: %v %v", u, err)
