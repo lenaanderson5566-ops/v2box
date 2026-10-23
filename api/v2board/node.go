@@ -160,6 +160,13 @@ func (c *Client) GetNodeInfo(ctx context.Context) (node *NodeInfo, err error) {
 	if r.StatusCode() < 200 || r.StatusCode() >= 300 {
 		return nil, fmt.Errorf("node API returned HTTP %d", r.StatusCode())
 	}
+	configurationHash := strings.Trim(r.Header().Get("ETag"), "\"")
+	if c.v10 {
+		configurationHash, err = configurationReceiptHash(r.Body(), r.Header().Get("ETag"))
+		if err != nil {
+			return nil, err
+		}
+	}
 	hash := sha256.Sum256(r.Body())
 	newBodyHash := hex.EncodeToString(hash[:])
 	if c.responseBodyHash == newBodyHash {
@@ -175,7 +182,6 @@ func (c *Client) GetNodeInfo(ctx context.Context) (node *NodeInfo, err error) {
 	} else {
 		return nil, fmt.Errorf("received nil response")
 	}
-	configurationHash := strings.Trim(r.Header().Get("ETag"), "\"")
 	if c.v10 {
 		defer func() {
 			if err != nil {

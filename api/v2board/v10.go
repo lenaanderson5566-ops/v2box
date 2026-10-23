@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"runtime/debug"
+	"strings"
 	"time"
 )
 
@@ -150,6 +151,36 @@ func (c *Client) announceCapabilities(ctx context.Context) error {
 		c.configurationReport.CompareAndSwap(report, &confirmed)
 	}
 	return nil
+}
+
+// The application version belongs to the response body. Transport ETags may be
+// weakened or removed by compression proxies; retain them only for HTTP caching.
+// Older panels supply the same SHA-256 in a strong or weak ETag.
+func configurationReceiptHash(body []byte, etag string) (string, error) {
+	var envelope struct {
+		Meta struct {
+			ConfigurationHash json.RawMessage `json:"configurationHash"`
+		} `json:"meta"`
+	}
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		return "", fmt.Errorf("invalid configuration response")
+	}
+	var hash string
+	if len(envelope.Meta.ConfigurationHash) > 0 {
+		if err := json.Unmarshal(envelope.Meta.ConfigurationHash, &hash); err != nil {
+			return "", fmt.Errorf("invalid configuration hash metadata")
+		}
+	} else {
+		tag := strings.TrimSpace(etag)
+		tag = strings.TrimPrefix(tag, "W/")
+		if len(tag) >= 2 && tag[0] == '"' && tag[len(tag)-1] == '"' {
+			hash = tag[1 : len(tag)-1]
+		}
+	}
+	if len(hash) != 64 || strings.Trim(hash, "0123456789abcdef") != "" {
+		return "", fmt.Errorf("missing or invalid configuration hash; update panel and check proxy response handling")
+	}
+	return hash, nil
 }
 
 // ConfigurationReport contains only a panel-issued version and a bounded error code.

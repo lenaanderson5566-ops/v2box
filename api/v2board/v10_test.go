@@ -63,6 +63,14 @@ func TestV10PanelFixture(t *testing.T) {
 	if n.Type != "vless" || n.Common.ServerPort != 443 || len(n.Common.Routes) != 0 || len(n.Common.SingBox) == 0 {
 		t.Fatal("PHP/Go configuration mismatch")
 	}
+	var envelope struct {
+		Meta struct {
+			Hash string `json:"configurationHash"`
+		} `json:"meta"`
+	}
+	if err := json.Unmarshal(data, &envelope); err != nil || len(envelope.Meta.Hash) != 64 || n.ConfigurationHash != envelope.Meta.Hash {
+		t.Fatal("PHP/Go configuration receipt version mismatch without ETag")
+	}
 }
 
 func TestV10Contract(t *testing.T) {
@@ -92,6 +100,7 @@ func TestV10Contract(t *testing.T) {
 			}
 			w.Write([]byte(`{"data":{"accepted":true}}`))
 		case "configuration":
+			w.Header().Set("ETag", `"`+strings.Repeat("a", 64)+`"`)
 			w.Write([]byte(`{"data":{"protocol":"vless","listenAddress":"127.0.0.1","listenPort":443,"network":"tcp","tls":0,"tlsSettings":{"serverName":"example.org"},"intervals":{"pushInterval":60,"pullInterval":60},"routes":[{"id":1,"match":["domain:example.org"],"action":"block","actionValue":null}],"singBox":{"route":{"final":"direct"}}}}`))
 		case "users":
 			w.Header().Set("ETag", "users-v1")
@@ -425,6 +434,85 @@ func TestConfigurationDecodeFailureReceipt(t *testing.T) {
 		}
 	default:
 		t.Fatal("decode failure missing receipt")
+	}
+}
+
+func TestConfigurationHashAcrossProxyResponses(t *testing.T) {
+	hash := strings.Repeat("a", 64)
+	id := strings.Repeat("c", 32)
+	for _, tc := range []struct {
+		name, etag, meta string
+		fail             bool
+	}{
+		{"strong", `"` + hash + `"`, "", false},
+		{"weak", `W/"` + hash + `"`, "", false},
+		{"missing-header", "", `,"meta":{"configurationHash":"` + hash + `"}`, false},
+		{"rewritten-header", `W/"proxy-cache-key"`, `,"meta":{"configurationHash":"` + hash + `"}`, false},
+		{"missing-version", "", "", true},
+		{"invalid-weak", `W/"short"`, "", true},
+		{"unquoted", hash, "", true},
+		{"multiple", `"` + hash + `", "` + hash + `"`, "", true},
+		{"nonhex", `"` + strings.Repeat("z", 64) + `"`, "", true},
+		{"invalid-meta", `"` + hash + `"`, `,"meta":{"configurationHash":"bad"}`, true},
+		{"null-meta-hash", `"` + hash + `"`, `,"meta":{"configurationHash":null}`, true},
+		{"numeric-meta-hash", `"` + hash + `"`, `,"meta":{"configurationHash":123}`, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var repaired atomic.Bool
+			var receipts atomic.Int32
+			s := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				if strings.HasSuffix(r.URL.Path, "/capabilities") {
+					var body struct {
+						Configuration *ConfigurationReport `json:"configuration"`
+					}
+					if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+						t.Error(err)
+					}
+					if body.Configuration != nil {
+						if body.Configuration.Hash != hash || body.Configuration.TransitionID != id || body.Configuration.State != "applied" {
+							t.Error("incorrect application receipt", body.Configuration)
+						}
+						receipts.Add(1)
+					}
+					w.Write([]byte(`{"data":{"accepted":true,"domainTransitionAccepted":true}}`))
+					return
+				}
+				etag, meta := tc.etag, tc.meta
+				if repaired.Load() {
+					etag, meta = `W/"`+hash+`"`, ""
+				}
+				if etag != "" {
+					w.Header().Set("ETag", etag)
+				}
+				fmt.Fprintf(w, `{"data":{"protocol":"anytls","listenPort":9443,"tls":1,"tlsSettings":{"serverName":"new.example.test","certMode":"http"},"intervals":{"pushInterval":60,"pullInterval":60},"domainTransition":{"id":"%s","domain":"new.example.test","addresses":{"ipv4":"8.8.8.8"}}}%s}`, id, meta)
+			}))
+			defer s.Close()
+			c, err := newTestPanel(t, s, &conf.NodeConfig{APIHost: s.URL, NodeType: "v2box", NodeID: 3, Key: "fixture"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			n, err := c.GetNodeInfo(context.Background())
+			if tc.fail {
+				if err == nil || n != nil || c.nodeEtag != "" || c.responseBodyHash != "" || receipts.Load() != 0 {
+					t.Fatalf("invalid version reached node preparation or poisoned cache: %v", err)
+				}
+				repaired.Store(true)
+				n, err = c.GetNodeInfo(context.Background())
+			}
+			if err != nil || n == nil || n.ConfigurationHash != hash || n.Common.DomainTransition.ID != id {
+				t.Fatalf("candidate version lost: %v", err)
+			}
+			if !tc.fail && c.nodeEtag != tc.etag {
+				t.Fatal("transport cache validator rewritten")
+			}
+			if err := c.ReportConfiguration(context.Background(), n.ConfigurationHash, "", strings.Repeat("b", 64), id); err != nil {
+				t.Fatal(err)
+			}
+			if receipts.Load() != 1 {
+				t.Fatal("publication receipt not confirmed exactly once")
+			}
+		})
 	}
 }
 

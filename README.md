@@ -294,6 +294,10 @@ V10 能力增加 `configuration-receipt-v1`。节点记录面板配置 ETag；�
 此功能需同时更新面板并发布/安装新版 V2Box。旧节点没有回执时面板显示未确认，不把配置拉取或 304 当作应用成功。维护模式由面板管理，订阅隐藏不停止节点进程或中断已有连接。
 
 
+### Configuration hashes through proxies
+
+v1.0.5 reads the panel-issued SHA-256 from `meta.configurationHash` and accepts strong or weak HTTP ETags from older panels. The original ETag is retained only for conditional HTTP requests. Missing, malformed or non-hex versions are rejected before certificate preparation or listener replacement, without caching the rejected response. Upgrade the panel first so proxies that remove ETag entirely cannot prevent configuration receipts. This fixes `invalid configuration hash` rollback after a prepared domain transition; it does not bypass certificate checks or publication acknowledgement.
+
 ### Verified managed TLS domain transitions
 
 The `certificate-transition-v1` capability accepts a candidate domain from the panel without changing published subscriptions first. V2Box waits up to two minutes for both public DNS address families to match, verifies the certificate identity, lifetime, server usage and key pair (including public trust for HTTP/DNS/file modes), and prepares replacement users before closing existing listeners. Domain-specific ACME/self-signed files preserve the old certificate; remote certificates remain in memory. Failed listener startup restores the previous controllers, authentication snapshot and traffic budget. Successful startup reports the candidate ID, configuration hash and leaf SHA-256 fingerprint; the panel explicitly acknowledges publication, with bounded retries for lost acknowledgements. A rejected or unconfirmed publication restores the previous listener. Subsequent configuration polling reconciles an ambiguous acknowledgement loss with the panel's committed state.

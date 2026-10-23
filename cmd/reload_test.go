@@ -14,6 +14,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -21,6 +22,67 @@ import (
 )
 
 var reloadTestRoots sync.Once
+
+func TestReloadInvalidConfigurationHashPreservesLiveListener(t *testing.T) {
+	socket, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := socket.Addr().(*net.TCPAddr).Port
+	socket.Close()
+	var invalid atomic.Bool
+	s := reloadTestPanel(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/v10/server/configuration":
+			if !invalid.Load() {
+				w.Header().Set("ETag", `W/"`+strings.Repeat("a", 64)+`"`)
+			}
+			fmt.Fprintf(w, `{"data":{"protocol":"vless","tls":0,"listenAddress":"127.0.0.1","listenPort":%d,"intervals":{"pushInterval":3600,"pullInterval":3600}}}`, port)
+		case "/api/v10/server/capabilities":
+			w.Write([]byte(`{"data":{"accepted":true}}`))
+		case "/api/v10/server/users":
+			w.Write([]byte(`{"data":[{"id":1,"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","speedLimit":0,"deviceLimit":0}]}`))
+		default:
+			w.Write([]byte(`{"data":[]}`))
+		}
+	}))
+	defer s.Close()
+	configPath := filepath.Join(t.TempDir(), "config.json")
+	body, _ := json.Marshal(map[string]any{"Nodes": []any{map[string]any{"ApiHost": s.URL, "NodeID": 1, "NodeType": "v2box", "ApiKey": "fixture", "RetryCount": 0}}})
+	if err := os.WriteFile(configPath, body, 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := conf.New()
+	if err := cfg.LoadFromPath(configPath); err != nil {
+		t.Fatal(err)
+	}
+	n, err := node.New(cfg.NodeConfigs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v := core.New(cfg)
+	v.ReloadCh = make(chan struct{}, 1)
+	if err := v.Start(n.NodeInfos); err != nil {
+		t.Fatal(err)
+	}
+	if err := n.Start(cfg.NodeConfigs, v); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = n.Close(); _ = v.Close() }()
+	oldCore, oldNodes := v, n
+	invalid.Store(true)
+	err = reload(configPath, &n, &v)
+	var rejected *reloadRejected
+	if !errors.As(err, &rejected) || !strings.Contains(err.Error(), "configuration hash") || v != oldCore || n != oldNodes {
+		t.Fatalf("bad version should be rejected without replacing live runtime: %v", err)
+	}
+	conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), time.Second)
+	if err != nil {
+		t.Fatalf("listener closed on invalid version: %v", err)
+	}
+	conn.Close()
+}
 
 func reloadTestPanel(t *testing.T, handler http.Handler) *httptest.Server {
 	t.Helper()

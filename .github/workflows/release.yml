@@ -93,9 +93,12 @@ jobs:
           generate_release_notes: true
           make_latest: true
           body: |
-            V2Box v1.0.4。面板请先更新至支持托管 TLS 域名切换的版本。
+            V2Box v1.0.5。请先更新面板，再升级节点。
 
-            - 新增 certificate-transition-v1：验证公网 DNS、新证书及监听启动成功后，再由面板发布新域名。
+            - 修复代理将 ETag 改为弱标签或移除后，域名切换出现 invalid configuration hash 并回退的问题。
+            - 优先使用面板响应正文中的配置哈希，同时兼容旧面板的强、弱 ETag；不自行猜测或重算配置版本。
+            - 缺失或无效的配置哈希在准备证书、停止旧监听之前拒绝，保留正在运行的节点。
+            - 保留 certificate-transition-v1：验证公网 DNS、新证书及监听启动成功后，再由面板发布新域名。
             - 普通 TLS 同步连接域名、SNI 与证书域名；Reality 身份保持独立。
             - 验证失败保留旧配置，监听切换失败恢复原监听、用户与流量预算；旧证书文件保留。
             - 增加操作 ID、证书指纹和面板确认，重复确认有界重试，完成后避免重复重载。
