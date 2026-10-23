@@ -87,7 +87,7 @@ func TestV10Contract(t *testing.T) {
 			}
 			var body map[string]any
 			json.NewDecoder(r.Body).Decode(&body)
-			if len(body["features"].([]any)) != 8 {
+			if len(body["features"].([]any)) != 9 {
 				t.Error("capabilities missing")
 			}
 			w.Write([]byte(`{"data":{"accepted":true}}`))
@@ -386,8 +386,8 @@ func TestConfigurationReceiptRetryAndValidation(t *testing.T) {
 	if report = <-reports; report.Hash != hash || report.State != "failed" {
 		t.Fatal("latest receipt not retried", report)
 	}
-	c.ReportConfiguration(context.Background(), hash, "")
-	if report = <-reports; report.State != "applied" || report.ErrorCode != "" {
+	c.ReportConfiguration(context.Background(), hash, "", strings.Repeat("f", 64))
+	if report = <-reports; report.State != "applied" || report.ErrorCode != "" || report.CertificateFingerprint != strings.Repeat("f", 64) {
 		t.Fatal("success retains error", report)
 	}
 }
@@ -425,5 +425,40 @@ func TestConfigurationDecodeFailureReceipt(t *testing.T) {
 		}
 	default:
 		t.Fatal("decode failure missing receipt")
+	}
+}
+
+func TestDecodeCertificateTransition(t *testing.T) {
+	var n CommonNode
+	err := decodeV10Config([]byte(`{"data":{"protocol":"vless","listenPort":443,"tls":1,"tlsSettings":{"serverName":"new.example.test","certMode":"http"},"domainTransition":{"id":"0123456789abcdef0123456789abcdef","domain":"new.example.test","addresses":{"ipv4":"8.8.8.8"}}}}`), &n)
+	if err != nil || n.DomainTransition == nil || n.DomainTransition.Domain != n.TlsSettings.ServerName || n.DomainTransition.Addresses["ipv4"] != "8.8.8.8" {
+		t.Fatalf("transition metadata lost: %#v %v", n, err)
+	}
+}
+
+func TestDomainTransitionRequiresPublicationAcknowledgement(t *testing.T) {
+	var accepted atomic.Bool
+	s := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if accepted.Load() {
+			w.Write([]byte(`{"data":{"accepted":true,"domainTransitionAccepted":true}}`))
+		} else {
+			w.Write([]byte(`{"data":{"accepted":true,"domainTransitionAccepted":false}}`))
+		}
+	}))
+	defer s.Close()
+	zero := 0
+	c, err := newTestPanel(t, s, &conf.NodeConfig{APIHost: s.URL, NodeType: "v2box", NodeID: 1, Key: "test", RetryCount: &zero})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.ReportConfiguration(context.Background(), strings.Repeat("a", 64), "", strings.Repeat("b", 64), strings.Repeat("c", 32)); err == nil {
+		t.Fatal("rejected publication was treated as success")
+	}
+	accepted.Store(true)
+	if err := c.announceCapabilities(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if c.configurationReport.Load().TransitionID != "" {
+		t.Fatal("acknowledged transition continued to block future configuration fetches")
 	}
 }

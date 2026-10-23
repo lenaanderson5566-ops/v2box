@@ -174,6 +174,11 @@ func stageCertFile(name string, data []byte, mode os.FileMode) (string, error) {
 }
 
 func (l *Lego) writeCert(certificates *certificate.Resource) error {
+	if l.config.CertMode == "http" || l.config.CertMode == "dns" {
+		if _, err := validateCertificate(certificates.Certificate, certificates.PrivateKey, l.config.CertDomain, true, false); err != nil {
+			return err
+		}
+	}
 	if _, err := tls.X509KeyPair(certificates.Certificate, certificates.PrivateKey); err != nil {
 		return err
 	}

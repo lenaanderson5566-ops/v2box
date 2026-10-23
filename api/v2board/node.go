@@ -23,24 +23,32 @@ const (
 )
 
 type NodeInfo struct {
-	ConfigurationHash string
-	Id                int
-	Type              string
-	Security          int
-	PushInterval      time.Duration
-	PullInterval      time.Duration
-	Tag               string
-	Common            *CommonNode
+	CertificateFingerprint string
+	ConfigurationHash      string
+	Id                     int
+	Type                   string
+	Security               int
+	PushInterval           time.Duration
+	PullInterval           time.Duration
+	Tag                    string
+	Common                 *CommonNode
+}
+
+type DomainTransition struct {
+	ID        string            `json:"id"`
+	Domain    string            `json:"domain"`
+	Addresses map[string]string `json:"addresses"`
 }
 
 type CommonNode struct {
-	SingBox     json.RawMessage  `json:"sing_box"`
-	LandingPage conf.LandingPage `json:"-"`
-	Protocol    string           `json:"protocol"`
-	ListenIP    string           `json:"listen_ip"`
-	ServerPort  int              `json:"server_port"`
-	Routes      []Route          `json:"routes"`
-	BaseConfig  *BaseConfig      `json:"base_config"`
+	DomainTransition *DomainTransition `json:"domain_transition"`
+	SingBox          json.RawMessage   `json:"sing_box"`
+	LandingPage      conf.LandingPage  `json:"-"`
+	Protocol         string            `json:"protocol"`
+	ListenIP         string            `json:"listen_ip"`
+	ServerPort       int               `json:"server_port"`
+	Routes           []Route           `json:"routes"`
+	BaseConfig       *BaseConfig       `json:"base_config"`
 	//vless vmess trojan
 	Tls                  int         `json:"tls"`
 	TlsSettings          TlsSettings `json:"tls_settings"`

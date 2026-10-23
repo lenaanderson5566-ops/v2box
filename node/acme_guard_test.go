@@ -1,6 +1,9 @@
 package node
 
 import (
+	"crypto/rand"
+	"crypto/x509"
+	"encoding/pem"
 	"errors"
 	"net"
 	"os"
@@ -156,5 +159,87 @@ func TestACMEProviderEnvironmentScope(t *testing.T) {
 	})
 	if err == nil || os.Getenv("V2BOX_TEST_DNS_TOKEN") != "before" {
 		t.Fatal("provider environment was not restored")
+	}
+}
+
+func TestCertificateIdentityAndTrustBeforeSwitch(t *testing.T) {
+	dir := t.TempDir()
+	oldCert, oldKey := filepath.Join(dir, "old.pem"), filepath.Join(dir, "old.key")
+	if err := generateSelfSslCertificate("old.example.test", oldCert, oldKey); err != nil {
+		t.Fatal(err)
+	}
+	before, _ := os.ReadFile(oldCert)
+	key, _ := os.ReadFile(oldKey)
+	if _, err := validateCertificate(before, key, "new.example.test", false, false); err == nil {
+		t.Fatal("wrong certificate identity accepted")
+	}
+	if _, err := validateCertificate(before, key, "old.example.test", true, false); err == nil {
+		t.Fatal("untrusted public certificate accepted")
+	}
+	fp, err := validateCertificate(before, key, "old.example.test", false, false)
+	if err != nil || len(fp) != 64 {
+		t.Fatalf("valid pinned certificate: %v", err)
+	}
+	candidate := &panel.CertInfo{CertMode: "self", CertDomain: "new.example.test", CertFile: filepath.Join(dir, "new", "cert.pem"), KeyFile: filepath.Join(dir, "new", "key.pem")}
+	c := &Controller{info: &panel.NodeInfo{Common: &panel.CommonNode{CertInfo: candidate}}}
+	if err := c.requestCert(); err != nil {
+		t.Fatal(err)
+	}
+	if c.info.CertificateFingerprint == fp || len(c.info.CertificateFingerprint) != 64 {
+		t.Fatal("new certificate fingerprint missing")
+	}
+	after, _ := os.ReadFile(oldCert)
+	afterKey, _ := os.ReadFile(oldKey)
+	if string(before) != string(after) || string(key) != string(afterKey) {
+		t.Fatal("previous certificate overwritten")
+	}
+	certBlock, _ := pem.Decode(before)
+	keyBlock, _ := pem.Decode(key)
+	expired, _ := x509.ParseCertificate(certBlock.Bytes)
+	private, _ := x509.ParsePKCS1PrivateKey(keyBlock.Bytes)
+	expired.NotBefore = time.Now().Add(-2 * time.Hour)
+	expired.NotAfter = time.Now().Add(-time.Hour)
+	der, err := x509.CreateCertificate(rand.Reader, expired, expired, &private.PublicKey, private)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := validateCertificate(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), key, "old.example.test", false, false); err == nil {
+		t.Fatal("expired certificate accepted")
+	}
+	writer := &Lego{config: &panel.CertInfo{CertMode: "http", CertDomain: "new.example.test", CertFile: oldCert, KeyFile: oldKey}}
+	if writer.writeCert(&certificate.Resource{Certificate: before, PrivateKey: key}) == nil {
+		t.Fatal("ACME writer accepted a mismatched certificate")
+	}
+	unchanged, _ := os.ReadFile(oldCert)
+	if string(unchanged) != string(before) {
+		t.Fatal("rejected renewal changed old certificate")
+	}
+	// An existing but incorrect file must not count as successful preparation.
+	bad := *candidate
+	bad.CertDomain = "other.example.test"
+	failed := &Controller{info: &panel.NodeInfo{Common: &panel.CommonNode{CertInfo: &bad}}}
+	if failed.requestCert() == nil || failed.certPrepared {
+		t.Fatal("existing wrong-domain certificate accepted")
+	}
+	if _, err := validateCertificate(before, []byte("invalid"), "old.example.test", false, false); err == nil {
+		t.Fatal("invalid private key accepted")
+	}
+}
+func TestTransitionDNSAddresses(t *testing.T) {
+	for _, tc := range []struct {
+		got      []string
+		expected string
+		ok       bool
+	}{
+		{[]string{"8.8.8.8"}, "8.8.8.8", true}, {nil, "", true}, {nil, "8.8.8.8", false},
+		{[]string{"1.1.1.1"}, "8.8.8.8", false}, {[]string{"8.8.8.8", "1.1.1.1"}, "8.8.8.8", false},
+		{[]string{"2001:4860:4860::8888"}, "", false},
+	} {
+		if (checkDNSAddresses(tc.got, tc.expected) == nil) != tc.ok {
+			t.Fatalf("unexpected DNS validation for %#v", tc)
+		}
+	}
+	if verifyTransitionDNS(&panel.DomainTransition{Domain: "example.test"}) == nil {
+		t.Fatal("empty addresses accepted")
 	}
 }

@@ -4,10 +4,15 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/sha256"
+	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/hex"
 	"encoding/pem"
 	"fmt"
+	"github.com/go-acme/lego/v4/certificate"
+	panel "github.com/lenaanderson5566-ops/v2box/api/v2board"
 	"math/big"
 	"os"
 	"time"
@@ -43,50 +48,118 @@ func (c *Controller) renewCertTask(_ context.Context) error {
 	return nil
 }
 
-func (c *Controller) requestCert() error {
-	cert := c.info.Common.CertInfo
-	switch cert.CertMode {
-	case "none", "":
-	case "file":
-		if cert.CertFile == "" || cert.KeyFile == "" {
-			return fmt.Errorf("cert file path or key file path not exist")
-		}
-	case "dns", "http":
-		if cert.CertFile == "" || cert.KeyFile == "" {
-			return fmt.Errorf("cert file path or key file path not exist")
-		}
-		if file.IsExist(cert.CertFile) && file.IsExist(cert.KeyFile) {
-			return nil
-		}
-		if err := guardedACME(cert, func() error {
-			l, err := NewLego(cert)
-			if err != nil {
-				return err
+// validateCertificate always verifies the key pair, identity and validity. Public
+// certificate modes additionally verify the full chain against system roots.
+func validateCertificate(certPEM, keyPEM []byte, domain string, public, legacyCN bool) (string, error) {
+	pair, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		return "", fmt.Errorf("invalid certificate/key pair: %w", err)
+	}
+	leaf, err := x509.ParseCertificate(pair.Certificate[0])
+	if err != nil {
+		return "", err
+	}
+	if err = leaf.VerifyHostname(domain); err != nil && !(legacyCN && len(leaf.DNSNames) == 0 && leaf.Subject.CommonName == domain) {
+		return "", err
+	}
+	if len(leaf.ExtKeyUsage) > 0 {
+		serverAuth := false
+		for _, usage := range leaf.ExtKeyUsage {
+			if usage == x509.ExtKeyUsageAny || usage == x509.ExtKeyUsageServerAuth {
+				serverAuth = true
 			}
-			return l.CreateCert()
-		}); err != nil {
+		}
+		if !serverAuth {
+			return "", fmt.Errorf("certificate does not permit server authentication")
+		}
+	}
+	now := time.Now()
+	if now.Before(leaf.NotBefore) || !now.Add(time.Minute).Before(leaf.NotAfter) {
+		return "", fmt.Errorf("certificate is not currently valid")
+	}
+	if public {
+		intermediates := x509.NewCertPool()
+		for _, der := range pair.Certificate[1:] {
+			cert, e := x509.ParseCertificate(der)
+			if e != nil {
+				return "", e
+			}
+			intermediates.AddCert(cert)
+		}
+		if _, err = leaf.Verify(x509.VerifyOptions{DNSName: domain, Intermediates: intermediates}); err != nil {
+			return "", fmt.Errorf("certificate trust verification: %w", err)
+		}
+	}
+	fingerprint := sha256.Sum256(leaf.Raw)
+	return hex.EncodeToString(fingerprint[:]), nil
+}
+
+func (c *Controller) requestCert() error {
+	if c.certPrepared {
+		return nil
+	}
+	cert := c.info.Common.CertInfo
+	transition := c.info.Common.DomainTransition
+	if transition != nil {
+		if transition.Domain != cert.CertDomain {
+			return fmt.Errorf("certificate transition identity mismatch")
+		}
+		if err := verifyTransitionDNS(transition); err != nil {
 			return err
 		}
-
-	case "self":
+	}
+	switch cert.CertMode {
+	case "none", "":
+		return fmt.Errorf("TLS requires a certificate mode")
+	case "file", "dns", "http", "self":
 		if cert.CertFile == "" || cert.KeyFile == "" {
-			return fmt.Errorf("cert file path or key file path not exist")
+			return fmt.Errorf("certificate and key paths are required")
 		}
-		if file.IsExist(cert.CertFile) && file.IsExist(cert.KeyFile) {
-			return nil
-		}
-		err := generateSelfSslCertificate(
-			cert.CertDomain,
-			cert.CertFile,
-			cert.KeyFile)
-		if err != nil {
-			return fmt.Errorf("generate self cert error: %s", err)
+		exists := file.IsExist(cert.CertFile) && file.IsExist(cert.KeyFile)
+		if !exists {
+			// A partial pair must never be overwritten silently.
+			if file.IsExist(cert.CertFile) || file.IsExist(cert.KeyFile) {
+				return fmt.Errorf("incomplete certificate/key pair")
+			}
+			switch cert.CertMode {
+			case "dns", "http":
+				if err := guardedACME(cert, func() error {
+					l, e := NewLego(cert)
+					if e != nil {
+						return e
+					}
+					return l.CreateCert()
+				}); err != nil {
+					return err
+				}
+			case "self":
+				if err := generateSelfSslCertificate(cert.CertDomain, cert.CertFile, cert.KeyFile); err != nil {
+					return err
+				}
+			}
 		}
 	case "remote":
-		return nil // sing-box reads the certificate from memory
 	default:
 		return fmt.Errorf("unsupported certmode: %s", cert.CertMode)
 	}
+	certPEM, keyPEM := []byte(cert.TlsCert), []byte(cert.TlsKey)
+	if cert.CertMode != "remote" {
+		var err error
+		certPEM, err = os.ReadFile(cert.CertFile)
+		if err != nil {
+			return err
+		}
+		keyPEM, err = os.ReadFile(cert.KeyFile)
+		if err != nil {
+			return err
+		}
+	}
+	fingerprint, err := validateCertificate(certPEM, keyPEM, cert.CertDomain, cert.CertMode != "self" && cert.CertMode != "remote", transition == nil && cert.CertMode == "remote")
+	if err != nil {
+		return fmt.Errorf("certificate verification failed: %w", err)
+	}
+	c.info.CertificateFingerprint = fingerprint
+	c.certPrepared = true
 	return nil
 }
 
@@ -118,8 +191,8 @@ func generateSelfSslCertificate(domain, certPath, keyPath string) error {
 	if err := checkPath(keyPath); err != nil {
 		return err
 	}
-	if err := os.WriteFile(certPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert}), 0644); err != nil {
-		return err
-	}
-	return os.WriteFile(keyPath, pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)}), 0600)
+	return (&Lego{config: &panel.CertInfo{CertFile: certPath, KeyFile: keyPath, CertDomain: domain}}).writeCert(&certificate.Resource{
+		Certificate: pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert}),
+		PrivateKey:  pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)}),
+	})
 }

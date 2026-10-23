@@ -292,3 +292,10 @@ Linux amd64 与 arm64 均以 `CGO_ENABLED=0 GOEXPERIMENT=jsonv2 go build -tags w
 V10 能力增加 `configuration-receipt-v1`。节点记录面板配置 ETag；所有控制器启动成功后报告 applied，配置解析、内核校验、用户准备、证书准备或启动失败时报告对应固定错误码。回执只包含哈希和状态，不包含配置或原始异常。失败的监控请求不阻止代理转发；即时上报共用最多 3 秒截止时间，后续既有能力上报携带最新状态重试，无新增后台任务或无界缓冲。面板会忽略不同配置哈希的迟到回执；仍需查看节点日志定位详细原因。
 
 此功能需同时更新面板并发布/安装新版 V2Box。旧节点没有回执时面板显示未确认，不把配置拉取或 304 当作应用成功。维护模式由面板管理，订阅隐藏不停止节点进程或中断已有连接。
+
+
+### Verified managed TLS domain transitions
+
+The `certificate-transition-v1` capability accepts a candidate domain from the panel without changing published subscriptions first. V2Box waits up to two minutes for both public DNS address families to match, verifies the certificate identity, lifetime, server usage and key pair (including public trust for HTTP/DNS/file modes), and prepares replacement users before closing existing listeners. Domain-specific ACME/self-signed files preserve the old certificate; remote certificates remain in memory. Failed listener startup restores the previous controllers, authentication snapshot and traffic budget. Successful startup reports the candidate ID, configuration hash and leaf SHA-256 fingerprint; the panel explicitly acknowledges publication, with bounded retries for lost acknowledgements. A rejected or unconfirmed publication restores the previous listener. Subsequent configuration polling reconciles an ambiguous acknowledgement loss with the panel's committed state.
+
+Reality identities are not changed. Manual files must cover the new hostname with a trusted chain. Reloads can interrupt existing sessions; clients must refresh subscriptions when domain/SNI/pins change. Old certificate files are retained, and managed DNS removal remains panel-owned. Existing v1.0.3 binaries do not implement this capability; these source changes require a new binary release before enabling TLS domain transitions.

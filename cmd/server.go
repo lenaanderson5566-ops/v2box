@@ -7,6 +7,7 @@ import (
 	_ "net/http/pprof"
 	"os"
 	"os/signal"
+	"reflect"
 	"runtime"
 	"syscall"
 
@@ -108,7 +109,9 @@ func serverHandle(_ *cobra.Command, _ []string) error {
 		log.WithField("err", err).Error("Run nodes failed")
 		return err
 	}
-	nodes.ReportConfiguration("")
+	if err := nodes.ReportConfiguration(""); err != nil {
+		return err
+	}
 	log.Info("Nodes started")
 	if watch {
 		// On file change, just signal reload; do not run reload concurrently here
@@ -171,6 +174,9 @@ func reload(config string, nodes **node.Node, v2core **core.V2Core) error {
 	if err != nil {
 		return &reloadRejected{err}
 	}
+	if reflect.DeepEqual(newConf, (*v2core).Config) && (*nodes).ConfirmPublication(newNodes) {
+		return nil
+	}
 	newCore := core.New(newConf)
 	if err := newCore.Start(newNodes.NodeInfos); err != nil {
 		newNodes.ReportConfiguration("core")
@@ -186,11 +192,33 @@ func reload(config string, nodes **node.Node, v2core **core.V2Core) error {
 	}
 	// Validate before stopping live listeners. Parsing failures and panel outages
 	// must not interrupt the currently applied configuration.
-	if err := (*nodes).Close(); err != nil {
-		return err
+	oldNodes := (*nodes).Snapshot()
+	oldCore := *v2core
+	stopErr := errors.Join((*nodes).Close(), (*v2core).Close())
+	newCore.PreserveAccountingFrom(oldCore)
+
+	rollback := func(cause error) error {
+		_ = newNodes.Close()
+		_ = newCore.Close()
+		restored := core.New(oldCore.Config)
+		restored.ReloadCh = oldReloadCh
+		restored.PreserveAccountingFrom(newCore)
+		if err := restored.Start(oldNodes.NodeInfos); err != nil {
+			return fmt.Errorf("reload failed: %v; rollback preparation: %w", cause, err)
+		}
+		if err := oldNodes.Restore(restored); err != nil {
+			_ = oldNodes.Close()
+			_ = restored.Close()
+			return fmt.Errorf("reload failed: %v; rollback start: %w", cause, err)
+		}
+		*nodes = oldNodes
+		*v2core = restored
+		return &reloadRejected{cause}
 	}
-	if err := (*v2core).Close(); err != nil {
-		return err
+
+	if stopErr != nil {
+		newNodes.ReportConfiguration("start")
+		return rollback(stopErr)
 	}
 
 	switch newConf.LogConfig.Level {
@@ -223,17 +251,17 @@ func reload(config string, nodes **node.Node, v2core **core.V2Core) error {
 	newCore.ReloadCh = oldReloadCh
 	if err := newCore.Start(newNodes.NodeInfos); err != nil {
 		newNodes.ReportConfiguration("core")
-		return err
+		return rollback(err)
 	}
 
 	if err := newNodes.Start(newConf.NodeConfigs, newCore); err != nil {
 		newNodes.ReportConfiguration("start")
-		_ = newNodes.Close()
-		_ = newCore.Close()
-		return err
+		return rollback(err)
 	}
 
-	newNodes.ReportConfiguration("")
+	if err := newNodes.ReportConfiguration(""); err != nil {
+		return rollback(err)
+	}
 	*nodes = newNodes
 	*v2core = newCore
 

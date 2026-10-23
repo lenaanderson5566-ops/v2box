@@ -3,6 +3,7 @@ package node
 import (
 	"context"
 	"errors"
+	"reflect"
 	"time"
 
 	panel "github.com/lenaanderson5566-ops/v2box/api/v2board"
@@ -79,6 +80,13 @@ func (c *Controller) nodeInfoMonitor(ctx context.Context) (err error) {
 		}).Error("Get node info failed")
 		return nil
 	}
+	if completedTransitionOnly(c.info, newN) {
+		// Publication removes candidate metadata but does not change listeners.
+		// Acknowledge the final hash without disconnecting clients a second time.
+		_ = c.apiClient.ReportConfiguration(ctx, newN.ConfigurationHash, "", c.info.CertificateFingerprint)
+		c.reloadPending = false
+		newN = nil
+	}
 	if newN != nil {
 		c.reloadPending = true
 	}
@@ -149,4 +157,16 @@ func (c *Controller) nodeInfoMonitor(ctx context.Context) (err error) {
 	c.userList = newU
 	log.WithField("tag", c.tag).Infof("%d user deleted, %d user added, %d user modified", len(deleted), len(added), len(modified))
 	return nil
+}
+
+func completedTransitionOnly(old, next *panel.NodeInfo) bool {
+	if old == nil || next == nil || old.Common == nil || next.Common == nil || old.Common.DomainTransition == nil || next.Common.DomainTransition != nil {
+		return false
+	}
+	if old.Id != next.Id || old.Tag != next.Tag || old.Type != next.Type || old.Security != next.Security || old.PushInterval != next.PushInterval || old.PullInterval != next.PullInterval {
+		return false
+	}
+	before, after := *old.Common, *next.Common
+	before.DomainTransition = nil
+	return reflect.DeepEqual(before, after)
 }

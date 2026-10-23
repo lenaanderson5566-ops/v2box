@@ -133,3 +133,32 @@ func TestTargetUploadRetryBackoffAndRecovery(t *testing.T) {
 		t.Fatal("fresh failure inherited old backoff")
 	}
 }
+
+func TestCommittedTransitionDoesNotReloadUnchangedListener(t *testing.T) {
+	old := &panel.NodeInfo{Id: 1, Type: "vless", Security: panel.Tls, Common: &panel.CommonNode{ServerPort: 443, TlsSettings: panel.TlsSettings{ServerName: "new.example.test"}, DomainTransition: &panel.DomainTransition{ID: "candidate"}}}
+	next := *old
+	common := *old.Common
+	common.DomainTransition = nil
+	next.Common = &common
+	next.ConfigurationHash = "committed-hash"
+	if !completedTransitionOnly(old, &next) {
+		t.Fatal("metadata removal would disconnect the new listener twice")
+	}
+	if !(&Node{NodeInfos: []*panel.NodeInfo{old}}).ConfirmPublication(&Node{NodeInfos: []*panel.NodeInfo{&next}}) {
+		t.Fatal("queued publication signal not absorbed")
+	}
+	common.ServerPort = 8443
+	if completedTransitionOnly(old, &next) {
+		t.Fatal("changed listener incorrectly skipped")
+	}
+	common.ServerPort = 443
+	common.TlsSettings.ServerName = "old.example.test"
+	if completedTransitionOnly(old, &next) {
+		t.Fatal("rollback identity incorrectly skipped")
+	}
+	common.TlsSettings.ServerName = "new.example.test"
+	common.DomainTransition = &panel.DomainTransition{ID: "retry"}
+	if completedTransitionOnly(old, &next) {
+		t.Fatal("new verification operation incorrectly skipped")
+	}
+}

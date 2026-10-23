@@ -20,6 +20,7 @@ type Controller struct {
 	tag                     string
 	limiter                 *limiter.Limiter
 	userList                []panel.UserInfo
+	certPrepared            bool
 	usersPrepared           bool
 	preparedBudget          *panel.TrafficBudget
 	reloadPending           bool
@@ -135,6 +136,7 @@ func (c *Controller) Close() error {
 	if c.renewCertPeriodic != nil {
 		c.renewCertPeriodic.Close()
 	}
+	c.preparedBudget = c.server.TrafficBudgetSnapshot(c.tag)
 	err := c.server.DelNode(c.tag)
 	reportCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()

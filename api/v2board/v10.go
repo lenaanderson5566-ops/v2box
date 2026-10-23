@@ -10,6 +10,7 @@ import (
 )
 
 var v10Fields = map[string]string{
+	"domainTransition":      "domain_transition",
 	"protocol":              "protocol",
 	"listenAddress":         "listen_ip",
 	"listenPort":            "server_port",
@@ -123,8 +124,9 @@ func (c *Client) announceCapabilities(ctx context.Context) error {
 			}
 		}
 	}
-	body := map[string]any{"coreVersion": version, "features": []string{"native-routing-v1", "dns-v1", "outbounds-v1", "server-traffic-budget-v1", "target-statistics-v1", "target-statistics-policy-v2", "target-statistics-interval-v1", "configuration-receipt-v1"}}
-	if report := c.configurationReport.Load(); report != nil {
+	body := map[string]any{"coreVersion": version, "features": []string{"native-routing-v1", "dns-v1", "outbounds-v1", "server-traffic-budget-v1", "target-statistics-v1", "target-statistics-policy-v2", "target-statistics-interval-v1", "configuration-receipt-v1", "certificate-transition-v1"}}
+	report := c.configurationReport.Load()
+	if report != nil {
 		body["configuration"] = report
 	}
 	r, err := c.client.R().SetContext(ctx).SetBody(body).Post(c.nodePath("capabilities"))
@@ -134,36 +136,77 @@ func (c *Client) announceCapabilities(ctx context.Context) error {
 	if r.StatusCode() != 200 {
 		return fmt.Errorf("V10 capability registration returned HTTP %d", r.StatusCode())
 	}
+	if report != nil && report.TransitionID != "" && report.State == "applied" {
+		var result struct {
+			Data struct {
+				Accepted bool `json:"domainTransitionAccepted"`
+			} `json:"data"`
+		}
+		if json.Unmarshal(r.Body(), &result) != nil || !result.Data.Accepted {
+			return fmt.Errorf("panel did not confirm domain publication")
+		}
+		confirmed := *report
+		confirmed.TransitionID = ""
+		c.configurationReport.CompareAndSwap(report, &confirmed)
+	}
 	return nil
 }
 
 // ConfigurationReport contains only a panel-issued version and a bounded error code.
 type ConfigurationReport struct {
-	Hash      string `json:"hash"`
-	State     string `json:"state"`
-	ErrorCode string `json:"errorCode,omitempty"`
+	TransitionID           string `json:"transitionId,omitempty"`
+	CertificateFingerprint string `json:"certificateFingerprint,omitempty"`
+	Hash                   string `json:"hash"`
+	State                  string `json:"state"`
+	ErrorCode              string `json:"errorCode,omitempty"`
 }
 
-// ReportConfiguration is best-effort; monitoring failures never stop forwarding.
-// The next ordinary capability announcement retries the latest receipt.
-func (c *Client) ReportConfiguration(ctx context.Context, hash, code string) {
-	if !c.v10 || len(hash) != 64 {
-		return
+// Ordinary receipts are best-effort. Domain transitions require a publication
+// acknowledgement; bounded retries recover a lost response using the same ID.
+func (c *Client) ReportConfiguration(ctx context.Context, hash, code string, fingerprint ...string) error {
+	if !c.v10 {
+		return nil
+	}
+	if len(hash) != 64 {
+		return fmt.Errorf("invalid configuration hash")
 	}
 	if _, err := hex.DecodeString(hash); err != nil {
-		return
+		return err
 	}
 	switch code {
 	case "", "decode", "core", "users", "certificate", "start":
 	default:
-		return
+		return nil
 	}
 	state := "applied"
 	if code != "" {
 		state = "failed"
 	}
-	c.configurationReport.Store(&ConfigurationReport{Hash: hash, State: state, ErrorCode: code})
-	bounded, cancel := context.WithTimeout(ctx, 3*time.Second)
-	defer cancel()
-	_ = c.announceCapabilities(bounded)
+	report := &ConfigurationReport{Hash: hash, State: state, ErrorCode: code}
+	if code == "" && len(fingerprint) > 0 && len(fingerprint[0]) == 64 {
+		if _, err := hex.DecodeString(fingerprint[0]); err == nil {
+			report.CertificateFingerprint = fingerprint[0]
+		}
+	}
+	if len(fingerprint) > 1 {
+		report.TransitionID = fingerprint[1]
+	}
+	c.configurationReport.Store(report)
+	attempts := 1
+	if report.TransitionID != "" && report.State == "applied" {
+		if len(report.TransitionID) != 32 || report.CertificateFingerprint == "" {
+			return fmt.Errorf("incomplete transition receipt")
+		}
+		attempts = 3
+	}
+	var err error
+	for i := 0; i < attempts; i++ {
+		bounded, cancel := context.WithTimeout(ctx, 3*time.Second)
+		err = c.announceCapabilities(bounded)
+		cancel()
+		if err == nil || ctx.Err() != nil {
+			return err
+		}
+	}
+	return err
 }
