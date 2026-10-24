@@ -331,3 +331,11 @@ Reality identities are not changed. Manual files must cover the new hostname wit
 TLS 在节点终止时，证书及普通 TLS SNI 覆盖连接入口域名。自动签发使用单独配置的 DNS 验证凭据，不依赖入口将 HTTP 80 端口转发到节点。域名候选验证的预期 IP 是入口 IP，不能替换为本机回源 IP。DNS 校验只访问固定解析器并拒绝 HTTP 重定向。失败保留原配置，成功验证及面板确认后完成切换；Reality 身份不随入口域名改变。
 
 面板可生成 Nginx 1.27.3+ stream 转发片段，采用动态 DNS 回源。管理员需在入口应用并测试该片段；V2Box 本机监听就绪不能证明入口转发或防火墙已经正确。更换回源域名时，确认入口更新后才允许面板延迟清理旧解析。停止共享服务器的上报服务会影响该服务器的全部关联域名。
+
+### 配置实际应用回归
+
+`cmd/TestReloadAppliesProtocolPortDomainAndRelay` 使用本地 HTTPS 面板、真实 sing-box 监听和回显服务器，覆盖 VLESS/Trojan 协议切换、监听端口迁移、证书域名变化、直连/四层 TCP 中转往返、DNS 模式凭据轮换进入活动控制器，以及错误证书拒绝后原连接仍可传输数据。测试不只断言面板回执。
+
+测试使用自签名及本地受信证书，不会访问 Cloudflare 或公网 ACME，不代表生产 DNS 权限、证书服务可达性或外部 Nginx 配置已经验证。DNS 凭据环境作用域和签发失败保护由 `node/acme_guard_test.go` 覆盖。
+
+本轮在 Go 1.27.3 Linux 隔离容器执行 `go test -tags with_quic,with_utls ./cmd ./node ./core ./api/v2board`，四包全部通过，包括上述真实重载测试。未调用真实 Cloudflare 或公网 ACME。
