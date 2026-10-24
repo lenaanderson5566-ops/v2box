@@ -133,16 +133,50 @@ esac
             self.assertIn('old-version', (self.lib/'v2box').read_text())
             self.preserved()
 
-    def test_pending_state_and_symlinked_lock_are_rejected(self):
+    def test_pending_update_preserves_state_and_stopped_service(self):
         state = self.config/'deployment-state.json'
         state.write_text('pending')
+        self.active.unlink()
         r = self.install()
-        self.assertNotEqual(r.returncode, 0)
-        self.assertIn('Resume', r.stderr)
-        state.unlink()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('resume', r.stdout)
+        self.assertEqual(state.read_text(), 'pending')
+        self.assertFalse(self.active.exists())
+        self.assertTrue((self.lib/'manager.sh').exists())
+        r = self.run_script(self.root/'usr/local/bin/v2box', 'uninstall', '--yes')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(state.read_text(), 'pending')
+        self.preserved()
+
+    def test_resume_uses_retained_state(self):
+        (self.config/'deployment-state.json').write_text('pending')
+        (self.lib/'panel-deploy.py').write_text('import sys; from pathlib import Path; assert Path(sys.argv[1]).read_text() == "pending"')
+        r = self.run_script(self.root/'usr/local/bin/v2box', 'resume')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.preserved()
+
+    def test_repair_missing_program_preserves_pending_state_without_start(self):
+        (self.config/'deployment-state.json').write_text('pending')
+        (self.lib/'v2box').unlink()
+        self.active.unlink()
+        r = self.run_script(self.installer)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertFalse(self.active.exists())
+        self.assertEqual((self.config/'deployment-state.json').read_text(), 'pending')
+        self.preserved()
+
+    def test_active_deployment_blocks_update_and_uninstall(self):
+        import fcntl
+        with (self.config/'.deployment.lock').open('w') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            self.assertNotEqual(self.install().returncode, 0)
+            self.assertNotEqual(self.run_script(self.root/'usr/local/bin/v2box', 'uninstall', '--yes').returncode, 0)
+        self.assertTrue((self.lib/'v2box').exists())
+        self.preserved()
+
+    def test_symlinked_lock_is_rejected(self):
         (self.config/'.maintenance.lock').symlink_to(self.config/'saved.cer')
-        r = self.install()
-        self.assertNotEqual(r.returncode, 0)
+        self.assertNotEqual(self.install().returncode, 0)
         self.preserved()
 
     def test_bootstrap_delegates_its_lock_and_other_deployments_are_rejected(self):

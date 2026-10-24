@@ -95,15 +95,14 @@ jobs:
           generate_release_notes: true
           make_latest: true
           body: |
-            V2Box v1.0.6。请先更新面板，再升级节点。
+            V2Box v1.0.7：修复未完成部署时的更新与管理命令路径。
 
-            - 发布尚未包含在 v1.0.5 中的节点生命周期与证书部署修复。
-            - 增加 v2box update 与 v2box uninstall，支持 systemd 和 OpenRC；更新失败恢复旧程序，保留配置与证书。
-            - 卸载默认保留独立 IP 上报，--stop-network 可明确停用共享上报调度。
-            - 改进证书申请默认配置，验证协议、监听端口、证书及直连/中转设置重载。
-            - 中转连接地址与 TLS 身份独立管理，不要求入口域名替换落地证书。
-            - 提供 Linux/macOS/Windows 的 amd64、arm64 安装包及逐包 SHA-256 校验文件；服务管理脚本适用于 Linux。
+            - 未完成部署允许更新程序，保留配置、证书与恢复状态；更新后执行 v2box resume。
+            - 活跃部署与维护互斥，避免更新、卸载和部署同时修改程序。
+            - 核心二进制支持转交 Linux 运维命令，管理入口固定为 /usr/local/bin/v2box。
+            - 卸载保留配置、证书及部署状态，默认保留独立 IP 上报；--stop-network 可显式停用。
+            - 更新失败回滚程序，停止的服务保持停止；运行中服务更新会重启。
 
-            旧版命令脚本不支持 update 时，请下载本版本 script/install.sh，运行 bash install.sh v1.0.6 --update。
-            更新保留 /etc/v2box/config.json 和证书。升级重启可能中断已有连接。
-            面板部署 DNS 故障切换由面板 bootstrap 提供，请更新面板并重新下载脚本后恢复部署。
+            旧版不支持 update 时，下载本版本 script/install.sh 后执行 bash install.sh v1.0.7 --update。
+            完成后执行 hash -r；未完成部署执行 /usr/local/bin/v2box resume。
+            提供六个平台/架构安装包及 SHA-256；服务管理脚本适用于 Linux。

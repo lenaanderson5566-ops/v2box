@@ -53,12 +53,16 @@ if [[ "$ddns" == true ]]; then
 fi
 [[ $EUID -eq 0 ]] || { echo 'Run as root' >&2; exit 1; }
 [[ $(uname -s) == Linux ]] || { echo 'This installer requires Linux' >&2; exit 1; }
-[[ ! -L /etc/v2box && ! -L /etc/v2box/config.json && ! -L /etc/v2box/.maintenance.lock && ! -L /etc/v2box/.bootstrap.lock && ! -L /usr/local/lib/v2box ]] || { echo 'Refusing symlinked installation paths' >&2; exit 1; }
+[[ ! -L /etc/v2box/.deployment.lock && ! -L /etc/v2box && ! -L /etc/v2box/config.json && ! -L /etc/v2box/.maintenance.lock && ! -L /etc/v2box/.bootstrap.lock && ! -L /usr/local/lib/v2box ]] || { echo 'Refusing symlinked installation paths' >&2; exit 1; }
 if $update_only; then
   [[ -s /etc/v2box/config.json && -x /usr/local/lib/v2box/v2box ]] || { echo 'V2Box is not installed; use the panel deployment command.' >&2; exit 1; }
   [[ -z "$api_host$node_id$api_key" && "$ddns" == false && "$landing_page" == false ]] || { echo 'Update preserves existing settings; do not supply deployment options.' >&2; exit 1; }
 fi
-[[ ! -e /etc/v2box/deployment-state.json ]] || { echo 'Resume the pending panel deployment before updating; state and certificates preserved.' >&2; exit 1; }
+pending_deployment=false
+if [[ -e /etc/v2box/deployment-state.json ]]; then
+  pending_deployment=true
+  [[ -z "$api_host$node_id$api_key" && "$ddns" == false && "$landing_page" == false && -z "$landing_dir" && "$prompt_api_key" == false ]] || { echo 'Pending deployment: update program files without new deployment options, then resume.' >&2; exit 1; }
+fi
 install -d -m 755 /etc/v2box
 # The root-owned panel bootstrap holds its lock while invoking this installer.
 # Keep that descriptor out of child services, including older release installers.
@@ -67,6 +71,8 @@ if [[ "${V2BOX_BOOTSTRAP_LOCK_HELD:-}" != 1 ]]; then
   flock -n 9 || { echo 'Another deployment is running.' >&2; exit 1; }
 fi
 unset V2BOX_BOOTSTRAP_LOCK_HELD
+exec 7>/etc/v2box/.deployment.lock
+flock -n 7 || { echo 'Deployment is actively running. Wait for it to finish or stop its terminal command before updating.' >&2; exit 1; }
 exec 8>/etc/v2box/.maintenance.lock
 flock -n 8 || { echo 'Another maintenance operation is running.' >&2; exit 1; }
 case "$(uname -m)" in
@@ -106,7 +112,7 @@ if [[ "$init" == systemd ]]; then
   if systemctl is-active --quiet v2box; then was_running=true; fi
 elif rc-service v2box status >/dev/null 2>&1; then was_running=true; fi
 rollback=false
-program_files=(v2box v2box.previous install.sh node-credentials.py node-network.py)
+program_files=(v2box v2box.previous manager.sh install.sh node-credentials.py node-network.py)
 cleanup() {
   result=$?
   trap - EXIT
@@ -118,10 +124,10 @@ cleanup() {
         mv -f -- "/usr/local/lib/v2box/$file.restore" "/usr/local/lib/v2box/$file"
       else rm -f -- "/usr/local/lib/v2box/$file"; fi
     done
-    if [[ -f "$stage/previous/wrapper" ]]; then cp -p -- "$stage/previous/wrapper" /usr/local/bin/v2box; fi
+    if [[ -f "$stage/previous/wrapper" ]]; then cp -p -- "$stage/previous/wrapper" /usr/local/bin/v2box.restore; mv -f -- /usr/local/bin/v2box.restore /usr/local/bin/v2box; fi
     if $was_running; then
-      if [[ "$init" == systemd ]]; then systemctl restart v2box || echo 'Previous service could not restart; inspect v2box log.' >&2
-      else rc-service v2box restart 8>&- 9>&- || echo 'Previous service could not restart; inspect v2box log.' >&2; fi
+      if [[ "$init" == systemd ]]; then systemctl restart v2box 7>&- 8>&- 9>&- || echo 'Previous service could not restart; inspect v2box log.' >&2
+      else rc-service v2box restart 7>&- 8>&- 9>&- || echo 'Previous service could not restart; inspect v2box log.' >&2; fi
     fi
   fi
   rm -rf -- "$stage"
@@ -155,8 +161,12 @@ if [[ -f /usr/local/lib/v2box/v2box ]]; then
 fi
 install -m 755 "$stage/v2box" /usr/local/lib/v2box/v2box.new
 mv -f /usr/local/lib/v2box/v2box.new /usr/local/lib/v2box/v2box
-install -m 755 "$stage/v2box.sh" /usr/local/bin/v2box
-install -m 755 "$stage/install.sh" /usr/local/lib/v2box/install.sh
+install -m 755 "$stage/v2box.sh" /usr/local/lib/v2box/manager.sh.new
+mv -f -- /usr/local/lib/v2box/manager.sh.new /usr/local/lib/v2box/manager.sh
+install -m 755 "$stage/v2box.sh" /usr/local/bin/v2box.new
+mv -f -- /usr/local/bin/v2box.new /usr/local/bin/v2box
+install -m 755 "$stage/install.sh" /usr/local/lib/v2box/install.sh.new
+mv -f -- /usr/local/lib/v2box/install.sh.new /usr/local/lib/v2box/install.sh
 if [[ -f "$stage/node-credentials.py" ]]; then
   install -m 755 "$stage/node-credentials.py" /usr/local/lib/v2box/node-credentials.py
 fi
@@ -224,8 +234,8 @@ if [[ "$ddns" == true ]]; then
   python3 /usr/local/lib/v2box/node-network.py "${ddns_args[@]}"
 fi
 if jq -e '.Nodes | length > 0 and all(.[]; .ApiKey != "REPLACE_ME")' /etc/v2box/config.json >/dev/null; then
-  if ! $had_binary || $was_running; then
-    v2box restart 8>&- 9>&-
+  if $was_running || { ! $had_binary && ! $pending_deployment; }; then
+    /usr/local/bin/v2box restart 7>&- 8>&- 9>&-
     for attempt in 1 2 3; do
       sleep 2
       if [[ "$init" == systemd ]]; then systemctl is-active --quiet v2box
@@ -237,3 +247,8 @@ else
 fi
 rollback=false
 echo "Installed v2box $version. Existing v2node services are separate; avoid listening on the same port."
+
+if $pending_deployment; then
+  echo 'Program updated; pending deployment, configuration and certificates retained. Next: /usr/local/bin/v2box resume'
+fi
+echo 'Management command: /usr/local/bin/v2box. Run hash -r if your shell cached an older path.'

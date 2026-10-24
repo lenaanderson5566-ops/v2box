@@ -7,6 +7,15 @@ case "$1" in
     shift
     (($# <= 1)) || { echo 'Usage: v2box update [release-tag]' >&2; exit 1; }
     exec bash /usr/local/lib/v2box/install.sh --update "$@";;
+  resume)
+    [[ $EUID -eq 0 && $# -eq 1 ]] || { echo 'Run as root: v2box resume' >&2; exit 1; }
+    [[ -x "$binary" ]] || { echo 'V2Box is uninstalled; reinstall program files before resuming. Configuration and certificates remain.' >&2; exit 1; }
+    [[ -f /etc/v2box/deployment-state.json ]] || { echo 'No pending deployment.'; exit 0; }
+    [[ -f /usr/local/lib/v2box/panel-deploy.py ]] || { echo 'Download the panel installation command and run it with --resume.' >&2; exit 1; }
+    [[ ! -L /etc/v2box/.deployment.lock && ! -L /etc/v2box && ! -L /etc/v2box/.bootstrap.lock ]] || { echo 'Refusing symlinked deployment paths' >&2; exit 1; }
+    exec 9>/etc/v2box/.bootstrap.lock
+    flock -n 9 || { echo 'Another deployment or maintenance operation is running.' >&2; exit 1; }
+    exec python3 /usr/local/lib/v2box/panel-deploy.py /etc/v2box/deployment-state.json;;
   uninstall)
     shift
     stop_network=false
@@ -19,10 +28,12 @@ case "$1" in
       esac
     done
     [[ $EUID -eq 0 && $(uname -s) == Linux ]] || { echo 'Run as root on Linux' >&2; exit 1; }
-    [[ ! -L /etc/v2box && ! -L /etc/v2box/.bootstrap.lock && ! -L /etc/v2box/.maintenance.lock && ! -L /usr/local/lib/v2box ]] || { echo 'Refusing symlinked installation paths' >&2; exit 1; }
+    [[ ! -L /etc/v2box/.deployment.lock && ! -L /etc/v2box && ! -L /etc/v2box/.bootstrap.lock && ! -L /etc/v2box/.maintenance.lock && ! -L /usr/local/lib/v2box ]] || { echo 'Refusing symlinked installation paths' >&2; exit 1; }
     install -d -m 755 /etc/v2box
     exec 9>/etc/v2box/.bootstrap.lock
     flock -n 9 || { echo 'A deployment is running; retry after it finishes.' >&2; exit 1; }
+    exec 7>/etc/v2box/.deployment.lock
+    flock -n 7 || { echo 'Deployment is actively running; stop its terminal command before uninstalling.' >&2; exit 1; }
     exec 8>/etc/v2box/.maintenance.lock
     flock -n 8 || { echo 'Another maintenance operation is running.' >&2; exit 1; }
     echo 'This removes all V2Box nodes on this server. Configuration, certificates and DNS records are retained.'
@@ -47,7 +58,7 @@ case "$1" in
       if rc-service v2box status >/dev/null 2>&1; then echo 'Service is still running; removal stopped.' >&2; exit 1; fi
       rm -f -- /etc/init.d/v2box
     fi
-    rm -f -- /usr/local/lib/v2box/v2box /usr/local/lib/v2box/v2box.previous /usr/local/lib/v2box/install.sh /usr/local/lib/v2box/node-credentials.py /usr/local/lib/v2box/node-network.py /usr/local/bin/v2box
+    rm -f -- /usr/local/lib/v2box/v2box /usr/local/lib/v2box/v2box.previous /usr/local/lib/v2box/manager.sh /usr/local/lib/v2box/install.sh /usr/local/lib/v2box/node-credentials.py /usr/local/lib/v2box/node-network.py /usr/local/bin/v2box
     echo 'V2Box uninstalled. Configuration and certificates remain in /etc/v2box. Revoke node credentials and review domain bindings in the panel.';;
   start|stop|restart|status|enable|disable)
     action=$1
@@ -67,6 +78,6 @@ case "$1" in
   credential) exec python3 /usr/local/lib/v2box/node-credentials.py;;
   ddns) shift; exec python3 /usr/local/lib/v2box/node-network.py "${@:-status}";;
   version|server) exec "$binary" "$@";;
-  help) echo 'Usage: v2box {start|stop|restart|status|enable|disable|log|version|server|ip|credential|ddns|update [release-tag]|uninstall [--stop-network] [--yes]|help}';;
+  help) echo 'Usage: v2box {start|stop|restart|status|enable|disable|log|version|server|ip|credential|ddns|resume|update [release-tag]|uninstall [--stop-network] [--yes]|help}';;
   *) echo 'Unknown command. Run: v2box help'; exit 1;;
 esac
