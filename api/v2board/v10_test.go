@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"github.com/lenaanderson5566-ops/v2box/conf"
+	"github.com/lenaanderson5566-ops/v2box/internal/buildinfo"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -95,6 +96,9 @@ func TestV10Contract(t *testing.T) {
 			}
 			var body map[string]any
 			json.NewDecoder(r.Body).Decode(&body)
+			if body["agentVersion"] != buildinfo.Version {
+				t.Error("running agent version missing")
+			}
 			if len(body["features"].([]any)) != 9 {
 				t.Error("capabilities missing")
 			}

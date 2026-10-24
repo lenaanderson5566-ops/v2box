@@ -342,3 +342,5 @@ TLS 在节点终止时，证书及普通 TLS SNI 覆盖连接入口域名。自�
 测试使用自签名及本地受信证书，不会访问 Cloudflare 或公网 ACME，不代表生产 DNS 权限、证书服务可达性或外部 Nginx 配置已经验证。DNS 凭据环境作用域和签发失败保护由 `node/acme_guard_test.go` 覆盖。
 
 本轮在 Go 1.27.3 Linux 隔离容器执行 `go test -tags with_quic,with_utls ./cmd ./node ./core ./api/v2board`，四包全部通过，包括上述真实重载测试。未调用真实 Cloudflare 或公网 ACME。
+
+V2Box v1.0.8 起，V10 capabilities 上报独立的 `agentVersion` 与 `coreVersion`，发布版本取自与 CLI 相同的构建值。面板“部署与状态”展示版本和最近上报时间；此功能不提供远程更新控制。

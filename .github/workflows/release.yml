@@ -95,14 +95,14 @@ jobs:
           generate_release_notes: true
           make_latest: true
           body: |
-            V2Box v1.0.7：修复未完成部署时的更新与管理命令路径。
+            V2Box v1.0.8：向面板上报实际运行版本。
 
-            - 未完成部署允许更新程序，保留配置、证书与恢复状态；更新后执行 v2box resume。
-            - 活跃部署与维护互斥，避免更新、卸载和部署同时修改程序。
-            - 核心二进制支持转交 Linux 运维命令，管理入口固定为 /usr/local/bin/v2box。
-            - 卸载保留配置、证书及部署状态，默认保留独立 IP 上报；--stop-network 可显式停用。
-            - 更新失败回滚程序，停止的服务保持停止；运行中服务更新会重启。
+            - 复用现有 capabilities 上报链路，分别提供 V2Box 发布版本和 sing-box 内核版本。
+            - 上报版本与 v2box version 使用同一构建版本，面板显示最近上报时间。
+            - 不提供后台远程更新控制；继续使用 v2box update 手动升级。
+            - 保留 v1.0.7 的未完成部署更新、恢复部署及卸载保留配置和证书行为。
 
-            旧版不支持 update 时，下载本版本 script/install.sh 后执行 bash install.sh v1.0.7 --update。
-            完成后执行 hash -r；未完成部署执行 /usr/local/bin/v2box resume。
+            请先通过 update.sh 更新面板，再在节点执行 v2box update v1.0.8。
+            旧版管理命令不支持 update 时，下载本版本 script/install.sh，运行 bash install.sh v1.0.8 --update。
+            服务原本停止时升级不会启动，请完成部署或执行 v2box start 后等待版本上报。
             提供六个平台/架构安装包及 SHA-256；服务管理脚本适用于 Linux。

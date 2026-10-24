@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"github.com/lenaanderson5566-ops/v2box/internal/buildinfo"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -31,5 +32,11 @@ func TestManagerDelegation(t *testing.T) {
 	os.Symlink(path, link)
 	if runManager(link, nil) == nil {
 		t.Fatal("symlink accepted")
+	}
+}
+
+func TestRuntimeVersionMatchesCLI(t *testing.T) {
+	if buildinfo.Version != version {
+		t.Fatal("reported version differs from CLI version")
 	}
 }

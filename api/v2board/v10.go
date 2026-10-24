@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"github.com/lenaanderson5566-ops/v2box/internal/buildinfo"
 	"runtime/debug"
 	"strings"
 	"time"
@@ -125,7 +126,7 @@ func (c *Client) announceCapabilities(ctx context.Context) error {
 			}
 		}
 	}
-	body := map[string]any{"coreVersion": version, "features": []string{"native-routing-v1", "dns-v1", "outbounds-v1", "server-traffic-budget-v1", "target-statistics-v1", "target-statistics-policy-v2", "target-statistics-interval-v1", "configuration-receipt-v1", "certificate-transition-v1"}}
+	body := map[string]any{"agentVersion": buildinfo.Version, "coreVersion": version, "features": []string{"native-routing-v1", "dns-v1", "outbounds-v1", "server-traffic-budget-v1", "target-statistics-v1", "target-statistics-policy-v2", "target-statistics-interval-v1", "configuration-receipt-v1", "certificate-transition-v1"}}
 	report := c.configurationReport.Load()
 	if report != nil {
 		body["configuration"] = report

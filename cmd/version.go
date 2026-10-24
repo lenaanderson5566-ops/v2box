@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"fmt"
+	"github.com/lenaanderson5566-ops/v2box/internal/buildinfo"
 
 	"github.com/spf13/cobra"
 )
@@ -21,6 +22,7 @@ var versionCommand = cobra.Command{
 }
 
 func init() {
+	buildinfo.Version = version
 	command.AddCommand(&versionCommand)
 }
 
