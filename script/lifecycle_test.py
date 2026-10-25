@@ -9,6 +9,8 @@ import tempfile
 import unittest
 import zipfile
 import shlex
+import signal
+import time
 
 
 @unittest.skipUnless(os.name == 'posix' and shutil.which('jq'), 'Linux test environment with jq required')
@@ -47,10 +49,16 @@ class LifecycleTest(unittest.TestCase):
         self.write(self.bin/'systemctl', '''#!/bin/sh
 echo "$*" >> "$TEST_ROOT/service-calls"
 case "$1" in
- is-active) test -e "$TEST_ROOT/active";;
+ is-active)
+   if test -e "$TEST_ROOT/slow-polls"; then
+     count=$(cat "$TEST_ROOT/slow-polls"); echo $((count+1)) > "$TEST_ROOT/slow-polls"
+     if test "$count" -lt 2; then exit 3; fi
+   fi
+   test -e "$TEST_ROOT/active" || exit 3;;
  restart)
    if test -e "$TEST_ROOT/fail-start" && grep -q new-version "$TEST_ROOT/usr/local/lib/v2box/v2box"; then rm -f "$TEST_ROOT/active"; exit 1; fi
-   touch "$TEST_ROOT/active";;
+   touch "$TEST_ROOT/active"
+   if test -e "$TEST_ROOT/slow-start"; then echo 0 > "$TEST_ROOT/slow-polls"; fi;;
  disable) if test -e "$TEST_ROOT/fail-stop"; then exit 1; fi; rm -f "$TEST_ROOT/active";;
 esac
 ''')
@@ -75,13 +83,14 @@ esac
         path.write_text(value)
         path.chmod(0o755)
 
-    def package(self, missing=None):
+    def package(self, missing=None, overrides=None):
         files = {'v2box': '#!/bin/sh\necho new-version\n',
                  'install.sh': self.installer.read_text(),
                  'v2box.sh': (self.root/'usr/local/bin/v2box').read_text(),
                  'node-network.py': 'print("isolated IP helper")',
                  'node-credentials.py': '# helper', 'config.example.json': '{}'}
         files.update({name: 'fixture' for name in ['LICENSE', 'LICENSE.sing-box', 'NOTICE.md', 'README.md']})
+        files.update(overrides or {})
         with zipfile.ZipFile(self.root/'release.zip', 'w') as archive:
             for name, value in files.items():
                 if name != missing: archive.writestr(name, value)
@@ -97,6 +106,35 @@ esac
     def preserved(self):
         self.assertEqual((self.config/'config.json').read_bytes(), self.original_config)
         self.assertEqual((self.config/'saved.cer').read_text(), 'retain certificate')
+
+    @unittest.skipIf(os.path.exists('/dev/tty') and os.isatty(0), 'Requires noninteractive test process')
+    def test_noninteractive_uninstall_requires_explicit_confirmation(self):
+        result=self.run_script(self.root/'usr/local/bin/v2box','uninstall')
+        self.assertNotEqual(result.returncode,0)
+        self.assertIn('Nothing was removed',result.stderr)
+        self.assertTrue((self.lib/'v2box').exists())
+        self.assertTrue(self.active.exists())
+        self.preserved()
+
+    def test_missing_update_installer_has_repair_guidance(self):
+        result=self.run_script(self.root/'usr/local/bin/v2box','update')
+        self.assertNotEqual(result.returncode,0)
+        self.assertIn('Update installer is missing',result.stderr)
+        self.preserved()
+        self.assertTrue(self.active.exists())
+
+    def test_missing_reporter_uninstall_stops_schedule_directly(self):
+        units=self.root/'etc/systemd/system'
+        (units/'node-network.timer').write_text('fixture')
+        (units/'node-network.service').write_text('fixture')
+        result=self.run_script(self.root/'usr/local/bin/v2box','uninstall','--yes','--stop-network')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertIn('helper is missing',result.stdout)
+        calls=(self.root/'service-calls').read_text()
+        self.assertIn('disable --now node-network.timer',calls)
+        self.assertIn('stop node-network.service',calls)
+        self.preserved()
+        self.assertFalse((self.lib/'v2box').exists())
 
     def test_update_preserves_settings_and_supports_next_update(self):
         r = self.install()
@@ -117,6 +155,104 @@ esac
         self.assertTrue(self.active.exists())
         self.preserved()
 
+    def test_slow_start_is_retried_before_rollback(self):
+        (self.root/'slow-start').touch()
+        r=self.install()
+        self.assertEqual(r.returncode,0,r.stderr)
+        self.assertGreaterEqual(int((self.root/'slow-polls').read_text()),5)
+        self.assertIn('new-version',(self.lib/'v2box').read_text())
+        self.preserved()
+
+    def test_invalid_release_scripts_preserve_existing_installation(self):
+        for name in ['v2box.sh','install.sh']:
+            self.package(overrides={name:'#!/bin/bash\nif then\n'})
+            r=self.install()
+            self.assertNotEqual(r.returncode,0)
+            self.assertIn('invalid shell script',r.stderr)
+            self.assertIn('old-version',(self.lib/'v2box').read_text())
+            self.preserved()
+
+    def test_invalid_python_helper_is_rejected_before_install(self):
+        self.package(overrides={'node-network.py':'def broken(\n'})
+        r=self.install()
+        self.assertNotEqual(r.returncode,0)
+        self.assertIn('invalid Python helper',r.stderr)
+        self.assertIn('old-version',(self.lib/'v2box').read_text())
+        self.preserved()
+
+    def test_interrupted_download_retains_files_and_releases_locks(self):
+        self.write(self.bin/'curl', '#!/bin/sh\ntouch "$TEST_ROOT/download-started"\nexec /bin/sleep 30\n')
+        tmp=self.root/'tmp';tmp.mkdir();self.env['TMPDIR']=str(tmp)
+        process=subprocess.Popen(['bash',str(self.installer),'--update','v-test'],env=self.env,text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,start_new_session=True)
+        try:
+            deadline=time.monotonic()+3
+            while not (self.root/'download-started').exists() and time.monotonic()<deadline: time.sleep(.02)
+            self.assertTrue((self.root/'download-started').exists())
+            os.killpg(process.pid,signal.SIGTERM)
+            _,error=process.communicate(timeout=5)
+            self.assertNotEqual(process.returncode,0)
+            self.assertIn('rerun the panel',error)
+            self.assertIn('old-version',(self.lib/'v2box').read_text())
+            self.assertEqual(list(tmp.iterdir()),[])
+            self.preserved()
+            import fcntl
+            for name in ['.bootstrap.lock','.deployment.lock','.maintenance.lock']:
+                with (self.config/name).open('w') as lock: fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        finally:
+            if process.poll() is None:
+                os.killpg(process.pid,signal.SIGKILL);process.communicate()
+
+    def test_unknown_service_state_never_replaces_or_removes_programs(self):
+        self.write(self.bin/'timeout','''#!/bin/sh
+if test "$4" = systemctl && test "$5" = is-active; then exit 124; fi
+shift 3
+exec "$@"
+''')
+        for r in [self.install(),self.run_script(self.root/'usr/local/bin/v2box','uninstall','--yes')]:
+            self.assertNotEqual(r.returncode,0)
+            self.assertIn('timed out',r.stderr)
+            self.assertIn('old-version',(self.lib/'v2box').read_text())
+            self.preserved()
+
+    def test_uninstall_stop_timeout_retains_programs_and_service(self):
+        self.write(self.bin/'timeout','''#!/bin/sh
+if test "$4" = systemctl && test "$5" = disable; then exit 124; fi
+shift 3
+exec "$@"
+''')
+        r=self.run_script(self.root/'usr/local/bin/v2box','uninstall','--yes')
+        self.assertNotEqual(r.returncode,0)
+        self.assertIn('timed out',r.stderr)
+        self.assertTrue((self.lib/'v2box').exists())
+        self.assertTrue((self.root/'etc/systemd/system/v2box.service').exists())
+        self.preserved()
+
+    def test_binary_version_timeout_never_installs_the_release(self):
+        self.write(self.bin/'timeout','''#!/bin/sh
+if test "$3" = 15; then exit 124; fi
+shift 3
+exec "$@"
+''')
+        r=self.install()
+        self.assertNotEqual(r.returncode,0)
+        self.assertIn('version check',r.stderr)
+        self.assertIn('old-version',(self.lib/'v2box').read_text())
+        self.preserved()
+
+    def test_failed_rollback_retains_backup_for_manual_recovery(self):
+        (self.root/'fail-start').touch()
+        tmp=self.root/'tmp';tmp.mkdir();self.env['TMPDIR']=str(tmp)
+        self.write(self.bin/'cp','''#!/bin/sh
+case "$3" in */previous/v2box) exit 1;; esac
+exec /bin/cp "$@"
+''')
+        r=self.install()
+        self.assertNotEqual(r.returncode,0)
+        self.assertIn('Rollback incomplete',r.stderr)
+        backup=next(line.split('Backup retained at ',1)[1] for line in r.stderr.splitlines() if 'Backup retained at ' in line)
+        self.assertIn('old-version',(Path(backup)/'previous/v2box').read_text())
+        self.preserved()
+
     def test_stopped_node_stays_stopped(self):
         self.active.unlink()
         r = self.install()
@@ -125,7 +261,7 @@ esac
         self.assertNotIn('restart', (self.root/'service-calls').read_text())
 
     def test_bad_release_and_checksum_do_not_replace_binary(self):
-        for missing in ['v2box.sh', None]:
+        for missing in ['v2box.sh', 'node-network.py', 'node-credentials.py', None]:
             self.package(missing)
             if missing is None: (self.root/'release.zip.sha256').write_text('0'*64+'  v2box-linux-amd64.zip\n')
             r = self.install()
@@ -198,7 +334,7 @@ esac
         # Alpine/CI test environment must not provide a real systemd daemon.
         self.write(self.bin/'rc-service', '''#!/bin/sh
 case "$2" in
- status) test -e "$TEST_ROOT/active";;
+ status) test -e "$TEST_ROOT/active" || exit 3;;
  restart) touch "$TEST_ROOT/active";;
  stop) rm -f "$TEST_ROOT/active";;
 esac

@@ -1,11 +1,21 @@
 #!/usr/bin/env bash
 set -euo pipefail
+run_service() {
+  command -v timeout >/dev/null || { echo 'Required command timeout is missing. Use the latest panel installation script to repair dependencies.' >&2; return 1; }
+  local result=0
+  timeout -k 5 90 "$@" 7>&- 8>&- 9>&- || result=$?
+  if ((result == 124 || result == 137)); then
+    echo 'Service operation timed out; program files, configuration and certificates were retained. Check v2box status and the service manager, then retry.' >&2
+  fi
+  return "$result"
+}
 binary=/usr/local/lib/v2box/v2box
 if (($# == 0)); then set -- help; fi
 case "$1" in
   update)
     shift
     (($# <= 1)) || { echo 'Usage: v2box update [release-tag]' >&2; exit 1; }
+    [[ -s /usr/local/lib/v2box/install.sh && ! -L /usr/local/lib/v2box/install.sh ]] || { echo 'Update installer is missing or unsafe. Download the current panel bootstrap and use --install with the published version to repair program files; configuration and certificates remain.' >&2; exit 1; }
     exec bash /usr/local/lib/v2box/install.sh --update "$@";;
   resume)
     [[ $EUID -eq 0 && $# -eq 1 ]] || { echo 'Run as root: v2box resume' >&2; exit 1; }
@@ -39,23 +49,39 @@ case "$1" in
     echo 'This removes all V2Box nodes on this server. Configuration, certificates and DNS records are retained.'
     if $stop_network; then echo 'The shared node-network IP reporting/DDNS schedule will also be stopped.'; fi
     if ! $confirmed; then
-      read -r -p 'Type uninstall to continue: ' answer < /dev/tty
+      if ! { read -r -p 'Type uninstall to continue: ' answer < /dev/tty; } 2>/dev/null; then
+        echo 'Confirmation could not be read. Run interactively, or explicitly use v2box uninstall --yes. Nothing was removed.' >&2; exit 1
+      fi
       [[ "$answer" == uninstall ]] || { echo 'Uninstall cancelled.'; exit 1; }
     fi
-    if $stop_network && [[ -f /etc/node-network/cloudflare.json ]]; then
-      python3 /usr/local/lib/node-network/node-network.py disable
+    if $stop_network; then
+      if [[ -s /usr/local/lib/node-network/node-network.py ]]; then
+        run_service python3 /usr/local/lib/node-network/node-network.py disable
+      elif command -v systemctl >/dev/null; then
+        echo 'IP reporting helper is missing; stopping its systemd schedule directly. Reporting settings and DNS records are retained.'
+        if [[ -f /etc/systemd/system/node-network.timer ]]; then run_service systemctl disable --now node-network.timer; fi
+        if [[ -f /etc/systemd/system/node-network.service ]]; then run_service systemctl stop node-network.service; fi
+      elif [[ -f /etc/node-network/cloudflare.json ]]; then
+        echo 'IP reporting helper is missing. Restore node-network before uninstalling with --stop-network; nothing was removed.' >&2; exit 1
+      fi
     fi
     if command -v systemctl >/dev/null; then
-      if [[ -f /etc/systemd/system/v2box.service ]] || systemctl is-active --quiet v2box; then
-        systemctl disable --now v2box
-        if systemctl is-active --quiet v2box; then echo 'Service is still running; removal stopped.' >&2; exit 1; fi
+      active=false
+      if run_service systemctl is-active --quiet v2box; then active=true;
+      else state=$?; [[ $state == 3 || $state == 4 ]] || { echo 'Cannot verify service state; removal stopped before deleting programs.' >&2; exit "$state"; }; fi
+      if [[ -f /etc/systemd/system/v2box.service ]] || $active; then
+        run_service systemctl disable --now v2box
+        if run_service systemctl is-active --quiet v2box; then echo 'Service is still running; removal stopped.' >&2; exit 1;
+        else state=$?; [[ $state == 3 || $state == 4 ]] || { echo 'Cannot verify the service stopped; program files retained.' >&2; exit "$state"; }; fi
         rm -f -- /etc/systemd/system/v2box.service
-        systemctl daemon-reload
+        run_service systemctl daemon-reload
       fi
     elif [[ -f /etc/init.d/v2box ]]; then
-      if rc-service v2box status >/dev/null 2>&1; then rc-service v2box stop; fi
-      if rc-update show default | grep -q 'v2box'; then rc-update del v2box default; fi
-      if rc-service v2box status >/dev/null 2>&1; then echo 'Service is still running; removal stopped.' >&2; exit 1; fi
+      if run_service rc-service v2box status >/dev/null 2>&1; then run_service rc-service v2box stop;
+      else state=$?; [[ $state == 3 ]] || exit "$state"; fi
+      if run_service rc-update show default | grep -q 'v2box'; then run_service rc-update del v2box default; fi
+      if run_service rc-service v2box status >/dev/null 2>&1; then echo 'Service is still running; removal stopped.' >&2; exit 1;
+      else state=$?; [[ $state == 3 ]] || exit "$state"; fi
       rm -f -- /etc/init.d/v2box
     fi
     rm -f -- /usr/local/lib/v2box/v2box /usr/local/lib/v2box/v2box.previous /usr/local/lib/v2box/manager.sh /usr/local/lib/v2box/install.sh /usr/local/lib/v2box/node-credentials.py /usr/local/lib/v2box/node-network.py /usr/local/bin/v2box
@@ -63,12 +89,12 @@ case "$1" in
   start|stop|restart|status|enable|disable)
     action=$1
     if command -v systemctl >/dev/null; then
-      systemctl "$action" v2box
+      run_service systemctl "$action" v2box
     else
       case "$action" in
-        enable) rc-update add v2box default;;
-        disable) rc-update del v2box default;;
-        *) rc-service v2box "$action";;
+        enable) run_service rc-update add v2box default;;
+        disable) run_service rc-update del v2box default;;
+        *) run_service rc-service v2box "$action";;
       esac
     fi;;
   log)
