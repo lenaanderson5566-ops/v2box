@@ -95,14 +95,14 @@ jobs:
           generate_release_notes: true
           make_latest: true
           body: |
-            V2Box v1.0.8：向面板上报实际运行版本。
+            V2Box v1.0.9：拒绝示例配置启动，修复部署身份配置。
 
-            - 复用现有 capabilities 上报链路，分别提供 V2Box 发布版本和 sing-box 内核版本。
-            - 上报版本与 v2box version 使用同一构建版本，面板显示最近上报时间。
+            - 启动和重新载入时拒绝示例面板地址、空凭据及无效节点编号。
+            - 配合面板更新在等待 DNS 前写入真实身份，并支持恢复残留示例配置。
             - 不提供后台远程更新控制；继续使用 v2box update 手动升级。
             - 保留 v1.0.7 的未完成部署更新、恢复部署及卸载保留配置和证书行为。
 
-            请先通过 update.sh 更新面板，再在节点执行 v2box update v1.0.8。
-            旧版管理命令不支持 update 时，下载本版本 script/install.sh，运行 bash install.sh v1.0.8 --update。
+            请先通过 update.sh 更新面板，再在节点执行 v2box update v1.0.9。
+            旧版管理命令不支持 update 时，下载本版本 script/install.sh，运行 bash install.sh v1.0.9 --update。
             服务原本停止时升级不会启动，请完成部署或执行 v2box start 后等待版本上报。
             提供六个平台/架构安装包及 SHA-256；服务管理脚本适用于 Linux。
