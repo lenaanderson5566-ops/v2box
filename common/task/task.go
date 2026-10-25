@@ -2,6 +2,7 @@ package task
 
 import (
 	"context"
+	"fmt"
 	log "github.com/sirupsen/logrus"
 	"math/rand/v2"
 	"sync"
@@ -29,6 +30,9 @@ func (t *Task) Start(first bool) error {
 	if t.cancel != nil {
 		return nil
 	}
+	if t.Interval <= 0 || t.Execute == nil {
+		return fmt.Errorf("task %q requires a positive interval and callback", t.Name)
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	t.cancel = cancel
 	t.done = make(chan struct{})
@@ -54,7 +58,7 @@ func (t *Task) Start(first bool) error {
 	return nil
 }
 func (t *Task) execute(parent context.Context) {
-	ctx, cancel := context.WithTimeout(parent, min(5*t.Interval, 5*time.Minute))
+	ctx, cancel := context.WithTimeout(parent, min(t.Interval, time.Minute)*5)
 	defer cancel()
 	if err := t.Execute(ctx); err != nil && parent.Err() == nil {
 		log.WithError(err).Warnf("Task %s failed", t.Name)

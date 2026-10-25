@@ -113,3 +113,7 @@ func New(c *conf.NodeConfig) (*Client, error) {
 		AliveMap:              &AliveMap{},
 	}, nil
 }
+
+// CloseIdleConnections releases pooled sockets without making the client unusable
+// when an existing controller must be restored after a rejected reload.
+func (c *Client) CloseIdleConnections() { c.client.GetClient().CloseIdleConnections() }

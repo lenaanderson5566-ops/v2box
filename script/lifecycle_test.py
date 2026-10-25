@@ -388,6 +388,44 @@ esac
         self.assertTrue((cfg/'cloudflare.json').exists())
         self.preserved()
 
+    def test_install_does_not_probe_ip_before_report_configuration(self):
+        self.package(overrides={'node-network.py': 'raise RuntimeError("unnecessary IP probe")'})
+        r=self.install()
+        self.assertEqual(r.returncode,0,r.stderr)
+        self.assertNotIn('unnecessary IP probe',r.stderr)
+
+    def test_failed_first_configuration_write_is_retryable(self):
+        (self.config/'config.json').unlink()
+        (self.root/'active').unlink()
+        self.write(self.bin/'jq', '#!/bin/sh\nprintf "partial json"\nexit 1\n')
+        r=self.run_script(self.installer,'v-test','--api-host','https://actual.example.test','--node-id','7','--api-key','new-secret')
+        self.assertNotEqual(r.returncode,0)
+        self.assertFalse((self.config/'config.json').exists())
+        self.assertFalse((self.config/'config.json.new').exists())
+        (self.bin/'jq').unlink()
+        r=self.run_script(self.installer,'v-test','--api-host','https://actual.example.test','--node-id','7','--api-key','new-secret')
+        self.assertEqual(r.returncode,0,r.stderr)
+        self.assertEqual(json.loads((self.config/'config.json').read_text())['Nodes'][0]['NodeID'],7)
+        self.assertEqual((self.config/'saved.cer').read_text(),'retain certificate')
+
+    def test_failed_service_publication_is_retryable(self):
+        unit=self.root/'etc/systemd/system/v2box.service'
+        unit.unlink()
+        self.active.unlink()
+        real_install=shutil.which('install')
+        self.write(self.bin/'install', '#!/bin/sh\ncase "$*" in *v2box.service.new*) printf partial > "${@: -1}"; exit 1;; esac\nexec '+shlex.quote(real_install)+' "$@"\n')
+        # Use bash for the positional-argument fixture, matching the installer.
+        (self.bin/'install').write_text((self.bin/'install').read_text().replace('#!/bin/sh','#!/bin/bash'))
+        r=self.install()
+        self.assertNotEqual(r.returncode,0)
+        self.assertFalse(unit.exists())
+        self.assertFalse(unit.with_name('v2box.service.new').exists())
+        (self.bin/'install').unlink()
+        r=self.install()
+        self.assertEqual(r.returncode,0,r.stderr)
+        self.assertIn('ExecStart=',unit.read_text())
+        self.preserved()
+
 
 if __name__ == '__main__':
     unittest.main()

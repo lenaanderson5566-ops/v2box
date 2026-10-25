@@ -98,6 +98,8 @@ func serverHandle(_ *cobra.Command, _ []string) error {
 	err = v2core.Start(nodes.NodeInfos)
 	if err != nil {
 		nodes.ReportConfiguration("core")
+		_ = nodes.Close()
+		_ = v2core.Close()
 		log.WithField("err", err).Error("Start core failed")
 		return err
 	}
@@ -174,10 +176,20 @@ func reload(config string, nodes **node.Node, v2core **core.V2Core) error {
 	if err != nil {
 		return &reloadRejected{err}
 	}
+	defer func() {
+		if *nodes != newNodes {
+			_ = newNodes.Close()
+		}
+	}()
 	if reflect.DeepEqual(newConf, (*v2core).Config) && (*nodes).ConfirmPublication(newNodes) {
 		return nil
 	}
 	newCore := core.New(newConf)
+	defer func() {
+		if *v2core != newCore {
+			_ = newCore.Close()
+		}
+	}()
 	if err := newCore.Start(newNodes.NodeInfos); err != nil {
 		newNodes.ReportConfiguration("core")
 		return &reloadRejected{err}

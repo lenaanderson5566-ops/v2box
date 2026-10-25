@@ -120,6 +120,9 @@ func (c *Controller) prepareUsers() error {
 
 // Close implement the Close() function of the service interface
 func (c *Controller) Close() error {
+	if c.apiClient != nil {
+		defer c.apiClient.CloseIdleConnections()
+	}
 	if c.server == nil || c.limiter == nil {
 		return nil
 	}
@@ -141,12 +144,14 @@ func (c *Controller) Close() error {
 	reportCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	traffic, _ := c.server.GetUserTrafficSlice(c.tag, 0)
-	if len(traffic) > 0 {
-		if reportErr := c.apiClient.ReportUserTraffic(reportCtx, traffic); reportErr != nil {
+	retained, reportErr := c.apiClient.ReportUserTrafficReliable(reportCtx, traffic)
+	if reportErr != nil {
+		if !retained {
 			c.server.RestoreUserTraffic(c.tag, traffic)
-			log.WithError(reportErr).Warn("Final traffic report failed")
 		}
+		log.WithError(reportErr).Warn("Final traffic report failed")
 	}
+
 	limiter.DeleteLimiter(c.tag)
 	if err != nil {
 		return fmt.Errorf("del node error: %s", err)

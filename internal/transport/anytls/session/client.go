@@ -108,8 +108,10 @@ func (c *Client) CreateStream(ctx context.Context) (net.Conn, error) {
 				go session.Close()
 			default:
 				c.idleSessionLock.Lock()
-				session.idleSince = time.Now()
-				c.idleSession.Insert(math.MaxUint64-session.seq, session)
+				if c.die.Err() == nil && !session.IsClosed() {
+					session.idleSince = time.Now()
+					c.idleSession.Insert(math.MaxUint64-session.seq, session)
+				}
 				c.idleSessionLock.Unlock()
 			}
 		}
@@ -130,11 +132,21 @@ func (c *Client) getIdleSession() (idle *Session) {
 }
 
 func (c *Client) createSession(ctx context.Context) (*Session, error) {
-	underlying, err := c.dialOut(ctx)
+	dialCtx, cancel := context.WithCancel(ctx)
+	stop := context.AfterFunc(c.die, cancel)
+	defer stop()
+	defer cancel()
+	underlying, err := c.dialOut(dialCtx)
 	if err != nil {
 		return nil, err
 	}
 
+	c.sessionsLock.Lock()
+	if c.die.Err() != nil || dialCtx.Err() != nil {
+		c.sessionsLock.Unlock()
+		_ = underlying.Close()
+		return nil, io.ErrClosedPipe
+	}
 	session := NewClientSession(underlying, c.padding, c.logger)
 	session.seq = c.sessionCounter.Add(1)
 	session.dieHook.set(func() {
@@ -147,7 +159,6 @@ func (c *Client) createSession(ctx context.Context) (*Session, error) {
 		c.sessionsLock.Unlock()
 	})
 
-	c.sessionsLock.Lock()
 	c.sessions[session.seq] = session
 	c.sessionsLock.Unlock()
 

@@ -331,7 +331,7 @@ Reality identities are not changed. Manual files must cover the new hostname wit
 
 面板的服务器记录代表实际机器。入口机仅执行服务器 IP 上报命令，V2Box 安装在回源节点。共享入口由面板引用管理，入口域名指向入口 IP、回源域名指向节点 IP；上报凭据不会在每次新增同机节点时自动轮换。
 
-TLS 在节点终止时，证书及普通 TLS SNI 覆盖连接入口域名。自动签发使用单独配置的 DNS 验证凭据，不依赖入口将 HTTP 80 端口转发到节点。域名候选验证的预期 IP 是入口 IP，不能替换为本机回源 IP。DNS 校验只访问固定解析器并拒绝 HTTP 重定向。失败保留原配置，成功验证及面板确认后完成切换；Reality 身份不随入口域名改变。
+连接地址、回源地址和 TLS 身份域名独立管理。四层中转默认保留代理服务器的落地证书，客户端连接入口地址，SNI 使用证书覆盖的 TLS 身份域名；入口域名无需与证书域名相同。DNS 验证凭据匹配证书域名所属区域。HTTP 验证仅在证书域名的公网 80 端口能够到达申请证书的代理服务器时使用；中转不满足此条件时使用 DNS 验证。连接入口解析检查使用入口 IP，回源解析检查使用代理服务器 IP，并分别按配置的地址类型验证。DNS 校验只访问固定解析器并拒绝 HTTP 重定向。失败保留原配置，成功验证及面板确认后完成切换；Reality 身份保持独立。
 
 面板可生成 Nginx 1.27.3+ stream 转发片段，采用动态 DNS 回源。管理员需在入口应用并测试该片段；V2Box 本机监听就绪不能证明入口转发或防火墙已经正确。更换回源域名时，确认入口更新后才允许面板延迟清理旧解析。停止共享服务器的上报服务会影响该服务器的全部关联域名。
 
@@ -350,3 +350,26 @@ V2Box v1.0.8 起，V10 capabilities 上报独立的 `agentVersion` 与 `coreVers
 安装和更新先验证发布包必需文件、脚本语法与程序版本；服务管理操作设有超时，更新在连续健康观测后确认。下载中断或启动失败会恢复原程序，配置、证书和部署状态保留。若磁盘或权限错误导致回滚不完整，保留临时备份并显示路径，修复后再恢复程序。卸载在确认服务停止后移除程序，默认保留 IP 上报；显式 --stop-network 才停止共享上报。复用 script/lifecycle_test.py 的隔离故障测试验证这些边界。
 
 管理命令在更新脚本缺失时提示通过面板引导脚本修复；非交互卸载必须明确传入 --yes。使用 --stop-network 且上报组件缺失时，systemd 环境直接停用既有上报定时器和服务，保留上报配置及 DNS 记录。
+
+
+### 资源与安装生命周期复核
+
+AnyTLS 客户端关闭会取消尚未完成的拨号，并拒绝和关闭迟到连接；回收会话时在锁内再次确认关闭状态。控制器关闭使用与周期上报相同的持久化流量批次，不把已保留批次重复恢复到实时计数；即使没有新流量，也尝试发送既有待确认批次。候选配置被拒绝、初始化失败及控制器关闭后释放面板 HTTP 空闲连接，回滚时客户端仍可重新建立连接。
+
+定时任务拒绝非正间隔或空回调，超时计算先限制间隔再相乘，避免时长溢出。安装器移除重复公网 IP 探测和不可达的旧 DDNS 缺文件分支；首次配置与 systemd/OpenRC 服务文件在完整写入后原子替换，失败清理未发布临时文件。原配置、证书、部署授权状态和 DNS 记录仍保留。安装、更新、卸载、锁冲突、失败回滚及首次写入失败重试复用 `script/lifecycle_test.py`，网络及凭据测试共 48 项。
+
+复核命令：
+
+```sh
+GOEXPERIMENT=jsonv2 go test -race -tags with_quic,with_utls ./...
+GOEXPERIMENT=jsonv2 go test -tags with_quic,with_utls ./core -run TestVLESSRealityVision -count=1
+GOEXPERIMENT=jsonv2 go vet -tags with_quic,with_utls ./...
+V2BOX_SOAK=1 GOEXPERIMENT=jsonv2 go test -tags with_quic,with_utls ./core -run 'TestCoreLifecycleSoak|TestNaiveMultiplexChurnSoak' -count=1 -v
+python3 -B -m unittest discover -s script -p '*_test.py'
+bash -n script/install.sh script/v2box.sh
+govulncheck -tags with_quic,with_utls ./...
+```
+
+漏洞扫描按当前生产构建标签执行，实际可达符号和导入包告警均为 0。仍有未导入的 `golang.org/x/crypto/openpgp` 模块级告警 GO-2026-5932；该废弃包没有修复版本，项目其他密码功能需要 x/crypto，不能直接移除整个模块。资源测试是有界回环测试，不等于长期生产环境绝无泄漏；没有调用生产 Cloudflare、ACME 或 Nginx。上述修复包含于 v1.0.11；升级保留配置、证书和部署状态。
+
+本次隔离回归：全包竞态回归、Reality Vision 连接测试及 `go vet` 通过；八协议 144 次启停连接后，回收采样协程数始终为 3，最后活跃堆较基线减少约 26 KiB。Naive 多路复用采样协程数始终为 7，最后活跃堆增加约 34 KiB，未观察到持续增长。计量、流量累加及限速稳态基准均为 0 B/op、0 allocs/op；这些结果不代表公网吞吐或生产容量保证。

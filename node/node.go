@@ -22,6 +22,12 @@ func New(nodes []conf.NodeConfig) (*Node, error) {
 		controllers: make([]*Controller, len(nodes)),
 		NodeInfos:   make([]*panel.NodeInfo, len(nodes)),
 	}
+	complete := false
+	defer func() {
+		if !complete {
+			_ = n.Close()
+		}
+	}()
 	for i, node := range nodes {
 		p, err := panel.New(&node)
 		if err != nil {
@@ -29,11 +35,13 @@ func New(nodes []conf.NodeConfig) (*Node, error) {
 		}
 		info, err := p.GetNodeInfo(context.Background())
 		if err != nil {
+			p.CloseIdleConnections()
 			return nil, err
 		}
 		n.controllers[i] = NewController(p, &node, info)
 		n.NodeInfos[i] = info
 	}
+	complete = true
 	return n, nil
 }
 
@@ -53,6 +61,9 @@ func (n *Node) Start(nodes []conf.NodeConfig, core *core.V2Core) error {
 func (n *Node) Close() error {
 	var err error
 	for _, c := range n.controllers {
+		if c == nil {
+			continue
+		}
 		if closeErr := c.Close(); closeErr != nil {
 			log.Errorf("close controller failed: %v", closeErr)
 			err = errors.Join(err, closeErr)

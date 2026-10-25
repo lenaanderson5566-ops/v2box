@@ -3,10 +3,12 @@ package panel
 import (
 	"context"
 	"github.com/lenaanderson5566-ops/v2box/conf"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestUserListAndFailedReport(t *testing.T) {
@@ -153,5 +155,32 @@ func TestLegacyAliveErrorsAreNotEmptySuccess(t *testing.T) {
 				t.Fatalf("online counts lost: %v", alive)
 			}
 		})
+	}
+}
+
+func TestCloseIdleConnectionsReleasesSocketAndAllowsReuse(t *testing.T) {
+	closed := make(chan struct{}, 4)
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.Write([]byte(`{"users":[]}`)) }))
+	server.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+		if state == http.StateClosed {
+			closed <- struct{}{}
+		}
+	}
+	server.StartTLS()
+	defer server.Close()
+	c, err := newTestPanel(t, server, &conf.NodeConfig{APIHost: server.URL, APIVersion: "legacy"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		if _, err := c.GetUserList(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		c.CloseIdleConnections()
+		select {
+		case <-closed:
+		case <-time.After(time.Second):
+			t.Fatal("idle panel socket retained")
+		}
 	}
 }

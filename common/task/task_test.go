@@ -73,3 +73,22 @@ func TestDynamicIntervalReevaluatedWithoutJitter(t *testing.T) {
 		}
 	}
 }
+
+func TestInvalidTaskReturnsError(t *testing.T) {
+	for _, task := range []*Task{{Interval: 0, Execute: func(context.Context) error { return nil }}, {Interval: time.Second}} {
+		if err := task.Start(true); err == nil {
+			task.Close()
+			t.Fatal("invalid task accepted")
+		}
+	}
+}
+func TestLargeIntervalDeadlineDoesNotOverflow(t *testing.T) {
+	task := &Task{Interval: time.Duration(1<<63 - 1), Execute: func(ctx context.Context) error {
+		deadline, _ := ctx.Deadline()
+		if time.Until(deadline) < 4*time.Minute {
+			t.Error("deadline overflow")
+		}
+		return nil
+	}}
+	task.execute(context.Background())
+}

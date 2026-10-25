@@ -3,13 +3,17 @@ package node
 import (
 	"context"
 	"crypto/x509"
+	"encoding/json"
 	"fmt"
 	panel "github.com/lenaanderson5566-ops/v2box/api/v2board"
 	"github.com/lenaanderson5566-ops/v2box/conf"
 	"github.com/lenaanderson5566-ops/v2box/core"
+	"github.com/lenaanderson5566-ops/v2box/limiter"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -160,5 +164,74 @@ func TestCommittedTransitionDoesNotReloadUnchangedListener(t *testing.T) {
 	common.DomainTransition = &panel.DomainTransition{ID: "retry"}
 	if completedTransitionOnly(old, &next) {
 		t.Fatal("new verification operation incorrectly skipped")
+	}
+}
+
+func TestCloseRetainsFinalTrafficAndReplaysSameBatch(t *testing.T) {
+	hits := 0
+	batchID := ""
+	s := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/configuration"):
+			w.Header().Set("ETag", `"`+strings.Repeat("a", 64)+`"`)
+			w.Write([]byte(`{"data":{"protocol":"vless","listenPort":443,"tls":0,"intervals":{"pushInterval":60,"pullInterval":60},"trafficBatchDedup":true}}`))
+		case strings.HasSuffix(r.URL.Path, "/traffic"):
+			var body struct {
+				BatchID string `json:"batchId"`
+				Records []struct {
+					Upload int64 `json:"uploadBytes"`
+				} `json:"records"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Error(err)
+			}
+			if body.BatchID == "" || len(body.Records) != 1 || body.Records[0].Upload != 123 {
+				t.Error("shutdown bypassed durable batch")
+			}
+			if batchID != "" && body.BatchID != batchID {
+				t.Error("retry changed batch ID")
+			}
+			batchID = body.BatchID
+			hits++
+			fmt.Fprintf(w, `{"data":{"accepted":%t}}`, hits > 1)
+		default:
+			w.Write([]byte(`{"data":{"accepted":true}}`))
+		}
+	}))
+	defer s.Close()
+	roots := x509.NewCertPool()
+	roots.AddCert(s.Certificate())
+	t.Setenv("GODEBUG", os.Getenv("GODEBUG")+",x509usefallbackroots=1")
+	fixtureRootsOnce.Do(func() { x509.SetFallbackRoots(roots) })
+	retries := 0
+	spool := t.TempDir()
+	api, err := panel.New(&conf.NodeConfig{APIHost: s.URL, NodeType: "v2box", NodeID: 77, Key: "test", RetryCount: &retries, TrafficSpoolDirectory: spool})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = api.GetNodeInfo(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	server := core.New(conf.New())
+	defer server.Close()
+	server.RestoreUserTraffic("shutdown-test", []panel.UserTraffic{{UID: 1, Upload: 123}})
+	c := &Controller{apiClient: api, server: server, tag: "shutdown-test", limiter: limiter.AddLimiter("", "shutdown-test", nil, nil)}
+	if err = c.Close(); err != nil {
+		t.Fatal(err)
+	}
+	files, _ := filepath.Glob(filepath.Join(spool, "*", "*.json"))
+	if len(files) != 1 {
+		t.Fatal("final batch not retained")
+	}
+	live, _ := server.GetUserTrafficSlice(c.tag, 0)
+	if len(live) != 0 {
+		t.Fatal("durable bytes restored to counters")
+	}
+	if err = c.Close(); err != nil {
+		t.Fatal(err)
+	}
+	files, _ = filepath.Glob(filepath.Join(spool, "*", "*.json"))
+	if len(files) != 0 || hits != 2 {
+		t.Fatal("empty shutdown failed to drain pending batch")
 	}
 }

@@ -129,6 +129,7 @@ cleanup() {
   result=$?
   trap - EXIT
   trap '' INT TERM
+  rm -f -- /etc/v2box/config.json.new /etc/systemd/system/v2box.service.new /etc/init.d/v2box.new || true
   if ((result != 0)) && $rollback; then
     echo 'Update failed; restoring the previous program files. Configuration and certificates were preserved.' >&2
     restore_failed=false
@@ -169,9 +170,6 @@ curl -fSL --proto '=https' --proto-redir '=https' --connect-timeout 10 --max-tim
 for file in v2box v2box.sh install.sh node-network.py node-credentials.py config.example.json LICENSE LICENSE.sing-box NOTICE.md README.md; do
   [[ -s "$stage/$file" && ! -L "$stage/$file" ]] || { echo "Release is missing required file: $file" >&2; exit 1; }
 done
-if [[ "$ddns" == true && ! -f "$stage/node-network.py" ]]; then
-  echo 'This release does not include DDNS support; select a newer release' >&2; exit 1
-fi
 for script in v2box.sh install.sh; do
   bash -n "$stage/$script" || { echo "Release contains an invalid shell script: $script; installed programs were not changed." >&2; exit 1; }
 done
@@ -205,11 +203,6 @@ if [[ -f "$stage/node-credentials.py" ]]; then
 fi
 if [[ -f "$stage/node-network.py" ]]; then
   install -m 755 "$stage/node-network.py" /usr/local/lib/v2box/node-network.py
-  if command -v python3 >/dev/null; then
-    python3 /usr/local/lib/v2box/node-network.py ip || echo 'Public IP lookup failed; deployment will continue.'
-  else
-    echo 'Install python3 to use: v2box ip'
-  fi
 fi
 for file in LICENSE LICENSE.sing-box NOTICE.md README.md; do
   install -m 644 "$stage/$file" "/usr/local/lib/v2box/$file"
@@ -219,15 +212,18 @@ if [[ ! -f /etc/v2box/config.json ]]; then
     umask 077
     printf '%s' "$api_key" > "$stage/api-key"
     jq -n --arg host "$api_host" --argjson id "$node_id" --rawfile key "$stage/api-key" --arg type "$node_type" --argjson landing "$landing_page" --arg directory "$landing_dir" \
-      '{Log:{Level:"info"},Nodes:[{NodeType:$type,ApiHost:$host,NodeID:$id,ApiKey:$key,Timeout:15,RetryCount:1,LandingPage:{Enabled:$landing,Directory:$directory}}]}' > /etc/v2box/config.json
+      '{Log:{Level:"info"},Nodes:[{NodeType:$type,ApiHost:$host,NodeID:$id,ApiKey:$key,Timeout:15,RetryCount:1,LandingPage:{Enabled:$landing,Directory:$directory}}]}' > "$stage/config.json"
+    install -m 600 "$stage/config.json" /etc/v2box/config.json.new
+    mv -f -- /etc/v2box/config.json.new /etc/v2box/config.json
   else
-    install -m 600 "$stage/config.example.json" /etc/v2box/config.json
+    install -m 600 "$stage/config.example.json" /etc/v2box/config.json.new
+    mv -f -- /etc/v2box/config.json.new /etc/v2box/config.json
   fi
 elif [[ "$landing_page" == true ]]; then
   echo 'Existing config preserved. Set Nodes[].LandingPage.Enabled and Directory manually to enable the page.'
 fi
 if [[ "$init" == systemd && ! -f /etc/systemd/system/v2box.service ]]; then
-  cat > /etc/systemd/system/v2box.service <<'UNIT'
+  cat > "$stage/v2box.service" <<'UNIT'
 [Unit]
 Description=V2box sing-box panel backend
 After=network-online.target
@@ -242,10 +238,12 @@ LimitNOFILE=1048576
 [Install]
 WantedBy=multi-user.target
 UNIT
+  install -m 644 "$stage/v2box.service" /etc/systemd/system/v2box.service.new
+  mv -f -- /etc/systemd/system/v2box.service.new /etc/systemd/system/v2box.service
   run_service systemctl daemon-reload
   run_service systemctl enable v2box
 elif [[ "$init" == openrc && ! -f /etc/init.d/v2box ]]; then
-  cat > /etc/init.d/v2box <<'UNIT'
+  cat > "$stage/v2box.openrc" <<'UNIT'
 #!/sbin/openrc-run
 name="v2box"
 command="/usr/local/lib/v2box/v2box"
@@ -256,7 +254,8 @@ output_log="/var/log/v2box.log"
 error_log="/var/log/v2box.log"
 depend() { need net; }
 UNIT
-  chmod +x /etc/init.d/v2box
+  install -m 755 "$stage/v2box.openrc" /etc/init.d/v2box.new
+  mv -f -- /etc/init.d/v2box.new /etc/init.d/v2box
   run_service rc-update add v2box default
 fi
 if [[ "$ddns" == true ]]; then
