@@ -1,6 +1,7 @@
 package conf
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -89,5 +90,31 @@ func TestWatchLifecycleDoesNotLeak(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 	if after := runtime.NumGoroutine(); after > before+2 {
 		t.Fatalf("watchers leaked: %d -> %d", before, after)
+	}
+}
+
+func TestEnrollmentConfiguration(t *testing.T) {
+	cases := []struct {
+		host, key string
+		id        int
+		valid     bool
+	}{
+		{"https://panel.example.com", "real-key", 3, false},
+		{"https://PANEL.EXAMPLE.COM.", "real-key", 3, false},
+		{"https://panel.example.test", "REPLACE_ME", 3, false},
+		{"https://panel.example.test", "", 3, false},
+		{"https://panel.example.test", "key", 0, false},
+		{"https://panel.example.test", "key", 3, true},
+	}
+	for _, c := range cases {
+		path := filepath.Join(t.TempDir(), "config.json")
+		data, _ := json.Marshal(map[string]any{"Nodes": []any{map[string]any{"ApiHost": c.host, "ApiKey": c.key, "NodeID": c.id}}})
+		if err := os.WriteFile(path, data, 0600); err != nil {
+			t.Fatal(err)
+		}
+		err := New().LoadFromPath(path)
+		if (err == nil) != c.valid {
+			t.Fatalf("unexpected validation for host %s id %d: %v", c.host, c.id, err)
+		}
 	}
 }

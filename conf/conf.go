@@ -2,7 +2,9 @@ package conf
 
 import (
 	"fmt"
+	"net/url"
 	"os"
+	"strings"
 
 	"github.com/spf13/viper"
 )
@@ -68,6 +70,11 @@ func (p *Conf) LoadFromPath(filePath string) error {
 		return fmt.Errorf("at least one node is required")
 	}
 	for i := range p.NodeConfigs {
+		node := p.NodeConfigs[i]
+		host, err := url.Parse(node.APIHost)
+		if err != nil || host.Hostname() == "" || (host.Scheme != "https" && host.Scheme != "http") || host.User != nil || host.RawQuery != "" || host.Fragment != "" || strings.EqualFold(strings.TrimSuffix(host.Hostname(), "."), "panel.example.com") || node.NodeID <= 0 || strings.TrimSpace(node.Key) == "" || node.Key == "REPLACE_ME" {
+			return fmt.Errorf("node %d has incomplete or example enrollment configuration; resume deployment from the panel before starting V2Box", i+1)
+		}
 		if p.NodeConfigs[i].RetryCount == nil {
 			p.NodeConfigs[i].RetryCount = intPtr(DefaultNodeRetryCount)
 		}

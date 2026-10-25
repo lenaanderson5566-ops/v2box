@@ -8,7 +8,7 @@ import (
 
 func TestLandingPagePerNodeConfig(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.json")
-	if err := os.WriteFile(path, []byte(`{"Nodes":[{"NodeID":1,"LandingPage":{"Enabled":true,"Directory":"/site"}},{"NodeID":2}]}`), 0600); err != nil {
+	if err := os.WriteFile(path, []byte(`{"Nodes":[{"ApiHost":"https://panel.example.test","ApiKey":"test","NodeID":1,"LandingPage":{"Enabled":true,"Directory":"/site"}},{"ApiHost":"https://panel.example.test","ApiKey":"test","NodeID":2}]}`), 0600); err != nil {
 		t.Fatal(err)
 	}
 	c := New()
