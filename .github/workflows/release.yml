@@ -46,17 +46,28 @@ jobs:
       - name: Build
         shell: bash
         run: |
-          mkdir -p build_assets
+          set -euo pipefail
+          artifact_dir=$PWD
+          package_root=$(mktemp -d)
+          trap 'rm -rf -- "$package_root"' EXIT
+          mkdir "$package_root/package"
           suffix=''
           if [ "$GOOS" = windows ]; then suffix='.exe'; fi
-          go build -tags with_quic,with_utls -trimpath -ldflags "-s -w -X github.com/lenaanderson5566-ops/v2box/cmd.version=${GITHUB_REF_NAME}" -o "build_assets/v2box${suffix}" .
-          cp README.md LICENSE LICENSE.sing-box NOTICE.md config.example.json build_assets/
-          cp script/install.sh script/v2box.sh script/node-network.py script/node-credentials.py build_assets/
-          cp -r internal/licenses build_assets/
-          cd build_assets
+          go build -tags with_quic,with_utls -trimpath -ldflags "-s -w -X github.com/lenaanderson5566-ops/v2box/cmd.version=${GITHUB_REF_NAME}" -o "$package_root/package/v2box${suffix}" .
+          cp README.md LICENSE LICENSE.sing-box NOTICE.md config.example.json "$package_root/package/"
+          cp script/install.sh script/v2box.sh script/node-network.py script/node-credentials.py "$package_root/package/"
+          cp -r internal/licenses "$package_root/package/"
+          cd "$package_root/package"
           zip -r "../v2box-${GOOS}-${GOARCH}.zip" .
-          cd ..
+          cd "$artifact_dir"
+          mv -f "$package_root/v2box-${GOOS}-${GOARCH}.zip" .
           sha256sum "v2box-${GOOS}-${GOARCH}.zip" > "v2box-${GOOS}-${GOARCH}.zip.sha256"
+          sha256sum -c "v2box-${GOOS}-${GOARCH}.zip.sha256"
+          unzip -tq "v2box-${GOOS}-${GOARCH}.zip"
+          listing=$(unzip -Z1 "v2box-${GOOS}-${GOARCH}.zip")
+          for file in "v2box${suffix}" README.md LICENSE LICENSE.sing-box NOTICE.md config.example.json install.sh v2box.sh node-network.py node-credentials.py; do
+            grep -Fxq "$file" <<< "$listing"
+          done
       - uses: actions/upload-artifact@v6
         with:
           name: v2box-${{ matrix.goos }}-${{ matrix.goarch }}

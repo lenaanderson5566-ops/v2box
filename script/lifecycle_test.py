@@ -11,6 +11,7 @@ import zipfile
 import shlex
 import signal
 import time
+import textwrap
 
 
 @unittest.skipUnless(os.name == 'posix' and shutil.which('jq'), 'Linux test environment with jq required')
@@ -523,6 +524,68 @@ esac
         self.assertEqual(r.returncode,0,r.stderr)
         self.assertIn('ExecStart=',unit.read_text())
         self.preserved()
+
+
+@unittest.skipUnless(os.name == 'posix' and all(shutil.which(x) for x in ('zip', 'unzip', 'sha256sum')), 'Linux packaging tools required')
+class ReleasePackageTest(unittest.TestCase):
+    def package(self, platform='linux', missing=None):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        workspace = root/'workspace'
+        workspace.mkdir()
+        binaries = root/'bin'
+        binaries.mkdir()
+        scratch = root/'scratch'
+        scratch.mkdir()
+        required = ['README.md', 'LICENSE', 'LICENSE.sing-box', 'NOTICE.md', 'config.example.json']
+        required += ['script/install.sh', 'script/v2box.sh', 'script/node-network.py', 'script/node-credentials.py', 'internal/licenses/license.txt']
+        for name in required:
+            if name == missing:
+                continue
+            target = workspace/name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text('fixture')
+        old = workspace/'build_assets'
+        old.mkdir()
+        (old/'operator-private.log').write_text('must never be packaged')
+        archive = workspace/f'v2box-{platform}-amd64.zip'
+        with zipfile.ZipFile(archive, 'w') as stream:
+            stream.writestr('stale.txt', 'must not survive archive replacement')
+        original = archive.read_bytes()
+        go = binaries/'go'
+        go.write_text('#!/bin/sh\noutput=""\nwhile [ "$#" -gt 0 ]; do if [ "$1" = -o ]; then shift; output=$1; fi; shift; done\nprintf test-binary > "$output"\n')
+        go.chmod(0o755)
+        workflow = Path(__file__).resolve().parents[1]/'.github/workflows/release.yml'
+        text = workflow.read_text()
+        start = text.index('        run: |', text.index('      - name: Build')) + len('        run: |\n')
+        end = text.index('      - uses: actions/upload-artifact', start)
+        script = root/'build.sh'
+        script.write_text(textwrap.dedent(text[start:end]))
+        env = dict(os.environ, PATH=str(binaries)+':'+os.environ['PATH'], TMPDIR=str(scratch), GOOS=platform, GOARCH='amd64', GITHUB_REF_NAME='v-test')
+        result = subprocess.run(['bash', '-e', '-o', 'pipefail', str(script)], cwd=workspace, env=env, capture_output=True, text=True, timeout=30)
+        return result, archive, original, scratch
+
+    def test_archives_exclude_old_outputs_and_replace_stale_entries(self):
+        for platform in ('linux', 'windows'):
+            with self.subTest(platform=platform):
+                result, archive, _, scratch = self.package(platform)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                with zipfile.ZipFile(archive) as stream:
+                    names = set(stream.namelist())
+                    self.assertNotIn('operator-private.log', names)
+                    self.assertNotIn('stale.txt', names)
+                    self.assertEqual(stream.read('v2box.exe' if platform == 'windows' else 'v2box'), b'test-binary')
+                    self.assertIn('node-credentials.py', names)
+                    self.assertIn('licenses/license.txt', names)
+                self.assertEqual(archive.with_suffix('.zip.sha256').read_text().split()[0], hashlib.sha256(archive.read_bytes()).hexdigest())
+                self.assertEqual(list(scratch.iterdir()), [])
+
+    def test_missing_required_file_preserves_previous_archive_and_cleans_scratch(self):
+        result, archive, original, scratch = self.package(missing='script/node-credentials.py')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(archive.read_bytes(), original)
+        self.assertEqual(list(scratch.iterdir()), [])
 
 
 if __name__ == '__main__':

@@ -105,3 +105,21 @@ func TestNativeDefaultDoesNotInjectInspection(t *testing.T) {
 		}
 	}
 }
+
+func TestLogLevelConfigurationValidation(t *testing.T) {
+	node := testNode(t, "vless")
+	for _, level := range []string{"", "trace", "debug", "info", "warn", "warning", "error", "fatal", "panic"} {
+		cfg := testConf()
+		cfg.LogConfig.Level = level
+		if _, err := buildOptions(node, nil, cfg); err != nil {
+			t.Fatalf("valid level %q rejected: %v", level, err)
+		}
+	}
+	for _, level := range []string{"verbose", "INFO", "silent"} {
+		cfg := testConf()
+		cfg.LogConfig.Level = level
+		if _, err := buildOptions(node, nil, cfg); err == nil {
+			t.Fatalf("invalid level %q accepted before listener replacement", level)
+		}
+	}
+}

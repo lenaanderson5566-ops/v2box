@@ -14,6 +14,7 @@ import (
 	"github.com/lenaanderson5566-ops/v2box/conf"
 	"github.com/lenaanderson5566-ops/v2box/internal/landing"
 
+	boxlog "github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
 	sj "github.com/sagernet/sing/common/json"
 )
@@ -24,6 +25,13 @@ var canonicalUUID = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-
 
 func buildOptions(n *panel.NodeInfo, users []panel.UserInfo, c *conf.Conf) (option.Options, error) {
 	var options option.Options
+	// Validate before a replacement can stop the live listener. Shared boxes
+	// retain their logging factory, so invalid levels must not be silently ignored.
+	if c.LogConfig.Level != "" {
+		if _, err := boxlog.ParseLevel(c.LogConfig.Level); err != nil {
+			return options, fmt.Errorf("invalid log level: %w", err)
+		}
+	}
 	in, err := buildInbound(n, users)
 	if err != nil {
 		return options, err

@@ -311,3 +311,25 @@ func TestSharedEffectiveCredentialConflicts(t *testing.T) {
 		})
 	}
 }
+
+func TestSharedListenerRejectsInvalidLogLevelWithoutDisconnecting(t *testing.T) {
+	limiter.Init()
+	node := testNode(t, "anytls")
+	node.Security = panel.Tls
+	node.Common.CertInfo = testCertificate(t)
+	node.SharedListener = "logging"
+	live := startTestNode(t, node)
+	echo := echoServer(t)
+	client := clientBox(t, node, testUUID)
+	stream := persistent(t, client, echo.Addr())
+	cfg := testConf()
+	cfg.LogConfig.Level = "verbose"
+	candidate := New(cfg)
+	candidate.InheritSharedListeners(live)
+	if err := candidate.ValidateNodeUsers(node, []panel.UserInfo{{Id: 42, Uuid: testUUID}}); err == nil {
+		t.Fatal("invalid shared log level accepted before replacement")
+	}
+	if err := roundTrip(stream); err != nil {
+		t.Fatal("log validation interrupted live stream", err)
+	}
+}

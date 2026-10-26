@@ -87,7 +87,7 @@ DNS 支持 local、UDP、TCP、TLS、HTTPS，以及原生 DNS 规则和解析策
 
 - **用户增加不重建节点、不关闭其他用户的现有连接。删除、UUID 变化或同一 UUID 对应的用户 ID 变化，只撤销对应账号的连接和后续转发权限。** 单纯限速/设备限制变更也无需重建。节点端口、协议、TLS 等配置变化仍走配置重载，可能中断连接。
 - 空用户列表清空认证表并关闭全部用户连接，保留监听器以接受后续用户热更新，不提供匿名访问；304 响应保留现有用户。账号删除后重新添加会获得新的内部认证代次，旧多路复用会话不能恢复访问权限。
-- 用户流量计数独立于核心实例；用户删除和实例替换不清除待上报流量，配置重载时保留仍在配置中的节点计数。HTTP 上报失败恢复计数供下一轮重试。计数目前保存在内存中，进程崩溃无法恢复；面板接口没有幂等确认，超时后的重试存在重复计费可能。
+- 用户流量计数独立于核心实例；用户删除和实例替换不清除待上报流量，配置重载时保留仍在配置中的节点计数。HTTP 上报失败恢复计数供下一轮重试。未上报增量先在内存累计；V10 面板声明批次去重能力时，待报批次持久化并以稳定批次 ID 重试。尚未落盘的增量在进程崩溃时仍可能丢失；旧接口或未声明去重的面板在超时重试时仍存在重复计费可能。
 - 用户限速覆盖 TCP/UDP 的应用数据，上下行共享用户限速桶。设备限制依据源 IP，结合面板在线计数和本地最近两分钟活动；不是硬件设备识别，也不是跨服务器强一致配额。
 - XHTTP/SplitHTTP、TCP HTTP 伪装、PROXY protocol、trusted X-Forwarded-For、Xray VLESS 加密、Reality ML-DSA/xver、多 Reality server_names、reject_unknown_sni 当前明确拒绝，需先迁移配置。
 - 支持域名/IP/端口/协议封禁及自定义出站路由。`route` / `route_ip` / `default_out` 的 action_value 必须改为包含 `type`、`tag` 的 **sing-box 出站 JSON**；不接受 Xray 出站 JSON。当前注册的出站为 direct、SOCKS、HTTP、VMess、VLESS、Trojan、Shadowsocks、Hysteria2、TUIC、AnyTLS。
@@ -105,7 +105,7 @@ GOEXPERIMENT=jsonv2 go build -tags with_quic,with_utls -trimpath -o v2box .
 ./v2box server --config ./config.json
 ```
 
-复制 `config.example.json` 为 `config.json`，填写面板地址、节点 ID 和 API Key。QUIC 构建标签为 Hysteria2/TUIC 所必需。CI 运行协议连接、用户撤销、计数重试、限速及面板响应测试，并构建 Linux/macOS/Windows amd64/arm64 包。
+复制 `config.example.json` 为 `config.json`，填写面板地址、节点 ID 和 API Key。QUIC 构建标签为 Hysteria2/TUIC 所必需。CI 运行协议连接、用户撤销、计数重试、限速及面板响应测试，并构建 Linux/macOS/Windows amd64/arm64 包。 打包使用独立临时目录，避免夹带本地 `build_assets` 残留；每个平台上传前验证压缩包完整性、必需文件及 SHA-256。构建或收集必需文件失败时保留已有安装包。
 
 Reality/Vision 已加入本地 TLS 握手及数据转发测试。当前上游 sing-vmess 的 Vision 实现使用不兼容 checkptr 的 TLS 指针访问，并存在读写共享状态的竞态报告，因此该项单独以普通模式测试；其他后端测试使用 `-race`。这不代表 Vision 已通过竞态验证，生产使用前应做连接压力测试并跟进上游修复。
 
@@ -467,7 +467,7 @@ HTTP/DNS 证书按周期检查续期窗口；文件/远程/自签证书不自动
 
 支持多个独立后台在同一 IP、同一端口使用相同协议服务各自用户：VLESS、VMess、Trojan、Shadowsocks（AEAD 与 2022）、Hysteria2、TUIC、AnyTLS 和 Naive。每组使用一个实际监听器和合并认证表，每个用户仍按所属后台/节点执行限速、设备限制、额度、在线活动及流量上报。不同后台可使用相同用户 ID，不能使用相同有效认证凭据；UUID 大小写和 SS2022 派生密钥碰撞也会拒绝。冲突更新不提交限速状态，日志不打印凭据。
 
-默认不共享。先升级到包含 `shared-listener-v1` 的程序和配套管理脚本。组内协议、监听地址/端口、传输（含 WS/gRPC）、TLS/Reality、加密方式/服务端密钥、padding、路由/DNS/出站等必须一致。该功能不是不同协议的自动分流器。不同协议或不同配置应使用不同共享组，并规划可独立绑定的端口。
+默认不共享。先升级到包含 `shared-listener-v1` 的程序和配套管理脚本。组内协议、监听地址/端口、传输（含 WS/gRPC）、TLS/Reality、加密方式/服务端密钥、padding、路由/DNS/出站等必须一致。 共享核心日志级别沿用实际监听器创建时的设置；修改 `Log.Level` 后需在维护窗口重启 V2Box，使全部共享监听一致生效。非法日志级别会在配置准备阶段拒绝，保留原监听和连接。该功能不是不同协议的自动分流器。不同协议或不同配置应使用不同共享组，并规划可独立绑定的端口。
 
 使用普通 TLS 时，证书模式限 `file`（相同证书/密钥路径）或 `remote`（相同证书/密钥内容）；HTTP/DNS/self 模式不能加入，避免多个后台竞争证书更新。file 模式由外部统一续期，已有文件热更新机制继续适用。Reality 必须使用相同服务端身份和握手参数；无 TLS 的协议保留原有能力，不为共享监听自动改变加密设置。
 
