@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
@@ -141,6 +142,86 @@ func groupPing(t *testing.T, connection net.Conn) {
 	}
 	if string(result) != "still-active" {
 		t.Fatal("payload corrupted")
+	}
+}
+
+func TestNodeGroupOriginMigrationAndRollbackPreserveOtherPanelStream(t *testing.T) {
+	limiter.Init()
+	a := newGroupPanel(t, "b831381d-6324-4d53-ad4f-8cda48b30811", "existing-a-key")
+	b := newGroupPanel(t, "c831381d-6324-4d53-ad4f-8cda48b30822", "existing-b-key")
+	var oldApplied, newApplied atomic.Int64
+	observe := func(handler http.Handler, applied *atomic.Int64) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/api/v10/server/capabilities" {
+				body, _ := io.ReadAll(r.Body)
+				r.Body = io.NopCloser(strings.NewReader(string(body)))
+				var receipt struct{ Configuration struct{ State string } }
+				json.Unmarshal(body, &receipt)
+				if receipt.Configuration.State == "applied" {
+					applied.Add(1)
+				}
+			}
+			handler.ServeHTTP(w, r)
+		})
+	}
+	originalHandler := a.server.Config.Handler
+	a.server.Config.Handler = observe(originalHandler, &oldApplied)
+	alias := reloadTestPanel(t, observe(originalHandler, &newApplied))
+	defer alias.Close()
+	config := conf.New()
+	config.OutboundAllowCIDRs = []string{"127.0.0.0/8"}
+	config.NodeConfigs = []conf.NodeConfig{a.entry(t), b.entry(t)}
+	certPath := filepath.Join(config.NodeConfigs[0].CertificateDirectory, "existing.pem")
+	if err := os.MkdirAll(filepath.Dir(certPath), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(certPath, []byte("existing-certificate-preserved"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	original := config.NodeConfigs[0]
+	group := newNodeGroup(context.Background())
+	group.retry = 30 * time.Millisecond
+	defer group.Close()
+	if err := group.Apply(config); err != nil {
+		t.Fatal(err)
+	}
+	waitGroup(t, func() bool { return oldApplied.Load() > 0 && groupListening(b.port.Load()) })
+	echo, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer echo.Close()
+	go func() {
+		for {
+			c, e := echo.Accept()
+			if e != nil {
+				return
+			}
+			go func() { defer c.Close(); io.Copy(c, c) }()
+		}
+	}()
+	stream := groupStream(t, b, echo.Addr().(*net.TCPAddr).Port)
+	defer stream.Close()
+	config.NodeConfigs[0].APIHost = alias.URL
+	if err := group.Apply(config); err != nil {
+		t.Fatal(err)
+	}
+	waitGroup(t, func() bool { return newApplied.Load() > 0 })
+	groupPing(t, stream)
+	migratedStream := groupStream(t, a, echo.Addr().(*net.TCPAddr).Port)
+	migratedStream.Close()
+	before := oldApplied.Load()
+	config.NodeConfigs[0] = original
+	if err := group.Apply(config); err != nil {
+		t.Fatal(err)
+	}
+	waitGroup(t, func() bool { return oldApplied.Load() > before })
+	groupPing(t, stream)
+	if content, err := os.ReadFile(certPath); err != nil || string(content) != "existing-certificate-preserved" {
+		t.Fatal("origin migration altered certificate storage")
+	}
+	if config.NodeConfigs[0].Key != original.Key {
+		t.Fatal("origin migration rotated credentials")
 	}
 }
 func TestNodeGroupIndependentStartupReloadRecoveryAndRemoval(t *testing.T) {
