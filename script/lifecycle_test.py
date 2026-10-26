@@ -116,6 +116,8 @@ esac
         self.write(self.lib/'v2box', "#!/bin/sh\necho '" + capabilities + "'\n")
         source = Path(__file__).with_name('node-credentials.py').read_text()
         source = source.replace('"/etc/v2box/config.json"', repr(str(self.config/'config.json')))
+        # Match the shell fixture's simulated root identity only in this private copy.
+        source = source.replace('if os.geteuid() != 0:', 'if False:')
         self.write(self.lib/'node-credentials.py', source)
         self.active.unlink()
         result = subprocess.run(['bash', str(self.root/'usr/local/bin/v2box'), 'share-listener', 'public', '1'], env=self.env, capture_output=True, text=True)
