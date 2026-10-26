@@ -14,7 +14,7 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
-      - run: GOEXPERIMENT=jsonv2 go test -tags with_quic,with_utls ./...
+      - run: GOEXPERIMENT=jsonv2 go test -tags with_quic,with_utls ./... github.com/sagernet/fswatch
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3

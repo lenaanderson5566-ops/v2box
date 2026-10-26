@@ -336,3 +336,106 @@ func TestLegacyCertificateMigrationVerifiesIdentity(t *testing.T) {
 		t.Fatal("legacy pair was overwritten")
 	}
 }
+
+func TestRenewalDueBoundaryAndFreshCertificateSkip(t *testing.T) {
+	dir := t.TempDir()
+	certPath, keyPath := filepath.Join(dir, "cert.pem"), filepath.Join(dir, "key.pem")
+	if err := generateSelfSslCertificate("renew.example.test", certPath, keyPath); err != nil {
+		t.Fatal(err)
+	}
+	original, err := os.ReadFile(certPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyPEM, err := os.ReadFile(keyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certBlock, _ := pem.Decode(original)
+	keyBlock, _ := pem.Decode(keyPEM)
+	template, err := x509.ParseCertificate(certBlock.Bytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := x509.ParsePKCS1PrivateKey(keyBlock.Bytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name      string
+		remaining time.Duration
+		due       bool
+	}{
+		{"fresh", 90 * 24 * time.Hour, false}, {"outside-renewal-window", 31*24*time.Hour + time.Hour, false},
+		{"renewal-window", 30 * 24 * time.Hour, true}, {"near-expiry", time.Hour, true}, {"expired", -time.Hour, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			leaf := *template
+			leaf.NotBefore = time.Now().Add(-2 * time.Hour)
+			leaf.NotAfter = time.Now().Add(tc.remaining)
+			der, err := x509.CreateCertificate(rand.Reader, &leaf, &leaf, &key.PublicKey, key)
+			if err != nil {
+				t.Fatal(err)
+			}
+			encoded := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+			due, err := (&Lego{}).CheckCert(encoded)
+			if err != nil || due != tc.due {
+				t.Fatalf("renewal decision: due=%v error=%v", due, err)
+			}
+			if !tc.due {
+				if err := os.WriteFile(certPath, encoded, 0644); err != nil {
+					t.Fatal(err)
+				}
+				info := &panel.CertInfo{CertMode: "http", CertDomain: "renew.example.test", CertFile: certPath, KeyFile: keyPath}
+				controller := &Controller{info: &panel.NodeInfo{Common: &panel.CommonNode{CertInfo: info}}}
+				if err := controller.renewCertTask(context.Background()); err != nil {
+					t.Fatal(err)
+				}
+				after, _ := os.ReadFile(certPath)
+				afterKey, _ := os.ReadFile(keyPath)
+				if string(after) != string(encoded) || string(afterKey) != string(keyPEM) {
+					t.Fatal("fresh certificate was replaced")
+				}
+				if _, err := os.Stat(acmeStatePath(info)); !os.IsNotExist(err) {
+					t.Fatal("fresh certificate consumed an ACME attempt")
+				}
+			}
+		})
+	}
+	if _, err := (&Lego{}).CheckCert([]byte("invalid certificate")); err == nil {
+		t.Fatal("invalid renewal input accepted")
+	}
+}
+
+func TestIncompleteCertificatePairNeverReissuesOrOverwrites(t *testing.T) {
+	for _, mode := range []string{"file", "http", "dns", "self"} {
+		for _, existing := range []string{"certificate", "key"} {
+			t.Run(mode+"/"+existing, func(t *testing.T) {
+				dir := t.TempDir()
+				info := &panel.CertInfo{CertMode: mode, CertDomain: "partial.example.test", CertFile: filepath.Join(dir, "cert.pem"), KeyFile: filepath.Join(dir, "key.pem")}
+				present, missing := info.CertFile, info.KeyFile
+				if existing == "key" {
+					present, missing = missing, present
+				}
+				retained := []byte("operator-owned-fixture-" + existing)
+				if err := os.WriteFile(present, retained, 0600); err != nil {
+					t.Fatal(err)
+				}
+				c := &Controller{info: &panel.NodeInfo{Common: &panel.CommonNode{CertInfo: info}}}
+				if err := c.requestCert(); err == nil || !strings.Contains(err.Error(), "incomplete certificate/key pair") {
+					t.Fatalf("partial certificate accepted: %v", err)
+				}
+				got, _ := os.ReadFile(present)
+				if string(got) != string(retained) {
+					t.Fatal("operator file overwritten")
+				}
+				if _, err := os.Stat(missing); !os.IsNotExist(err) {
+					t.Fatal("missing half was silently generated")
+				}
+				if _, err := os.Stat(acmeStatePath(info)); !os.IsNotExist(err) {
+					t.Fatal("partial pair consumed an ACME attempt")
+				}
+			})
+		}
+	}
+}

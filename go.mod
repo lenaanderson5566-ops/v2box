@@ -280,3 +280,6 @@ require (
 	gopkg.in/yaml.v2 v2.4.0 // indirect
 	lukechampine.com/blake3 v1.3.0 // indirect
 )
+
+// Serialize per-watcher file callbacks during certificate/key hot updates.
+replace github.com/sagernet/fswatch => ./internal/fswatch

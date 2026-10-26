@@ -416,6 +416,49 @@ esac
         self.assertEqual(r.returncode,0,r.stderr)
         self.assertNotIn('unnecessary IP probe',r.stderr)
 
+    def test_fresh_install_creates_private_configuration_and_starts_with_explicit_identity(self):
+        (self.config/'config.json').unlink();(self.lib/'v2box').unlink()
+        (self.root/'etc/systemd/system/v2box.service').unlink();self.active.unlink()
+        r=self.run_script(self.installer,'v-test','--api-host','https://fresh.example.test','--node-id','9','--api-key','fresh-fixture-key')
+        self.assertEqual(r.returncode,0,r.stderr)
+        document=json.loads((self.config/'config.json').read_text())
+        self.assertEqual(document['Nodes'][0]['NodeID'],9);self.assertEqual(document['Nodes'][0]['ApiHost'],'https://fresh.example.test')
+        self.assertEqual((self.config/'config.json').stat().st_mode&0o777,0o600)
+        self.assertTrue(self.active.exists());self.assertIn('ExecStart=',(self.root/'etc/systemd/system/v2box.service').read_text())
+        self.assertNotIn('fresh-fixture-key',r.stdout+r.stderr)
+    def test_fresh_example_install_never_starts_unenrolled_service(self):
+        (self.config/'config.json').unlink();(self.lib/'v2box').unlink()
+        (self.root/'etc/systemd/system/v2box.service').unlink();self.active.unlink()
+        self.package(overrides={'config.example.json':json.dumps({'Nodes':[{'ApiHost':'https://panel.example.com','ApiKey':'REPLACE_ME','NodeID':1}]})})
+        r=self.run_script(self.installer,'v-test')
+        self.assertEqual(r.returncode,0,r.stderr);self.assertFalse(self.active.exists())
+        self.assertNotIn('restart',(self.root/'service-calls').read_text())
+    def test_reinstall_arguments_never_replace_existing_multi_panel_configuration(self):
+        document={'OperatorSetting':'retain','Nodes':[{'ApiHost':'https://a.example.test','NodeID':3,'ApiKey':'a-fixture-key'},{'ApiHost':'https://b.example.test','NodeID':3,'ApiKey':'b-fixture-key'}]}
+        self.original_config=json.dumps(document).encode();(self.config/'config.json').write_bytes(self.original_config)
+        r=self.run_script(self.installer,'v-test','--api-host','https://new.example.test','--node-id','4','--api-key','new-fixture-key')
+        self.assertEqual(r.returncode,0,r.stderr);self.preserved()
+    def test_uninstall_then_reinstall_preserves_multi_panel_certificates_guards_and_reporting(self):
+        document={'OperatorSetting':'retain','Nodes':[{'ApiHost':'https://a.example.test','NodeID':3,'ApiKey':'a-fixture-key'},{'ApiHost':'https://b.example.test','NodeID':3,'ApiKey':'b-fixture-key'}]}
+        self.original_config=json.dumps(document).encode();(self.config/'config.json').write_bytes(self.original_config)
+        report=self.root/'etc/node-network';report.mkdir()
+        (report/'cloudflare.json').write_text(json.dumps({'mode':'multi','targets':[{'mode':'panel','panel_url':'https://a.example.test','token':'a-report-fixture'},{'mode':'panel','panel_url':'https://b.example.test','token':'b-report-fixture'}]}))
+        for panel in ('a','b'):
+            cert=self.config/'panels'/panel;cert.mkdir(parents=True)
+            for name in ('cert.pem','key.pem','acme-state.json','user.json'):(cert/name).write_text(panel+'-'+name)
+        sentinel={p:p.read_bytes() for p in self.config.rglob('*') if p.is_file() and not p.name.startswith('.')}
+        reports=(report/'cloudflare.json').read_bytes()
+        for cycle in range(2):
+            wrapper=self.root/'usr/local/bin/v2box'
+            r=self.run_script(wrapper,'uninstall','--yes')
+            self.assertEqual(r.returncode,0,r.stderr);self.assertFalse(self.active.exists());self.assertFalse((self.lib/'v2box').exists())
+            self.assertEqual((report/'cloudflare.json').read_bytes(),reports)
+            for path,value in sentinel.items():self.assertEqual(path.read_bytes(),value)
+            refused=self.install();self.assertNotEqual(refused.returncode,0)
+            r=self.run_script(self.installer,'v-test')
+            self.assertEqual(r.returncode,0,r.stderr);self.assertTrue(self.active.exists())
+            for path,value in sentinel.items():self.assertEqual(path.read_bytes(),value)
+            self.assertEqual((report/'cloudflare.json').read_bytes(),reports);self.preserved()
     def test_failed_first_configuration_write_is_retryable(self):
         (self.config/'config.json').unlink()
         (self.root/'active').unlink()

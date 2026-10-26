@@ -20,7 +20,7 @@ jobs:
         with:
           go-version-file: go.mod
       - run: sudo apt-get update -qq && sudo apt-get install -y -qq jq unzip zip openssl
-      - run: go test -race -tags with_quic,with_utls ./...
+      - run: go test -race -tags with_quic,with_utls ./... github.com/sagernet/fswatch
       # Vision's upstream unsafe TLS access and shared filter state are not race-clean.
       - run: go test -tags with_quic,with_utls ./core -run TestVLESSRealityVision -count=1
       - run: go vet -tags with_quic,with_utls ./...

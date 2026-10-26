@@ -5,6 +5,7 @@ binary. They retain the original GPL-3.0-or-later terms. Source snapshots:
 
 | Directory | Upstream |
 | --- | --- |
+| fswatch | SagerNet/fswatch v0.1.2 |
 | inbound, transport/trojan | SagerNet/sing-box v1.14.3 |
 | transport/vmess | SagerNet/sing-vmess 9b95ab8c9478 (go.mod pinned pseudo-version) |
 | transport/quic | SagerNet/sing-quic 75c3ac4fa12b (go.mod pinned pseudo-version), TUIC and Hysteria2 packages |
@@ -53,3 +54,9 @@ blocking updates on protocol callbacks. Failed validation does not publish a tab
 When upgrading sing-box or its transport dependencies, compare these snapshots
 with upstream and reapply the concurrency/identity changes. Run the full race
 suite and the separate Reality/Vision interoperability test before release.
+
+The fswatch module is replaced locally through go.mod. Its file callbacks are
+serialized per watcher so certificate and key events cannot concurrently mutate
+sing-box TLS state. Separate watchers remain independent; debounce, cancellation
+and public APIs are retained. Upstream tests and the certificate handshake/race
+regression accompany this small adaptation.

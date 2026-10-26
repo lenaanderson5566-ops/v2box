@@ -3,8 +3,11 @@ package core
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	panel "github.com/lenaanderson5566-ops/v2box/api/v2board"
 	"github.com/lenaanderson5566-ops/v2box/conf"
 	"github.com/lenaanderson5566-ops/v2box/limiter"
@@ -12,6 +15,9 @@ import (
 	M "github.com/sagernet/sing/common/metadata"
 	"io"
 	"net"
+	"os"
+	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -116,12 +122,28 @@ func TestUDPAccounting(t *testing.T) {
 			v.SetTargetPolicy(n.Tag, panel.TargetPolicy{Enabled: true, Version: "udp", LeaseSeconds: 120})
 			exchangeUDP(t, clientBox(t, n, testUUID), echo.LocalAddr())
 			traffic := awaitTraffic(t, v, n.Tag, int64(len("udp-accounting-echo")))
-			targets := v.TargetBatch(n.Tag)
-			if targets == nil || len(targets.Records) != 1 || targets.Records[0].Target != "127.0.0.1" || targets.Records[0].UploadBytes != traffic[0].Upload || targets.Records[0].DownloadBytes != traffic[0].Download {
-				t.Fatalf("UDP target mismatch: %+v", targets)
-			}
 			if len(traffic) != 1 || traffic[0].Upload == 0 || traffic[0].Download == 0 {
 				t.Fatalf("UDP traffic missing: %+v", traffic)
+			}
+			// Traffic and target counters publish separately; a valid frozen batch
+			// may contain only the upload. Acknowledge and sum subsequent batches.
+			var up, down int64
+			deadline := time.Now().Add(2 * time.Second)
+			for time.Now().Before(deadline) && (up < traffic[0].Upload || down < traffic[0].Download) {
+				if targets := v.TargetBatch(n.Tag); targets != nil {
+					if len(targets.Records) != 1 || targets.Records[0].Target != "127.0.0.1" || targets.Records[0].UserID != 42 {
+						t.Fatalf("UDP target mismatch: %+v", targets)
+					}
+					up += targets.Records[0].UploadBytes
+					down += targets.Records[0].DownloadBytes
+					v.AckTargets(n.Tag, targets.BatchID, true)
+				}
+				if up < traffic[0].Upload || down < traffic[0].Download {
+					time.Sleep(time.Millisecond)
+				}
+			}
+			if up != traffic[0].Upload || down != traffic[0].Download {
+				t.Fatalf("UDP target totals %d/%d differ from traffic %+v", up, down, traffic)
 			}
 		})
 	}
@@ -253,5 +275,148 @@ func TestDomainBlockStillInspectsIPConnections(t *testing.T) {
 				t.Fatal("domain block bypassed for IP destination")
 			}
 		})
+	}
+}
+
+// Exercise the actual sing-box file watcher and TLS handshakes, including
+// repeated atomic replacement and preservation of established proxy streams.
+func TestTLSCertificateRotationPreservesOtherNodesAndExistingConnections(t *testing.T) {
+	limiter.Init()
+	echo := echoServer(t)
+	makeNode := func(tag string) *panel.NodeInfo {
+		n := testNode(t, "vless")
+		n.Tag = tag
+		n.Security = panel.Tls
+		cert := testCertificate(t)
+		cert.CertMode = "file"
+		cert.CertFile = filepath.Join(t.TempDir(), "cert.pem")
+		cert.KeyFile = filepath.Join(filepath.Dir(cert.CertFile), "key.pem")
+		if err := os.WriteFile(cert.CertFile, []byte(cert.TlsCert), 0644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(cert.KeyFile, []byte(cert.TlsKey), 0600); err != nil {
+			t.Fatal(err)
+		}
+		n.Common.CertInfo = cert
+		startTestNode(t, n)
+		return n
+	}
+	a, b := makeNode("certificate-a"), makeNode("certificate-b")
+	old := *a.Common.CertInfo
+	next := testCertificate(t)
+	bCert, _ := os.ReadFile(b.Common.CertInfo.CertFile)
+	bKey, _ := os.ReadFile(b.Common.CertInfo.KeyFile)
+	roots := x509.NewCertPool()
+	for _, cert := range []string{old.TlsCert, next.TlsCert, b.Common.CertInfo.TlsCert} {
+		if !roots.AppendCertsFromPEM([]byte(cert)) {
+			t.Fatal("invalid fixture root")
+		}
+	}
+	peek := func(n *panel.NodeInfo) ([]byte, error) {
+		conn, err := tls.DialWithDialer(&net.Dialer{Timeout: time.Second}, "tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(n.Common.ServerPort)), &tls.Config{RootCAs: roots, ServerName: "localhost"})
+		if err != nil {
+			return nil, err
+		}
+		defer conn.Close()
+		return conn.ConnectionState().PeerCertificates[0].Raw, nil
+	}
+	connect := func(n *panel.NodeInfo) net.Conn {
+		box := clientBox(t, n, testUUID)
+		out, _ := box.Outbound().Outbound("proxy")
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		conn, err := out.DialContext(ctx, "tcp", M.ParseSocksaddr(echo.Addr().String()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { conn.Close() })
+		return conn
+	}
+	streamA, streamB := connect(a), connect(b)
+	ping := func(conn net.Conn) {
+		t.Helper()
+		conn.SetDeadline(time.Now().Add(3 * time.Second))
+		payload := []byte("certificate-rotation-long-stream")
+		if _, err := conn.Write(payload); err != nil {
+			t.Fatal(err)
+		}
+		got := make([]byte, len(payload))
+		if _, err := io.ReadFull(conn, got); err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(got, payload) {
+			t.Fatal("proxy stream corrupted")
+		}
+	}
+	ping(streamA)
+	ping(streamB)
+	replace := func(name, data string) {
+		t.Helper()
+		staged, err := os.CreateTemp(filepath.Dir(name), ".certificate-update-*")
+		if err != nil {
+			t.Fatal(err)
+		}
+		temp := staged.Name()
+		defer os.Remove(temp)
+		if err = staged.Chmod(0600); err != nil {
+			staged.Close()
+			t.Fatal(err)
+		}
+		if _, err = staged.WriteString(data); err != nil {
+			staged.Close()
+			t.Fatal(err)
+		}
+		if err = staged.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err = os.Rename(temp, name); err != nil {
+			t.Fatal(err)
+		}
+	}
+	waitCertificate := func(expected string) {
+		t.Helper()
+		block, _ := pem.Decode([]byte(expected))
+		deadline := time.Now().Add(10 * time.Second)
+		for time.Now().Before(deadline) {
+			got, err := peek(a)
+			if err == nil && bytes.Equal(got, block.Bytes) {
+				return
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		t.Fatal("new certificate was not served without restarting")
+	}
+	replace(old.KeyFile, next.TlsKey)
+	replace(old.CertFile, next.TlsCert)
+	waitCertificate(next.TlsCert)
+	ping(streamA)
+	ping(streamB)
+	// Invalid/partial replacement must retain the last usable in-memory pair.
+	replace(old.KeyFile, "invalid fixture key")
+	replace(old.CertFile, "invalid fixture certificate")
+	nextBlock, _ := pem.Decode([]byte(next.TlsCert))
+	for i := 0; i < 10; i++ {
+		got, err := peek(a)
+		if err != nil || !bytes.Equal(got, nextBlock.Bytes) {
+			t.Fatalf("invalid files replaced the usable certificate: %v", err)
+		}
+		ping(streamA)
+		ping(streamB)
+		time.Sleep(50 * time.Millisecond)
+	}
+	replace(old.KeyFile, old.TlsKey)
+	replace(old.CertFile, old.TlsCert)
+	waitCertificate(old.TlsCert)
+	ping(streamA)
+	ping(streamB)
+	got, err := peek(b)
+	block, _ := pem.Decode(bCert)
+	if err != nil || !bytes.Equal(got, block.Bytes) {
+		t.Fatalf("other panel certificate changed: %v", err)
+	}
+	currentCert, _ := os.ReadFile(b.Common.CertInfo.CertFile)
+	currentKey, _ := os.ReadFile(b.Common.CertInfo.KeyFile)
+	if !bytes.Equal(currentCert, bCert) || !bytes.Equal(currentKey, bKey) {
+		t.Fatal("other panel certificate files changed")
 	}
 }

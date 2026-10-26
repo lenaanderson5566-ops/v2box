@@ -6,7 +6,7 @@ The backend embeds SagerNet/sing-box v1.14.3 (GPL-3.0-or-later). Its copyright a
 
 Other Go dependencies retain their respective licenses; their exact versions are recorded in go.mod and go.sum.
 
-Local adaptations of sing-box, sing-vmess, sing-quic and sing-anytls are included
+Local adaptations of sing-box, sing-vmess, sing-quic, sing-anytls and fswatch are included
 under internal/. Their origins and modifications are documented in
 internal/README.md and their license/copyright texts in internal/licenses/.
 These files are part of the corresponding source and their notices accompany

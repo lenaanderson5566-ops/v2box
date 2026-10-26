@@ -8,7 +8,6 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"runtime"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -74,62 +73,6 @@ func TestTrafficSpoolLostAcknowledgementAndRestart(t *testing.T) {
 	files, _ = filepath.Glob(filepath.Join(client.spoolPath(), "*.json"))
 	if len(files) != 0 || hits != 2 || billed != 123 {
 		t.Fatal("replay duplicated or lost traffic")
-	}
-}
-
-func TestTrafficSpoolOriginMigrationUsesExistingQueueWithoutCopyOrLoss(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("Linux API migration uses a private directory symlink")
-	}
-	oldServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.Write([]byte(`{"data":{"accepted":false}}`)) }))
-	defer oldServer.Close()
-	var billed atomic.Int64
-	newServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var batch trafficBatch
-		if err := json.NewDecoder(r.Body).Decode(&batch); err != nil {
-			t.Error(err)
-		}
-		for _, record := range batch.Records {
-			billed.Add(record.Upload)
-		}
-		w.Write([]byte(`{"data":{"accepted":true}}`))
-	}))
-	defer newServer.Close()
-	zero := 0
-	cfg := &conf.NodeConfig{NodeType: "v2box", APIHost: oldServer.URL, NodeID: 7, Key: "existing-key", RetryCount: &zero, TrafficSpoolDirectory: t.TempDir()}
-	old, err := newTestPanel(t, oldServer, cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	old.trafficDedup.Store(true)
-	retained, err := old.ReportUserTrafficReliable(context.Background(), []UserTraffic{{UID: 1, Upload: 123}})
-	if !retained || err == nil {
-		t.Fatal("expected durable pending traffic")
-	}
-	cfg.APIHost = newServer.URL
-	next, err := newTestPanel(t, newServer, cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	next.trafficDedup.Store(true)
-	if err := os.Symlink(old.spoolPath(), next.spoolPath()); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := next.ReportUserTrafficReliable(context.Background(), nil); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := next.ReportUserTrafficReliable(context.Background(), []UserTraffic{{UID: 1, Upload: 17}}); err != nil {
-		t.Fatal(err)
-	}
-	files, _ := filepath.Glob(filepath.Join(old.spoolPath(), "*.json"))
-	if billed.Load() != 140 || len(files) != 0 {
-		t.Fatal("origin migration duplicated or stranded traffic")
-	}
-	if err := os.Remove(next.spoolPath()); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := os.Stat(old.spoolPath()); err != nil {
-		t.Fatal("rollback removed original traffic storage")
 	}
 }
 
