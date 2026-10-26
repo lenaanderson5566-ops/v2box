@@ -17,11 +17,13 @@ import (
 )
 
 func startTestNode(t *testing.T, n *panel.NodeInfo) *V2Core {
+	return startTestNodeWithConfig(t, n, testConf())
+}
+func startTestNodeWithConfig(t *testing.T, n *panel.NodeInfo, cfg *conf.Conf) *V2Core {
 	t.Helper()
 	users := []panel.UserInfo{{Id: 42, Uuid: testUUID}}
 	limiter.AddLimiter(n.Type, n.Tag, users, nil)
 	t.Cleanup(func() { limiter.DeleteLimiter(n.Tag) })
-	cfg := conf.New()
 	cfg.LogConfig.Level = "error"
 	v := New(cfg)
 	t.Cleanup(func() { v.Close() })

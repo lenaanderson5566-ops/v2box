@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Public IP discovery and opt-in Cloudflare DDNS; no third-party Python packages."""
 import argparse
+import hashlib
+from concurrent.futures import ThreadPoolExecutor
 import getpass
 import ipaddress
 import json
@@ -143,6 +145,8 @@ def validate_report(config):
     parsed = urllib.parse.urlsplit(url)
     if parsed.scheme != 'https' or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment or parsed.path not in ('', '/'):
         raise NetworkError('Use the HTTPS panel origin, for example https://panel.example.com', True)
+    if config.get('server_id') is not None and (type(config['server_id']) is not int or config['server_id'] <= 0):
+        raise NetworkError('Invalid server identity', True)
     if not re.fullmatch(r'[a-f0-9]{64}', config.get('token', '')):
         raise NetworkError('Invalid node report key', True)
     if config.get('family') not in ('ipv4', 'ipv6', 'dual'):
@@ -189,6 +193,93 @@ def write_private(path, data):
         temp.unlink(missing_ok=True)
 
 
+def targets(document):
+    if document.get('mode') != 'multi':
+        return [document]
+    entries = document.get('targets')
+    if not isinstance(entries, list) or not entries or len(entries) > 64 or not all(isinstance(item, dict) and item.get('mode') != 'multi' for item in entries):
+        raise NetworkError('Invalid network reporting targets', True)
+    keys = [target_key(item) for item in entries]
+    if len(keys) != len(set(keys)):
+        raise NetworkError('Duplicate network reporting identity', True)
+    return entries
+
+
+def target_key(config):
+    identity = ('panel', validate_report(config)['panel_url'], config.get('server_id', '')) if config.get('mode') == 'panel' else ('dns', validate(config)['zone_id'], validate(config)['domain'])
+    return hashlib.sha256(json.dumps(identity, separators=(',', ':')).encode()).hexdigest()[:24]
+
+
+def fingerprint(config):
+    return hashlib.sha256(json.dumps(config, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+
+
+def merge_target(document, config):
+    entries = targets(document) if document else []
+    key = target_key(config)
+    same_panel = [item for item in entries if config.get('mode') == item.get('mode') == 'panel' and config['panel_url'] == item.get('panel_url', '').rstrip('/')]
+    if not config.get('server_id') and len(same_panel) > 1:
+        raise NetworkError('Several server identities exist on this panel; specify --server-id', True)
+    # An old panel target had no server ID. Adopt it when installing its scoped ID.
+    entries = [item for item in entries if target_key(item) != key and not (
+        config.get('mode') == item.get('mode') == 'panel' and
+        config['panel_url'] == item.get('panel_url', '').rstrip('/') and
+        (not item.get('server_id') or not config.get('server_id')))]
+    entries.append(config)
+    if len(entries) > 64:
+        raise NetworkError('Too many network reporting targets', True)
+    return entries[0] if len(entries) == 1 else {'mode': 'multi', 'targets': entries}
+
+
+def save_target(config):
+    if CONFIG.is_symlink():
+        raise NetworkError('Refusing symlinked network configuration', True)
+    previous = json.loads(CONFIG.read_text()) if CONFIG.exists() else None
+    old_state = json.loads(STATE.read_text()) if STATE.exists() else {}
+    merged = merge_target(previous, config)
+    if merged.get('mode') == 'multi':
+        states = dict(old_state.get('targets', {}))
+        if previous and previous.get('mode') != 'multi':
+            states[target_key(previous)] = dict(old_state, fingerprint=fingerprint(previous))
+        states.pop(target_key(config), None)  # Only this credential/configuration resets.
+        states = {target_key(item): states.get(target_key(item), {}) for item in targets(merged)}
+        state = {'targets': states}
+    else:
+        state = {}
+    write_private(CONFIG, merged)
+    write_private(STATE, state)
+
+
+def run_multiple(document, state):
+    if state.get('disabled'):
+        return
+    entries = targets(document)
+    cached = state.get('targets', {})
+    def update(config):
+        key = target_key(config)
+        signature = fingerprint(config)
+        previous = cached.get(key, {})
+        if previous.get('fingerprint') != signature:
+            previous = {}
+        if previous.get('paused') or time.time() < previous.get('next_run', 0):
+            return key, previous, False
+        try:
+            execute(Client(), config)
+        except NetworkError as error:
+            return key, {'fingerprint': signature, 'paused': error.permanent, 'next_run': time.time() + error.retry_after}, True
+        return key, {'fingerprint': signature}, False
+    failures = 0
+    states = {}
+    # Slow or denied backends never prevent other targets from being contacted.
+    with ThreadPoolExecutor(max_workers=min(8, len(entries))) as pool:
+        for key, result, failed in pool.map(update, entries):
+            states[key] = result
+            failures += int(failed)
+    write_private(STATE, {'targets': states})
+    if failures:
+        raise NetworkError('%d network reporting target(s) failed; independent backoff saved' % failures)
+
+
 def run():
     import fcntl
     STATE.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -198,15 +289,18 @@ def run():
         except BlockingIOError:
             return
         state = json.loads(STATE.read_text()) if STATE.exists() else {}
+        if CONFIG.is_symlink() or not CONFIG.is_file() or CONFIG.stat().st_mode & 0o077:
+            raise NetworkError('Network configuration must be a private regular file', True)
+        document = json.loads(CONFIG.read_text())
+        if document.get('mode') == 'multi':
+            return run_multiple(document, state)
         if state.get('paused'):
             print('DDNS paused after configuration/authentication failure; reconfigure node-network to resume')
             return
         if time.time() < state.get('next_run', 0):
             return
         try:
-            if CONFIG.stat().st_mode & 0o077:
-                raise NetworkError('DDNS configuration must have mode 600', True)
-            execute(Client(), json.loads(CONFIG.read_text()))
+            execute(Client(), document)
         except NetworkError as error:
             write_private(STATE, {'paused': error.permanent, 'next_run': time.time() + error.retry_after})
             raise
@@ -236,13 +330,17 @@ def schedule(enabled):
 
 def main():
     parser = argparse.ArgumentParser(description='Node public IP and optional Cloudflare DDNS (DNS-only records)')
-    parser.add_argument('action', choices=['ip', 'configure', 'report-configure', 'run', 'disable', 'status'])
+    parser.add_argument('action', choices=['capabilities', 'ip', 'configure', 'report-configure', 'run', 'disable', 'status'])
     parser.add_argument('--panel-url', default='')
     parser.add_argument('--domain', default='')
+    parser.add_argument('--server-id', type=int)
     parser.add_argument('--zone-id', default='')
     parser.add_argument('--token-file', type=Path)
     parser.add_argument('--family', choices=['ipv4', 'ipv6', 'dual'], default='ipv4')
     args = parser.parse_args()
+    if args.action == 'capabilities':
+        print(json.dumps({'features':['report-multi-target-v1']}))
+        return 0
     if args.action == 'ip':
         detected = False
         for typ in ['A', 'AAAA']:
@@ -261,6 +359,9 @@ def main():
             panel = args.panel_url or input('HTTPS panel origin: ').strip()
             token = args.token_file.read_text().strip() if args.token_file else getpass.getpass('Node report key: ').strip()
             config = validate_report({'panel_url': panel, 'token': token, 'family': args.family})
+            if args.server_id is not None:
+                if args.server_id <= 0: raise NetworkError('Invalid server identity', True)
+                config['server_id'] = args.server_id
         else:
             domain = args.domain or input('DNS hostname: ').strip()
             zone = args.zone_id or input('Cloudflare Zone ID: ').strip()
@@ -279,8 +380,7 @@ def main():
             INSTALLED.chmod(0o755)
             Path('/usr/local/bin/node-network').write_text('#!/bin/sh\nexec /usr/bin/env python3 /usr/local/lib/node-network/node-network.py "$@"\n')
             Path('/usr/local/bin/node-network').chmod(0o755)
-            write_private(CONFIG, config)
-            write_private(STATE, {})
+            save_target(config)
             schedule(True)
             print('Node network updates enabled; checks run every five minutes.')
     elif args.action == 'run':
@@ -291,14 +391,15 @@ def main():
         STATE.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         with open(STATE.parent / 'lock', 'w') as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
-            write_private(STATE, {'paused': True})
+            write_private(STATE, {'paused': True, 'disabled': True})
         print('DDNS disabled. Existing DNS records have been retained.')
     else:
         if not CONFIG.exists():
             print('DDNS is not configured')
         else:
             config = json.loads(CONFIG.read_text())
-            print('Domain: %s; family: %s' % (config.get('domain', config.get('panel_url', '')), config['family']))
+            for entry in targets(config):
+                print('Target %s: %s; family: %s' % (target_key(entry), entry.get('domain', entry.get('panel_url', '')), entry['family']))
             print('State: ' + (STATE.read_text() if STATE.exists() else '{}'))
     return 0
 

@@ -35,6 +35,9 @@ func buildOptions(n *panel.NodeInfo, users []panel.UserInfo, c *conf.Conf) (opti
 	if err = buildRoutes(config, n); err != nil {
 		return options, err
 	}
+	if err = restrictOutboundDestinations(config, c.OutboundAllowCIDRs); err != nil {
+		return options, err
+	}
 	raw, err := json.Marshal(config)
 	if err != nil {
 		return options, err

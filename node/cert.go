@@ -21,7 +21,7 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-func (c *Controller) renewCertTask(_ context.Context) error {
+func (c *Controller) renewCertTask(ctx context.Context) error {
 	cert := c.info.Common.CertInfo
 	pem, err := os.ReadFile(cert.CertFile)
 	if err != nil {
@@ -34,13 +34,7 @@ func (c *Controller) renewCertTask(_ context.Context) error {
 	if !due {
 		return nil
 	}
-	err = guardedACME(cert, func() error {
-		l, err := NewLego(cert)
-		if err != nil {
-			return err
-		}
-		return l.RenewCert()
-	})
+	err = runACME(ctx, cert, true)
 	if err != nil {
 		log.WithField("tag", c.tag).WithError(err).Warn("Certificate renewal paused or failed; existing certificate retained")
 	}
@@ -95,6 +89,13 @@ func validateCertificate(certPEM, keyPEM []byte, domain string, public, legacyCN
 }
 
 func (c *Controller) requestCert() error {
+	return c.requestCertContext(context.Background())
+}
+
+func (c *Controller) requestCertContext(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if c.certPrepared {
 		return nil
 	}
@@ -104,7 +105,7 @@ func (c *Controller) requestCert() error {
 		if transition.Domain != cert.CertDomain {
 			return fmt.Errorf("certificate transition identity mismatch")
 		}
-		if err := verifyTransitionDNS(transition); err != nil {
+		if err := verifyTransitionDNSContext(ctx, transition); err != nil {
 			return err
 		}
 	}
@@ -115,6 +116,24 @@ func (c *Controller) requestCert() error {
 		if cert.CertFile == "" || cert.KeyFile == "" {
 			return fmt.Errorf("certificate and key paths are required")
 		}
+		// Adopt a legacy pair only if its identity and validity match this node.
+		// Never modify a shared legacy pair or copy another panel's certificate.
+		if !file.IsExist(cert.CertFile) && !file.IsExist(cert.KeyFile) && cert.LegacyCertFile != "" && cert.LegacyKeyFile != "" {
+			oldCert, e1 := os.ReadFile(cert.LegacyCertFile)
+			oldKey, e2 := os.ReadFile(cert.LegacyKeyFile)
+			if e1 == nil && e2 == nil {
+				if _, err := validateCertificate(oldCert, oldKey, cert.CertDomain, cert.CertMode != "self", false); err == nil {
+					if err := (&Lego{config: cert}).writeCert(&certificate.Resource{Certificate: oldCert, PrivateKey: oldKey}); err != nil {
+						return err
+					}
+				}
+			}
+		}
+		if cert.CertMode == "dns" || cert.CertMode == "http" {
+			if err := inheritACMEGuard(cert); err != nil {
+				return err
+			}
+		}
 		exists := file.IsExist(cert.CertFile) && file.IsExist(cert.KeyFile)
 		if !exists {
 			// A partial pair must never be overwritten silently.
@@ -123,13 +142,7 @@ func (c *Controller) requestCert() error {
 			}
 			switch cert.CertMode {
 			case "dns", "http":
-				if err := guardedACME(cert, func() error {
-					l, e := NewLego(cert)
-					if e != nil {
-						return e
-					}
-					return l.CreateCert()
-				}); err != nil {
+				if err := runACME(ctx, cert, false); err != nil {
 					return err
 				}
 			case "self":

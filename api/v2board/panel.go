@@ -25,6 +25,8 @@ type Client struct {
 	trafficDrainMu        sync.Mutex
 	trafficDedup          atomic.Bool
 	budgetSupported       atomic.Bool
+	certificateDirectory  string
+	nodeType              string
 	trafficSpoolDirectory string
 	v10                   bool
 	landingPage           conf.LandingPage
@@ -103,6 +105,8 @@ func New(c *conf.NodeConfig) (*Client, error) {
 
 	return &Client{
 		v10:                   version == "v10",
+		certificateDirectory:  c.CertificateDirectory,
+		nodeType:              nodeType,
 		trafficSpoolDirectory: c.TrafficSpoolDirectory,
 		landingPage:           c.LandingPage,
 		client:                client,

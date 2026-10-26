@@ -42,13 +42,14 @@ class LifecycleTest(unittest.TestCase):
             # All mutating absolute paths below are redirected into the sandbox;
             # allow this copy to exercise root-only branches as an ordinary CI user.
             source = source.replace('$EUID', '0')
-            for prefix in ['/etc/v2box', '/etc/node-network', '/etc/systemd/system', '/etc/init.d', '/usr/local', '/var/log']:
+            for prefix in ['/etc/v2box', '/etc/node-network', '/etc/systemd/system', '/etc/init.d', '/usr/local', '/var/log', '/proc/', '/run/v2box.pid']:
                 source = source.replace(prefix, str(self.root)+prefix)
             self.write(target, source)
         self.write(self.bin/'sleep', '#!/bin/sh\nexit 0\n')
         self.write(self.bin/'systemctl', '''#!/bin/sh
 echo "$*" >> "$TEST_ROOT/service-calls"
 case "$1" in
+ show) if test -f "$TEST_ROOT/mainpid"; then cat "$TEST_ROOT/mainpid"; else echo 0; fi;;
  is-active)
    if test -e "$TEST_ROOT/slow-polls"; then
      count=$(cat "$TEST_ROOT/slow-polls"); echo $((count+1)) > "$TEST_ROOT/slow-polls"
@@ -82,6 +83,26 @@ esac
     def write(self, path, value):
         path.write_text(value)
         path.chmod(0o755)
+
+    def test_reload_verifies_running_capabilities_without_restart(self):
+        process=self.root/'proc/123';process.mkdir(parents=True)
+        self.write(process/'exe',"#!/bin/sh\necho '{\"features\":[\"multi-panel-v1\",\"reload-signal-v1\"]}'\n")
+        (self.root/'mainpid').write_text('123')
+        result=subprocess.run(['bash',str(self.root/'usr/local/bin/v2box'),'reload'],env=self.env,capture_output=True,text=True)
+        self.assertEqual(result.returncode,0,result.stderr)
+        calls=(self.root/'service-calls').read_text()
+        self.assertIn('kill --kill-whom=main --signal=HUP v2box',calls);self.assertNotIn('restart',calls)
+        self.assertTrue(self.active.exists());self.assertEqual((self.config/'config.json').read_bytes(),self.original_config)
+    def test_reload_rejects_unsupported_running_binary(self):
+        process=self.root/'proc/123';process.mkdir(parents=True)
+        self.write(process/'exe','#!/bin/sh\necho old-version\n');(self.root/'mainpid').write_text('123')
+        result=subprocess.run(['bash',str(self.root/'usr/local/bin/v2box'),'reload'],env=self.env,capture_output=True,text=True)
+        self.assertNotEqual(result.returncode,0);self.assertIn('lacks independent',result.stderr)
+        self.assertNotIn('kill ',(self.root/'service-calls').read_text());self.assertTrue(self.active.exists())
+    def test_runtime_probe_rejects_invalid_process_id(self):
+        (self.root/'mainpid').write_text('not-a-pid')
+        result=subprocess.run(['bash',str(self.root/'usr/local/bin/v2box'),'check-runtime'],env=self.env,capture_output=True,text=True)
+        self.assertNotEqual(result.returncode,0);self.assertNotIn('kill ',(self.root/'service-calls').read_text())
 
     def package(self, missing=None, overrides=None):
         files = {'v2box': '#!/bin/sh\necho new-version\n',
@@ -285,6 +306,7 @@ exec /bin/cp "$@"
         self.preserved()
 
     def test_resume_uses_retained_state(self):
+        (self.lib/'node-network.py').write_text('import json; print(json.dumps({"features":["report-multi-target-v1"]}))')
         (self.config/'deployment-state.json').write_text('pending')
         (self.lib/'panel-deploy.py').write_text('import sys; from pathlib import Path; assert Path(sys.argv[1]).read_text() == "pending"')
         r = self.run_script(self.root/'usr/local/bin/v2box', 'resume')

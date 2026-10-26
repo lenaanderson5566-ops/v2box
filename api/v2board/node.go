@@ -121,6 +121,8 @@ type CertInfo struct {
 	DNSEnv           map[string]string
 	Provider         string
 	RejectUnknownSni bool
+	LegacyCertFile   string
+	LegacyKeyFile    string
 }
 
 type EncSettings struct {
@@ -225,18 +227,28 @@ func (c *Client) GetNodeInfo(ctx context.Context) (node *NodeInfo, err error) {
 	default:
 		return nil, fmt.Errorf("unsupport protocol: %s", cm.Protocol)
 	}
-	node.Tag = fmt.Sprintf("[%s]-%s:%d", c.APIHost, node.Type, node.Id)
+	node.Tag = fmt.Sprintf("[%s]-%s-%s:%d", c.APIHost, c.nodeType, node.Type, node.Id)
 	cf := cm.TlsSettings.CertFile
+	legacyCert, legacyKey := "", ""
 	kf := cm.TlsSettings.KeyFile
 	if cf == "" {
 		cf = filepath.Join("/etc/v2box/", cm.Protocol+strconv.Itoa(c.NodeId)+".cer")
+		if c.certificateDirectory != "" {
+			legacyCert = cf
+			cf = filepath.Join(c.certificateDirectory, cm.Protocol+".cer")
+		}
 	}
 	if kf == "" {
 		kf = filepath.Join("/etc/v2box/", cm.Protocol+strconv.Itoa(c.NodeId)+".key")
+		if c.certificateDirectory != "" {
+			legacyKey = kf
+			kf = filepath.Join(c.certificateDirectory, cm.Protocol+".key")
+		}
 	}
 	cm.CertInfo = &CertInfo{
-		CertMode:         cm.TlsSettings.CertMode,
-		CertFile:         cf,
+		CertMode:       cm.TlsSettings.CertMode,
+		CertFile:       cf,
+		LegacyCertFile: legacyCert, LegacyKeyFile: legacyKey,
 		KeyFile:          kf,
 		Email:            "fastdog.ltd@gmail.com",
 		CertDomain:       cm.TlsSettings.PrimaryServerName(),

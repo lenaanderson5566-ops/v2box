@@ -51,20 +51,24 @@ func NewController(api *panel.Client, conf *conf.NodeConfig, info *panel.NodeInf
 
 // Start implement the Start() function of the service interface
 func (c *Controller) Start(x *core.V2Core) error {
+	return c.StartContext(context.Background(), x)
+}
+
+func (c *Controller) StartContext(ctx context.Context, x *core.V2Core) error {
 	// Init Core
 	c.server = x
 	var err error
 	// First fetch Node Info
 	node := c.info
 	if node == nil {
-		c.info, err = c.apiClient.GetNodeInfo(context.Background())
+		c.info, err = c.apiClient.GetNodeInfo(ctx)
 		if err != nil {
 			return fmt.Errorf("get node info error: %s", err)
 		}
 		node = c.info
 	}
 	if !c.usersPrepared {
-		if err := c.prepareUsers(); err != nil {
+		if err := c.prepareUsersContext(ctx); err != nil {
 			return err
 		}
 	}
@@ -75,7 +79,7 @@ func (c *Controller) Start(x *core.V2Core) error {
 	l := limiter.AddLimiter(c.info.Type, c.tag, c.userList, c.aliveMap)
 	c.limiter = l
 	if node.Security == panel.Tls {
-		err = c.requestCert()
+		err = c.requestCertContext(ctx)
 		if err != nil {
 			return fmt.Errorf("request cert error: %s", err)
 		}
@@ -85,7 +89,7 @@ func (c *Controller) Start(x *core.V2Core) error {
 	if err != nil {
 		return fmt.Errorf("add new node error: %s", err)
 	}
-	added, err := c.server.AddUsers(&core.AddUsersParams{
+	added, err := c.server.AddUsersContext(ctx, &core.AddUsersParams{
 		Tag:      c.tag,
 		Users:    c.userList,
 		NodeInfo: node,
@@ -101,15 +105,19 @@ func (c *Controller) Start(x *core.V2Core) error {
 
 // Fetch all authentication inputs before replacing live listeners.
 func (c *Controller) prepareUsers() error {
-	users, err := c.apiClient.GetUserList(context.Background())
+	return c.prepareUsersContext(context.Background())
+}
+
+func (c *Controller) prepareUsersContext(ctx context.Context) error {
+	users, err := c.apiClient.GetUserList(ctx)
 	if err != nil {
 		return fmt.Errorf("get user list error: %w", err)
 	}
-	alive, err := c.apiClient.GetUserAlive(context.Background())
+	alive, err := c.apiClient.GetUserAlive(ctx)
 	if err != nil {
 		return fmt.Errorf("get user alive list error: %w", err)
 	}
-	budget, err := c.apiClient.GetTrafficBudget(context.Background())
+	budget, err := c.apiClient.GetTrafficBudget(ctx)
 	if err != nil {
 		return fmt.Errorf("get traffic budget error: %w", err)
 	}
@@ -120,6 +128,19 @@ func (c *Controller) prepareUsers() error {
 
 // Close implement the Close() function of the service interface
 func (c *Controller) Close() error {
+	return c.closeContext(context.Background())
+}
+
+func (c *Controller) cancelTasks() {
+	for _, t := range []*task.Task{c.nodeInfoMonitorPeriodic, c.userReportPeriodic, c.targetReportPeriodic, c.renewCertPeriodic} {
+		if t != nil {
+			t.Cancel()
+		}
+	}
+}
+
+func (c *Controller) closeContext(ctx context.Context) error {
+	c.cancelTasks()
 	if c.apiClient != nil {
 		defer c.apiClient.CloseIdleConnections()
 	}
@@ -141,7 +162,7 @@ func (c *Controller) Close() error {
 	}
 	c.preparedBudget = c.server.TrafficBudgetSnapshot(c.tag)
 	err := c.server.DelNode(c.tag)
-	reportCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	reportCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 	traffic, _ := c.server.GetUserTrafficSlice(c.tag, 0)
 	retained, reportErr := c.apiClient.ReportUserTrafficReliable(reportCtx, traffic)

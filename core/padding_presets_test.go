@@ -3,7 +3,6 @@ package core
 import (
 	"encoding/json"
 	panel "github.com/lenaanderson5566-ops/v2box/api/v2board"
-	"github.com/lenaanderson5566-ops/v2box/conf"
 	"github.com/lenaanderson5566-ops/v2box/limiter"
 	"os"
 	"testing"
@@ -41,7 +40,7 @@ func TestPanelAnyTLSPresets(t *testing.T) {
 			users := []panel.UserInfo{{Id: 42, Uuid: testUUID}}
 			limiter.AddLimiter("anytls", n.Tag, users, nil)
 			t.Cleanup(func() { limiter.DeleteLimiter(n.Tag) })
-			cfg := conf.New()
+			cfg := testConf()
 			cfg.LogConfig.Level = "error"
 			v := New(cfg)
 			t.Cleanup(func() { v.Close() })

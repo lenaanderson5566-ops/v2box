@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"time"
 
 	panel "github.com/lenaanderson5566-ops/v2box/api/v2board"
@@ -18,6 +19,10 @@ type Node struct {
 }
 
 func New(nodes []conf.NodeConfig) (*Node, error) {
+	return NewContext(context.Background(), nodes)
+}
+
+func NewContext(ctx context.Context, nodes []conf.NodeConfig) (*Node, error) {
 	n := &Node{
 		controllers: make([]*Controller, len(nodes)),
 		NodeInfos:   make([]*panel.NodeInfo, len(nodes)),
@@ -33,7 +38,7 @@ func New(nodes []conf.NodeConfig) (*Node, error) {
 		if err != nil {
 			return nil, err
 		}
-		info, err := p.GetNodeInfo(context.Background())
+		info, err := p.GetNodeInfo(ctx)
 		if err != nil {
 			p.CloseIdleConnections()
 			return nil, err
@@ -46,8 +51,15 @@ func New(nodes []conf.NodeConfig) (*Node, error) {
 }
 
 func (n *Node) Start(nodes []conf.NodeConfig, core *core.V2Core) error {
+	return n.StartContext(context.Background(), nodes, core)
+}
+
+func (n *Node) StartContext(ctx context.Context, nodes []conf.NodeConfig, core *core.V2Core) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	for i, node := range nodes {
-		err := n.controllers[i].Start(core)
+		err := n.controllers[i].StartContext(ctx, core)
 		if err != nil {
 			return fmt.Errorf("start node controller [%s-%d] error: %s",
 				node.APIHost,
@@ -59,12 +71,20 @@ func (n *Node) Start(nodes []conf.NodeConfig, core *core.V2Core) error {
 }
 
 func (n *Node) Close() error {
+	// Cancel every controller before joining callbacks or flushing traffic.
+	for _, c := range n.controllers {
+		if c != nil {
+			c.cancelTasks()
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
 	var err error
 	for _, c := range n.controllers {
 		if c == nil {
 			continue
 		}
-		if closeErr := c.Close(); closeErr != nil {
+		if closeErr := c.closeContext(ctx); closeErr != nil {
 			log.Errorf("close controller failed: %v", closeErr)
 			err = errors.Join(err, closeErr)
 		}
@@ -75,9 +95,13 @@ func (n *Node) Close() error {
 
 // PrepareCertificates runs before live nodes are stopped during a reload.
 func (n *Node) PrepareCertificates() error {
+	return n.PrepareCertificatesContext(context.Background())
+}
+
+func (n *Node) PrepareCertificatesContext(ctx context.Context) error {
 	for _, c := range n.controllers {
 		if c.info.Security == panel.Tls {
-			if err := c.requestCert(); err != nil {
+			if err := c.requestCertContext(ctx); err != nil {
 				return err
 			}
 		}
@@ -87,8 +111,12 @@ func (n *Node) PrepareCertificates() error {
 
 // PrepareUsers validates panel authentication data while old nodes are still serving.
 func (n *Node) PrepareUsers(server *core.V2Core) error {
+	return n.PrepareUsersContext(context.Background(), server)
+}
+
+func (n *Node) PrepareUsersContext(ctx context.Context, server *core.V2Core) error {
 	for _, c := range n.controllers {
-		if err := c.prepareUsers(); err != nil {
+		if err := c.prepareUsersContext(ctx); err != nil {
 			return err
 		}
 		if err := server.ValidateNodeUsers(c.info, c.userList); err != nil {
@@ -101,6 +129,10 @@ func (n *Node) PrepareUsers(server *core.V2Core) error {
 // ReportConfiguration runs only after all controllers started, or on a failed
 // preparation stage. A shared deadline bounds the cost across multiple nodes.
 func (n *Node) ReportConfiguration(code string) error {
+	return n.ReportConfigurationContext(context.Background(), code)
+}
+
+func (n *Node) ReportConfigurationContext(parent context.Context, code string) error {
 	var transitionError error
 	deadline := 3 * time.Second
 	for _, c := range n.controllers {
@@ -109,7 +141,7 @@ func (n *Node) ReportConfiguration(code string) error {
 			break
 		}
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), deadline)
+	ctx, cancel := context.WithTimeout(parent, deadline)
 	defer cancel()
 	for _, c := range n.controllers {
 		if c != nil && c.info != nil {
@@ -122,15 +154,19 @@ func (n *Node) ReportConfiguration(code string) error {
 			}
 		}
 	}
-	return transitionError
+	return errors.Join(transitionError, parent.Err())
 }
 
 // Snapshot retains validated authentication and certificate state for local rollback.
 // It is used only after all controller tasks have been stopped.
 func (n *Node) Snapshot() *Node { copy := *n; return &copy }
 func (n *Node) Restore(server *core.V2Core) error {
+	return n.RestoreContext(context.Background(), server)
+}
+
+func (n *Node) RestoreContext(ctx context.Context, server *core.V2Core) error {
 	for _, c := range n.controllers {
-		if err := c.Start(server); err != nil {
+		if err := c.StartContext(ctx, server); err != nil {
 			return err
 		}
 	}
@@ -152,5 +188,20 @@ func (n *Node) ConfirmPublication(next *Node) bool {
 		next.NodeInfos[i].CertificateFingerprint = info.CertificateFingerprint
 	}
 	_ = next.ReportConfiguration("")
+	return true
+}
+
+// Unchanged ignores the local certificate receipt, which is not panel config.
+func (n *Node) Unchanged(next *Node) bool {
+	if len(n.NodeInfos) != len(next.NodeInfos) {
+		return false
+	}
+	for i, current := range n.NodeInfos {
+		old, candidate := *current, *next.NodeInfos[i]
+		old.CertificateFingerprint, candidate.CertificateFingerprint = "", ""
+		if !reflect.DeepEqual(old, candidate) {
+			return false
+		}
+	}
 	return true
 }

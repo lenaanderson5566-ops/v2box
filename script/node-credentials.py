@@ -42,7 +42,7 @@ def main():
     with path.open(encoding="utf-8") as stream:
         nodes = json.load(stream).get("Nodes", [])
     for index, node in enumerate(nodes):
-        print(f"{index + 1}: {node.get('NodeType', 'v2node')} #{node.get('NodeID')}")
+        print(f"{index + 1}: {node.get('ApiHost', '')} / {node.get('NodeType', 'v2node')} #{node.get('NodeID')}")
     index = int(input("Select node number: ")) - 1
     # Require a real terminal: never fall back to echoing a secret through stdin.
     with open("/dev/tty", "r+") as terminal:
@@ -50,7 +50,7 @@ def main():
             warnings.simplefilter("error", getpass.GetPassWarning)
             secret = getpass.getpass("New independent key: ", stream=terminal)
     replace_key(path, index, secret)
-    print("Key saved. Run: v2box restart; then verify the new fingerprint in the panel.")
+    print("Key saved. With file watching enabled, only this node reloads. Verify its new fingerprint in the panel; restart is only needed when file watching is disabled.")
 
 
 if __name__ == "__main__":

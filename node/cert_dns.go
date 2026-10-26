@@ -16,6 +16,10 @@ import (
 // Only fixed HTTPS resolvers are contacted. Both address families are checked:
 // an unexpected AAAA record can break clients even when IPv4 is correct.
 func verifyTransitionDNS(t *panel.DomainTransition) error {
+	return verifyTransitionDNSContext(context.Background(), t)
+}
+
+func verifyTransitionDNSContext(parent context.Context, t *panel.DomainTransition) error {
 	if len(t.Addresses) == 0 || len(t.Addresses) > 2 {
 		return fmt.Errorf("missing transition addresses")
 	}
@@ -25,9 +29,12 @@ func verifyTransitionDNS(t *panel.DomainTransition) error {
 			return fmt.Errorf("invalid transition address")
 		}
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	ctx, cancel := context.WithTimeout(parent, 2*time.Minute)
 	defer cancel()
 	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		attempt, done := context.WithTimeout(ctx, 20*time.Second)
 		err := lookupTransitionDNS(attempt, t)
 		done()
@@ -38,7 +45,7 @@ func verifyTransitionDNS(t *panel.DomainTransition) error {
 		select {
 		case <-ctx.Done():
 			timer.Stop()
-			return fmt.Errorf("DNS propagation timed out: %w", err)
+			return fmt.Errorf("DNS propagation canceled or timed out: %w", ctx.Err())
 		case <-timer.C:
 		}
 	}

@@ -23,6 +23,11 @@ class FakeClient:
 class NetworkTests(unittest.TestCase):
     def setUp(self):
         self.config = {'zone_id': 'a'*32, 'token': 'secret-test-token', 'domain': 'node.example.com', 'family':'ipv4'}
+    def test_capabilities_can_be_probed_without_root_or_configuration(self):
+        import io
+        with patch.object(m.sys,'argv',['node-network','capabilities']),patch.object(m.sys,'stdout',io.StringIO()) as output:
+            self.assertEqual(m.main(),0)
+            self.assertIn('report-multi-target-v1',json.loads(output.getvalue())['features'])
     def test_panel_report_scoped_and_partial(self):
         config = {'mode':'panel','panel_url':'https://panel.example.test','token':'a'*64,'family':'dual'}
         c = m.Client()
@@ -139,5 +144,76 @@ class NetworkTests(unittest.TestCase):
                     m.run()
                     self.assertEqual(sync.call_count,1)
                 self.assertFalse(json.loads(m.STATE.read_text())['paused'])
+
+class MultiPanelNetworkTests(unittest.TestCase):
+    def setUp(self):
+        self.a={'mode':'panel','panel_url':'https://a.example.test','token':'a'*64,'family':'ipv4','server_id':1}
+        self.b=dict(self.a,panel_url='https://b.example.test',token='b'*64)
+    def test_merge_preserves_other_panel_and_direct_dns(self):
+        dns={'zone_id':'c'*32,'token':'dns-key','domain':'node.example.test','family':'ipv4'}
+        document=m.merge_target(dns,self.a)
+        document=m.merge_target(document,self.b)
+        document=m.merge_target(document,dict(self.a,token='d'*64))
+        self.assertEqual(len(m.targets(document)),3)
+        self.assertEqual(m.targets(document)[0],dns)
+        self.assertIn(self.b,m.targets(document))
+        self.assertNotIn(self.a,m.targets(document))
+    def test_same_node_id_on_different_panels_has_distinct_identity(self):
+        self.assertNotEqual(m.target_key(self.a),m.target_key(self.b))
+        self.assertEqual(m.target_key(self.a),m.target_key(dict(self.a,token='c'*64)))
+    def test_failed_target_does_not_pause_other_backend(self):
+        with tempfile.TemporaryDirectory() as temp,patch.object(m,'STATE',Path(temp)/'state'):
+            calls=[]
+            def execute(client,config):
+                calls.append(config['panel_url'])
+                if config['panel_url']==self.a['panel_url']:raise m.NetworkError('denied',True)
+            document=m.merge_target(self.a,self.b)
+            with patch.object(m,'execute',side_effect=execute):
+                with self.assertRaises(m.NetworkError):m.run_multiple(document,{})
+                state=json.loads(m.STATE.read_text())
+                self.assertTrue(state['targets'][m.target_key(self.a)]['paused'])
+                self.assertFalse(state['targets'][m.target_key(self.b)].get('paused',False))
+                m.run_multiple(document,state)
+            self.assertEqual(calls.count(self.a['panel_url']),1)
+            self.assertEqual(calls.count(self.b['panel_url']),2)
+    def test_slow_target_does_not_delay_other_backend(self):
+        import threading
+        with tempfile.TemporaryDirectory() as temp,patch.object(m,'STATE',Path(temp)/'state'):
+            slow=threading.Event();healthy=threading.Event();release=threading.Event()
+            errors=[]
+            def execute(client,config):
+                if config['panel_url']==self.a['panel_url']:
+                    slow.set();release.wait(3)
+                else: healthy.set()
+            def run():
+                try:m.run_multiple(m.merge_target(self.a,self.b),{})
+                except BaseException as error:errors.append(error)
+            with patch.object(m,'execute',side_effect=execute):
+                thread=threading.Thread(target=run);thread.start()
+                try:
+                    self.assertTrue(slow.wait(1));self.assertTrue(healthy.wait(1))
+                finally:release.set();thread.join(3)
+            self.assertFalse(thread.is_alive());self.assertEqual(errors,[])
+    def test_credential_rotation_preserves_other_backoff(self):
+        with tempfile.TemporaryDirectory() as temp:
+            with patch.object(m,'CONFIG',Path(temp)/'config'),patch.object(m,'STATE',Path(temp)/'state'):
+                m.write_private(m.CONFIG,m.merge_target(self.a,self.b))
+                retained={'fingerprint':m.fingerprint(self.b),'paused':True,'next_run':1234}
+                m.write_private(m.STATE,{'targets':{m.target_key(self.a):{'paused':True},m.target_key(self.b):retained}})
+                m.save_target(dict(self.a,token='c'*64))
+                result=json.loads(m.STATE.read_text())['targets']
+                self.assertEqual(result[m.target_key(self.b)],retained)
+                self.assertEqual(result[m.target_key(self.a)],{})
+                self.assertEqual(m.CONFIG.stat().st_mode&0o777,0o600)
+    def test_missing_server_id_cannot_replace_multiple_scoped_targets(self):
+        other=dict(self.a,server_id=2,token='c'*64)
+        document=m.merge_target(self.a,other)
+        ambiguous=dict(self.a);ambiguous.pop('server_id')
+        with self.assertRaisesRegex(m.NetworkError,'specify --server-id'):
+            m.merge_target(document,ambiguous)
+        self.assertEqual(m.targets(document),[self.a,other])
+    def test_duplicate_and_invalid_server_identity_rejected(self):
+        with self.assertRaises(m.NetworkError):m.targets({'mode':'multi','targets':[self.a,self.a]})
+        with self.assertRaises(m.NetworkError):m.validate_report(dict(self.a,server_id=True))
 
 if __name__=='__main__':unittest.main()

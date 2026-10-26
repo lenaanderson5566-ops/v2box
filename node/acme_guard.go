@@ -1,6 +1,7 @@
 package node
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -20,7 +21,13 @@ import (
 )
 
 // Serialize ACME operations, including providers which use process environment.
-var acmeMu sync.Mutex
+var acmeGate = make(chan struct{}, 1) // only legacy in-process environment users
+var acmeDomainGates sync.Map
+
+func acmeGateFor(c *panel.CertInfo) chan struct{} {
+	gate, _ := acmeDomainGates.LoadOrStore(acmeStatePath(c), make(chan struct{}, 1))
+	return gate.(chan struct{})
+}
 
 type acmeState struct {
 	Failures    int       `json:"failures"`
@@ -96,8 +103,22 @@ func nextACMEState(err error, failures int, now time.Time) acmeState {
 }
 
 func guardedACME(c *panel.CertInfo, operation func() error) error {
-	acmeMu.Lock()
-	defer acmeMu.Unlock()
+	acmeGate <- struct{}{}
+	defer func() { <-acmeGate }()
+	return guardedACMEContext(context.Background(), c, func() error { return withACMEEnvironment(c.DNSEnv, operation) })
+}
+
+func guardedACMEContext(ctx context.Context, c *panel.CertInfo, operation func() error) error {
+	gate := acmeGateFor(c)
+	select {
+	case gate <- struct{}{}:
+		defer func() { <-gate }()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	name := acmeStatePath(c)
 	if err := os.MkdirAll(filepath.Dir(name), 0755); err != nil {
 		return err
@@ -124,7 +145,7 @@ func guardedACME(c *panel.CertInfo, operation func() error) error {
 	if err = saveACMEState(name, acmeState{Failures: state.Failures + 1, Stopped: true}); err != nil {
 		return err
 	}
-	err = withACMEEnvironment(c.DNSEnv, operation)
+	err = operation()
 	if err == nil {
 		if e := os.Remove(name); e != nil && !os.IsNotExist(e) {
 			return e
@@ -160,4 +181,47 @@ func withACMEEnvironment(values map[string]string, operation func() error) error
 		}
 	}
 	return operation()
+}
+
+// A directory migration must not bypass an interrupted or paused ACME order.
+func inheritACMEGuard(cert *panel.CertInfo) error {
+	if cert.LegacyCertFile == "" {
+		return nil
+	}
+	legacy := *cert
+	legacy.CertFile = cert.LegacyCertFile
+	old, name := acmeStatePath(&legacy), acmeStatePath(cert)
+	if old == name {
+		return nil
+	}
+	_, lockErr := os.Stat(old + ".lock")
+	data, err := os.ReadFile(old)
+	if os.IsNotExist(err) {
+		if lockErr != nil {
+			return nil
+		}
+		// Permit an existing valid pair to start while pausing any new ACME order.
+		data, err = json.Marshal(acmeState{Failures: 1, Stopped: true})
+	}
+	if err != nil {
+		return err
+	}
+	var state acmeState
+	if len(data) > 4096 || json.Unmarshal(data, &state) != nil {
+		return fmt.Errorf("invalid legacy ACME guard; repair before migration")
+	}
+	if err := os.MkdirAll(filepath.Dir(name), 0755); err != nil {
+		return err
+	}
+	file, err := os.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if os.IsExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	_, writeErr := file.Write(data)
+	syncErr := file.Sync()
+	closeErr := file.Close()
+	return errors.Join(writeErr, syncErr, closeErr)
 }

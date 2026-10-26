@@ -1,9 +1,11 @@
 package conf
 
 import (
+	"crypto/sha256"
 	"fmt"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/spf13/viper"
@@ -13,9 +15,10 @@ const DefaultNodeRetryCount = 1
 const DefaultNodeTimeout = 15
 
 type Conf struct {
-	LogConfig   LogConfig    `mapstructure:"Log"`
-	NodeConfigs []NodeConfig `mapstructure:"Nodes"`
-	PprofPort   int          `mapstructure:"PprofPort"`
+	OutboundAllowCIDRs []string     `mapstructure:"OutboundAllowCIDRs"`
+	LogConfig          LogConfig    `mapstructure:"Log"`
+	NodeConfigs        []NodeConfig `mapstructure:"Nodes"`
+	PprofPort          int          `mapstructure:"PprofPort"`
 }
 
 type LogConfig struct {
@@ -25,6 +28,7 @@ type LogConfig struct {
 }
 
 type NodeConfig struct {
+	CertificateDirectory  string      `mapstructure:"CertificateDirectory"`
 	TrafficSpoolDirectory string      `mapstructure:"TrafficSpoolDirectory"`
 	APIVersion            string      `mapstructure:"ApiVersion"`
 	LandingPage           LandingPage `mapstructure:"LandingPage"`
@@ -84,4 +88,38 @@ func (p *Conf) LoadFromPath(filePath string) error {
 
 func intPtr(v int) *int {
 	return &v
+}
+
+// Canonical panel origins keep aliases from creating duplicate runtime owners.
+func CanonicalPanelURL(value string) (string, error) {
+	parsed, err := url.Parse(value)
+	if err != nil || parsed.Scheme != "https" || parsed.Hostname() == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" || parsed.Opaque != "" {
+		return "", fmt.Errorf("ApiHost must be an HTTPS URL without credentials, query or fragment")
+	}
+	parsed.Host = strings.ToLower(parsed.Host)
+	parsed.Path = strings.TrimRight(parsed.Path, "/")
+	return parsed.String(), nil
+}
+func NodeIdentity(entry NodeConfig) (string, error) {
+	host, err := CanonicalPanelURL(entry.APIHost)
+	if err != nil {
+		return "", err
+	}
+	kind := entry.NodeType
+	if kind == "" {
+		kind = "v2node"
+	}
+	if (kind != "v2node" && kind != "v2box") || entry.NodeID <= 0 || strings.TrimSpace(entry.Key) == "" {
+		return "", fmt.Errorf("invalid node identity")
+	}
+	return fmt.Sprintf("%s|%s|%d", host, kind, entry.NodeID), nil
+}
+func NodeCertificateDirectory(entry NodeConfig) string {
+	host, _ := CanonicalPanelURL(entry.APIHost)
+	digest := sha256.Sum256([]byte(host))
+	kind := entry.NodeType
+	if kind == "" {
+		kind = "v2node"
+	}
+	return filepath.Join("/etc/v2box/panels", fmt.Sprintf("%x", digest[:8]), fmt.Sprintf("%s-%d", kind, entry.NodeID))
 }

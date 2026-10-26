@@ -9,7 +9,6 @@ import (
 	"time"
 
 	panel "github.com/lenaanderson5566-ops/v2box/api/v2board"
-	"github.com/lenaanderson5566-ops/v2box/conf"
 	M "github.com/sagernet/sing/common/metadata"
 )
 
@@ -17,7 +16,7 @@ func BenchmarkTargetStatistics(b *testing.B) {
 	for _, enabled := range []bool{false, true} {
 		for _, target := range []string{"192.0.2.1:443", "example.org:443"} {
 			b.Run(fmt.Sprintf("enabled=%t/%s", enabled, target), func(b *testing.B) {
-				v := New(conf.New())
+				v := New(testConf())
 				v.SetTargetPolicy("n", panel.TargetPolicy{Enabled: enabled, Version: "v", LeaseSeconds: 120})
 				d := M.ParseSocksaddr(target)
 				var ids atomic.Int64
@@ -34,7 +33,7 @@ func BenchmarkTargetStatistics(b *testing.B) {
 }
 
 func TestTargetStatisticsSwitchLeaseAndRetry(t *testing.T) {
-	v := New(conf.New())
+	v := New(testConf())
 	m := &meter{tag: "node", uid: 1}
 	d := M.ParseSocksaddr("Example.COM:443")
 	record := func() { v.tracker.targets.record(m, d, 100, 200) }
@@ -91,7 +90,7 @@ func TestTargetStatisticsAddressesAndBounds(t *testing.T) {
 	if originalTarget(other, ip, M.Socksaddr{}) != ip {
 		t.Fatal("rewritten target leaked")
 	}
-	v := New(conf.New())
+	v := New(testConf())
 	v.SetTargetPolicy("node", panel.TargetPolicy{Enabled: true, Version: "v", LeaseSeconds: 120})
 	for i := 0; i < 550; i++ {
 		v.tracker.targets.record(&meter{tag: "node", uid: i + 1}, ip, 1, 2)
@@ -102,7 +101,7 @@ func TestTargetStatisticsAddressesAndBounds(t *testing.T) {
 	}
 }
 func TestTargetStatisticsConcurrentSwitch(t *testing.T) {
-	v := New(conf.New())
+	v := New(testConf())
 	var wg sync.WaitGroup
 	m := &meter{tag: "n", uid: 1}
 	for worker := 0; worker < 4; worker++ {
@@ -132,7 +131,7 @@ func TestTargetStatisticsConcurrentSwitch(t *testing.T) {
 }
 
 func TestTargetStatisticsPortsRetryExpiryAndRenewal(t *testing.T) {
-	v := New(conf.New())
+	v := New(testConf())
 	p := panel.TargetPolicy{Enabled: true, Version: "v", LeaseSeconds: 120}
 	v.SetTargetPolicy("n", p)
 	m := &meter{tag: "n", uid: 1}
@@ -161,7 +160,7 @@ func TestTargetStatisticsPortsRetryExpiryAndRenewal(t *testing.T) {
 	}
 }
 func TestTargetStatisticsConcurrentBounds(t *testing.T) {
-	v := New(conf.New())
+	v := New(testConf())
 	v.SetTargetPolicy("n", panel.TargetPolicy{Enabled: true, Version: "v", LeaseSeconds: 120})
 	var wg sync.WaitGroup
 	for user := 1; user <= 32; user++ {
@@ -184,7 +183,7 @@ func TestTargetStatisticsConcurrentBounds(t *testing.T) {
 	}
 }
 func TestTargetStatisticsLifecycleResources(t *testing.T) {
-	v := New(conf.New())
+	v := New(testConf())
 	baseline := sampleResources()
 	for cycle := 0; cycle < 100; cycle++ {
 		v.SetTargetPolicy("n", panel.TargetPolicy{Enabled: true, Version: "v", LeaseSeconds: 120})
@@ -201,7 +200,7 @@ func TestTargetStatisticsLifecycleResources(t *testing.T) {
 }
 
 func TestTargetCacheNodeBudgetsCloseAndRetire(t *testing.T) {
-	v := New(conf.New())
+	v := New(testConf())
 	v.SetTargetPolicy("n", panel.TargetPolicy{Enabled: true, Version: "v", LeaseSeconds: 120})
 	state := v.tracker.targets.nodes["n"]
 	meters := make([]*meter, 0, targetCacheMeterLimit)
@@ -238,7 +237,7 @@ func TestTargetCacheNodeBudgetsCloseAndRetire(t *testing.T) {
 }
 
 func TestTargetCacheConcurrentCloseAndSwitch(t *testing.T) {
-	v := New(conf.New())
+	v := New(testConf())
 	m := &meter{tag: "n", uid: 1}
 	var wg sync.WaitGroup
 	for i := 0; i < 3; i++ {
@@ -266,7 +265,7 @@ func TestTargetCacheConcurrentCloseAndSwitch(t *testing.T) {
 }
 
 func TestTargetTCPFixedCache(t *testing.T) {
-	v := New(conf.New())
+	v := New(testConf())
 	p := panel.TargetPolicy{Enabled: true, Version: "v", LeaseSeconds: 120}
 	v.SetTargetPolicy("n", p)
 	m := &meter{tag: "n", uid: 1, targetFixed: true}
@@ -290,7 +289,7 @@ func TestTargetTCPFixedCache(t *testing.T) {
 }
 
 func BenchmarkTargetStatisticsTCP(b *testing.B) {
-	v := New(conf.New())
+	v := New(testConf())
 	v.SetTargetPolicy("n", panel.TargetPolicy{Enabled: true, Version: "v", LeaseSeconds: 120})
 	d := M.ParseSocksaddr("example.org:443")
 	var ids atomic.Int64
@@ -304,7 +303,7 @@ func BenchmarkTargetStatisticsTCP(b *testing.B) {
 }
 
 func TestTargetConcurrentDrainPreservesExactCounters(t *testing.T) {
-	v := New(conf.New())
+	v := New(testConf())
 	v.SetTargetPolicy("n", panel.TargetPolicy{Enabled: true, Version: "v", LeaseSeconds: 120})
 	var wg sync.WaitGroup
 	for i := 0; i < 8; i++ {
@@ -345,7 +344,7 @@ func TestTargetConcurrentDrainPreservesExactCounters(t *testing.T) {
 }
 
 func TestExpiredTargetBatchPreservesTruncationNotice(t *testing.T) {
-	v := New(conf.New())
+	v := New(testConf())
 	v.SetTargetPolicy("n", panel.TargetPolicy{Enabled: true, Version: "v", LeaseSeconds: 120})
 	v.tracker.targets.record(&meter{tag: "n", uid: 1, targetFixed: true}, M.ParseSocksaddr("example.org:443"), 1, 2)
 	state := v.tracker.targets.nodes["n"]

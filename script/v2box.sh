@@ -9,6 +9,20 @@ run_service() {
   fi
   return "$result"
 }
+check_runtime() {
+  local pid=''
+  if command -v systemctl >/dev/null; then
+    pid=$(run_service systemctl show v2box --property=MainPID --value) || return 1
+    [[ "$pid" != 0 && -n "$pid" ]] || return 0
+  else
+    [[ -f /run/v2box.pid && ! -L /run/v2box.pid ]] || return 0
+    read -r pid < /run/v2box.pid
+  fi
+  [[ "$pid" =~ ^[1-9][0-9]*$ && -x /proc/$pid/exe ]] || { echo 'Cannot verify running V2Box identity; existing nodes preserved.' >&2; return 1; }
+  timeout -k 2 10 /proc/"$pid"/exe capabilities | jq -e '.features | index("multi-panel-v1") != null and index("reload-signal-v1") != null' >/dev/null || {
+    echo 'Running V2Box lacks independent multi-panel reload. Upgrade it in a maintenance window before deploying another node.' >&2; return 1;
+  }
+}
 binary=/usr/local/lib/v2box/v2box
 if (($# == 0)); then set -- help; fi
 case "$1" in
@@ -20,12 +34,17 @@ case "$1" in
   resume)
     [[ $EUID -eq 0 && $# -eq 1 ]] || { echo 'Run as root: v2box resume' >&2; exit 1; }
     [[ -x "$binary" ]] || { echo 'V2Box is uninstalled; reinstall program files before resuming. Configuration and certificates remain.' >&2; exit 1; }
-    [[ -f /etc/v2box/deployment-state.json ]] || { echo 'No pending deployment.'; exit 0; }
+    shopt -s nullglob
+    states=(/etc/v2box/deployment-state*.json)
+    ((${#states[@]} > 0)) || { echo 'No pending deployment.'; exit 0; }
+    ((${#states[@]} == 1)) || { echo 'Multiple pending deployments. Re-run the original panel command to resume its selected node.' >&2; exit 1; }
     [[ -f /usr/local/lib/v2box/panel-deploy.py ]] || { echo 'Download the panel installation command and run it with --resume.' >&2; exit 1; }
     [[ ! -L /etc/v2box/.deployment.lock && ! -L /etc/v2box && ! -L /etc/v2box/.bootstrap.lock ]] || { echo 'Refusing symlinked deployment paths' >&2; exit 1; }
     exec 9>/etc/v2box/.bootstrap.lock
     flock -n 9 || { echo 'Another deployment or maintenance operation is running.' >&2; exit 1; }
-    exec python3 /usr/local/lib/v2box/panel-deploy.py /etc/v2box/deployment-state.json;;
+    check_runtime
+    timeout -k 2 10 python3 /usr/local/lib/v2box/node-network.py capabilities | jq -e '.features | index("report-multi-target-v1") != null' >/dev/null || { echo 'Reporting helper lacks multi-target support; update node scripts before resuming.' >&2; exit 1; }
+    exec python3 /usr/local/lib/v2box/panel-deploy.py "${states[0]}";;
   uninstall)
     shift
     stop_network=false
@@ -86,6 +105,17 @@ case "$1" in
     fi
     rm -f -- /usr/local/lib/v2box/v2box /usr/local/lib/v2box/v2box.previous /usr/local/lib/v2box/manager.sh /usr/local/lib/v2box/install.sh /usr/local/lib/v2box/node-credentials.py /usr/local/lib/v2box/node-network.py /usr/local/bin/v2box
     echo 'V2Box uninstalled. Configuration and certificates remain in /etc/v2box. Revoke node credentials and review domain bindings in the panel.';;
+  check-runtime) check_runtime;;
+  reload)
+    check_runtime
+    if command -v systemctl >/dev/null; then
+      run_service systemctl kill --kill-whom=main --signal=HUP v2box
+    else
+      [[ -f /run/v2box.pid && ! -L /run/v2box.pid ]] || { echo 'V2Box is not running' >&2; exit 1; }
+      read -r pid < /run/v2box.pid
+      [[ "$pid" =~ ^[1-9][0-9]*$ ]] || exit 1
+      kill -HUP "$pid"
+    fi;;
   start|stop|restart|status|enable|disable)
     action=$1
     if command -v systemctl >/dev/null; then
@@ -103,7 +133,7 @@ case "$1" in
   ip) exec python3 /usr/local/lib/v2box/node-network.py ip;;
   credential) exec python3 /usr/local/lib/v2box/node-credentials.py;;
   ddns) shift; exec python3 /usr/local/lib/v2box/node-network.py "${@:-status}";;
-  version|server) exec "$binary" "$@";;
-  help) echo 'Usage: v2box {start|stop|restart|status|enable|disable|log|version|server|ip|credential|ddns|resume|update [release-tag]|uninstall [--stop-network] [--yes]|help}';;
+  version|server|capabilities) exec "$binary" "$@";;
+  help) echo 'Usage: v2box {start|stop|restart|reload|status|enable|disable|log|version|server|ip|credential|ddns|resume|update [release-tag]|uninstall [--stop-network] [--yes]|help}';;
   *) echo 'Unknown command. Run: v2box help'; exit 1;;
 esac

@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
@@ -27,6 +28,20 @@ import (
 	"time"
 )
 
+func reload(config string, nodes **node.Node, v2core **core.V2Core) error {
+	return reloadContext(context.Background(), config, nodes, v2core)
+}
+
+func reloadContext(parent context.Context, config string, nodes **node.Node, v2core **core.V2Core) error {
+	ctx, cancel := context.WithTimeout(parent, 5*time.Minute)
+	defer cancel()
+	newConf := conf.New()
+	if err := newConf.LoadFromPath(config); err != nil {
+		return &reloadRejected{err}
+	}
+	return reloadConfiguration(ctx, newConf, nodes, v2core)
+}
+
 var reloadTestRoots sync.Once
 
 func TestReloadInvalidConfigurationHashPreservesLiveListener(t *testing.T) {
@@ -37,7 +52,12 @@ func TestReloadInvalidConfigurationHashPreservesLiveListener(t *testing.T) {
 	port := socket.Addr().(*net.TCPAddr).Port
 	socket.Close()
 	var invalid atomic.Bool
+	var slow atomic.Bool
 	s := reloadTestPanel(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if slow.Load() && r.URL.Path == "/api/v10/server/configuration" {
+			<-r.Context().Done()
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
 		case "/api/v10/server/configuration":
@@ -77,13 +97,32 @@ func TestReloadInvalidConfigurationHashPreservesLiveListener(t *testing.T) {
 	}
 	defer func() { _ = n.Close(); _ = v.Close() }()
 	oldCore, oldNodes := v, n
+	slow.Store(true)
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	started := time.Now()
+	err = reloadContext(ctx, configPath, &n, &v)
+	cancel()
+	var timeoutRejected *reloadRejected
+	if !errors.As(err, &timeoutRejected) || time.Since(started) > 2*time.Second || n != oldNodes || v != oldCore {
+		t.Fatalf("slow panel disrupted runtime or deadline: %v", err)
+	}
+	conn, dialErr := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), time.Second)
+	if dialErr != nil {
+		t.Fatalf("listener lost after timeout: %v", dialErr)
+	}
+	conn.Close()
+	slow.Store(false)
+	if err = reload(configPath, &n, &v); err != nil {
+		t.Fatalf("reload did not recover after timeout: %v", err)
+	}
+	oldCore, oldNodes = v, n
 	invalid.Store(true)
 	err = reload(configPath, &n, &v)
 	var rejected *reloadRejected
 	if !errors.As(err, &rejected) || !strings.Contains(err.Error(), "configuration hash") || v != oldCore || n != oldNodes {
 		t.Fatalf("bad version should be rejected without replacing live runtime: %v", err)
 	}
-	conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), time.Second)
+	conn, err = net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), time.Second)
 	if err != nil {
 		t.Fatalf("listener closed on invalid version: %v", err)
 	}
@@ -277,7 +316,7 @@ func TestReloadAppliesProtocolPortDomainAndRelay(t *testing.T) {
 	}))
 	defer panelServer.Close()
 	configPath := filepath.Join(dir, "config.json")
-	body, _ := json.Marshal(map[string]any{"Nodes": []any{map[string]any{"ApiHost": panelServer.URL, "NodeID": 1, "NodeType": "v2box", "ApiKey": "fixture", "RetryCount": 0}}})
+	body, _ := json.Marshal(map[string]any{"OutboundAllowCIDRs": []string{"127.0.0.0/8", "::1/128"}, "Nodes": []any{map[string]any{"ApiHost": panelServer.URL, "NodeID": 1, "NodeType": "v2box", "ApiKey": "fixture", "RetryCount": 0}}})
 	if err := os.WriteFile(configPath, body, 0600); err != nil {
 		t.Fatal(err)
 	}

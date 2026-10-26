@@ -77,7 +77,7 @@ func (l *Lego) SetProvider() error {
 			return err
 		}
 	case "dns":
-		// guardedACME keeps provider environment in scope for the entire challenge.
+		// The ACME worker owns provider environment for the entire challenge.
 
 		p, err := dns.NewDNSChallengeProviderByName(l.config.Provider)
 		if err != nil {
@@ -305,15 +305,20 @@ func (u *User) Save(path string) error {
 		return fmt.Errorf("check path error: %w", err)
 	}
 	u.KeyEncoded, _ = EncodePrivate(u.key.(*ecdsa.PrivateKey))
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
+	defer func() { u.KeyEncoded = "" }()
+	data, err := json.Marshal(u)
+	if err != nil {
+		return fmt.Errorf("marshal account: %w", err)
+	}
+	staged, err := stageCertFile(path, data, 0600)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
-	err = json.NewEncoder(f).Encode(u)
-	if err != nil {
-		return fmt.Errorf("marshal json error: %w", err)
+	defer os.Remove(staged)
+	if err := os.Rename(staged, path); err != nil {
+		return err
 	}
+
 	u.KeyEncoded = ""
 	return nil
 }

@@ -283,3 +283,56 @@ func TestRelayCertificateDNSUsesEntryAndRejectsRedirects(t *testing.T) {
 		t.Fatal("DNS resolver redirect followed")
 	}
 }
+
+func TestACMEGuardIndependentCertificateDirectories(t *testing.T) {
+	a := &panel.CertInfo{CertDomain: "same.example", CertFile: filepath.Join(t.TempDir(), "cert.pem")}
+	b := *a
+	b.CertFile = filepath.Join(t.TempDir(), "cert.pem")
+	gate := acmeGateFor(a)
+	gate <- struct{}{}
+	defer func() { <-gate }()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := guardedACMEContext(ctx, &b, func() error { return nil }); err != nil {
+		t.Fatalf("another backend blocked ACME: %v", err)
+	}
+}
+func TestACMEGuardSurvivesDirectoryMigration(t *testing.T) {
+	old := &panel.CertInfo{CertDomain: "same.example", CertFile: filepath.Join(t.TempDir(), "old.pem")}
+	if err := guardedACME(old, func() error { return errors.New("invalid provider") }); err == nil {
+		t.Fatal("failure accepted")
+	}
+	next := *old
+	next.LegacyCertFile = old.CertFile
+	next.CertFile = filepath.Join(t.TempDir(), "new", "cert.pem")
+	if err := inheritACMEGuard(&next); err != nil {
+		t.Fatal(err)
+	}
+	called := false
+	if err := guardedACME(&next, func() error { called = true; return nil }); err == nil || called {
+		t.Fatal("directory migration bypassed ACME protection")
+	}
+}
+func TestLegacyCertificateMigrationVerifiesIdentity(t *testing.T) {
+	dir := t.TempDir()
+	oldCert, oldKey := filepath.Join(dir, "old.cer"), filepath.Join(dir, "old.key")
+	if err := generateSelfSslCertificate("a.example", oldCert, oldKey); err != nil {
+		t.Fatal(err)
+	}
+	previous, _ := os.ReadFile(oldCert)
+	for _, domain := range []string{"a.example", "b.example"} {
+		cert := &panel.CertInfo{CertMode: "self", CertDomain: domain, CertFile: filepath.Join(dir, domain, "cert.pem"), KeyFile: filepath.Join(dir, domain, "key.pem"), LegacyCertFile: oldCert, LegacyKeyFile: oldKey}
+		controller := &Controller{info: &panel.NodeInfo{Common: &panel.CommonNode{CertInfo: cert}}}
+		if err := controller.requestCert(); err != nil {
+			t.Fatal(err)
+		}
+		contents, _ := os.ReadFile(cert.CertFile)
+		if (string(contents) == string(previous)) != (domain == "a.example") {
+			t.Fatal("legacy certificate migration ignored identity")
+		}
+	}
+	after, _ := os.ReadFile(oldCert)
+	if string(previous) != string(after) {
+		t.Fatal("legacy pair was overwritten")
+	}
+}

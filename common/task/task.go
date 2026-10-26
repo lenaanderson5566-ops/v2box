@@ -64,6 +64,17 @@ func (t *Task) execute(parent context.Context) {
 		log.WithError(err).Warnf("Task %s failed", t.Name)
 	}
 }
+
+// Cancel interrupts work without waiting, so owners can cancel all tasks first.
+func (t *Task) Cancel() {
+	t.mu.Lock()
+	cancel := t.cancel
+	t.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
 func (t *Task) Close() {
 	t.mu.Lock()
 	cancel, done := t.cancel, t.done

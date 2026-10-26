@@ -19,6 +19,7 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq jq unzip zip openssl
       - run: go test -race -tags with_quic,with_utls ./...
       # Vision's upstream unsafe TLS access and shared filter state are not race-clean.
       - run: go test -tags with_quic,with_utls ./core -run TestVLESSRealityVision -count=1
@@ -95,7 +96,12 @@ jobs:
           generate_release_notes: true
           make_latest: true
           body: |
-            V2Box v1.0.11：修复关闭、重载和安装中断时的资源及计量恢复问题。
+            V2Box v1.0.12：单实例多后台与独立节点部署。
+
+            - 按后台/节点独立启动、重试和重载，保留其他节点长连接。
+            - 支持能力探测、SIGHUP 局部重载和多目标 IP 上报。
+            - 后台一键部署按身份追加 Nodes，保留既有节点、证书、上报和 DNS。
+            - 部署授权与恢复状态分开保存，完成回执避免重复消耗一次性授权。
 
             - AnyTLS 关闭时取消待完成拨号，拒绝并释放迟到连接。
             - 配置验证失败、重载及关闭后释放面板空闲 HTTP 连接。
@@ -104,8 +110,8 @@ jobs:
             - 修复定时任务非法参数和超时计算溢出。
             - 保留现有配置、证书、部署状态和 DNS 记录；启动失败仍自动回滚。
 
-            面板通过 update.sh 更新后，一键安装与恢复使用 v1.0.11。
-            现有节点执行 /usr/local/bin/v2box update v1.0.11；不指定版本时获取最新正式版。
-            旧管理命令缺少 update 时，下载本版本 script/install.sh，执行 bash install.sh v1.0.11 --update。
+            面板通过 update.sh 更新后，一键安装与恢复使用 v1.0.12。
+            现有节点执行 /usr/local/bin/v2box update v1.0.12；不指定版本时获取最新正式版。
+            旧管理命令缺少 update 时，下载本版本 script/install.sh，执行 bash install.sh v1.0.12 --update。
             服务原本停止时升级不会启动，请完成部署或执行 v2box start。
             提供六个平台/架构安装包及 SHA-256；服务管理脚本适用于 Linux。

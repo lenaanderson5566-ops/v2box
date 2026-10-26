@@ -7,7 +7,6 @@ import (
 	"testing"
 
 	panel "github.com/lenaanderson5566-ops/v2box/api/v2board"
-	"github.com/lenaanderson5566-ops/v2box/conf"
 	"github.com/lenaanderson5566-ops/v2box/limiter"
 	"github.com/sagernet/sing-box/adapter"
 	M "github.com/sagernet/sing/common/metadata"
@@ -18,7 +17,7 @@ func TestRevokedGenerationCannotReenter(t *testing.T) {
 	u := panel.UserInfo{Id: 42, Uuid: testUUID}
 	limiter.AddLimiter("vless", "n", []panel.UserInfo{u}, nil)
 	defer limiter.DeleteLimiter("n")
-	v := New(conf.New())
+	v := New(testConf())
 	n := &nodeState{}
 	old := v.identities(n, []panel.UserInfo{u})
 	n.identities = old

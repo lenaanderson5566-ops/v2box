@@ -67,7 +67,7 @@ if $update_only; then
   [[ -z "$api_host$node_id$api_key" && "$ddns" == false && "$landing_page" == false ]] || { echo 'Update preserves existing settings; do not supply deployment options.' >&2; exit 1; }
 fi
 pending_deployment=false
-if [[ -e /etc/v2box/deployment-state.json ]]; then
+if [[ -e /etc/v2box/.deployment-pending ]] || compgen -G '/etc/v2box/deployment-state*.json' >/dev/null; then
   pending_deployment=true
   [[ -z "$api_host$node_id$api_key" && "$ddns" == false && "$landing_page" == false && -z "$landing_dir" && "$prompt_api_key" == false ]] || { echo 'Pending deployment: update program files without new deployment options, then resume.' >&2; exit 1; }
 fi

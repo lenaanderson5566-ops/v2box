@@ -26,6 +26,12 @@ import (
 	"time"
 )
 
+func testConf() *conf.Conf {
+	cfg := conf.New()
+	cfg.OutboundAllowCIDRs = []string{"127.0.0.0/8", "::1/128"}
+	return cfg
+}
+
 const testUUID = "b831381d-6324-4d53-ad4f-8cda48b30811"
 
 func testNode(t *testing.T, protocol string) *panel.NodeInfo {
@@ -179,7 +185,7 @@ func TestProtocolConnectionsAndAccounting(t *testing.T) {
 			users := []panel.UserInfo{{Id: 42, Uuid: testUUID}}
 			limiter.AddLimiter(protocol, n.Tag, users, nil)
 			t.Cleanup(func() { limiter.DeleteLimiter(n.Tag) })
-			cfg := conf.New()
+			cfg := testConf()
 			cfg.LogConfig.Level = "error"
 			v := New(cfg)
 			t.Cleanup(func() { v.Close() })
@@ -266,4 +272,35 @@ func TestTrafficSurvivesUserRemoval(t *testing.T) {
 	if len(got) != 1 || got[0].Upload != 100 || got[0].Download != 200 {
 		t.Fatalf("lost removed user's traffic: %+v", got)
 	}
+}
+
+func TestSetupContextDoesNotExpireLiveListener(t *testing.T) {
+	v := New(testConf())
+	defer v.Close()
+	info := testNode(t, "vless")
+	if err := v.AddNode(info.Tag, info); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	_, err := v.AddUsersContext(ctx, &AddUsersParams{Tag: info.Tag, Users: []panel.UserInfo{{Id: 1, Uuid: testUUID}}, NodeInfo: info})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	address := net.JoinHostPort("127.0.0.1", strconv.Itoa(info.Common.ServerPort))
+	conn, err := net.DialTimeout("tcp", address, time.Second)
+	if err != nil {
+		t.Fatalf("setup cancellation killed live listener: %v", err)
+	}
+	conn.Close()
+	canceled, stop := context.WithCancel(context.Background())
+	stop()
+	if _, err := v.AddUsersContext(canceled, &AddUsersParams{Tag: info.Tag}); err == nil {
+		t.Fatal("canceled startup accepted")
+	}
+	conn, err = net.DialTimeout("tcp", address, time.Second)
+	if err != nil {
+		t.Fatalf("rejected startup killed existing listener: %v", err)
+	}
+	conn.Close()
 }

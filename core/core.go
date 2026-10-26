@@ -71,18 +71,39 @@ func (v *V2Core) AddNode(tag string, info *panel.NodeInfo) error {
 	v.nodes[tag] = &nodeState{info: info}
 	return nil
 }
-func (v *V2Core) newBox(options option.Options) (*box.Box, context.CancelFunc, error) {
+func (v *V2Core) newBox(parent context.Context, options option.Options) (*box.Box, context.CancelFunc, error) {
+	if err := parent.Err(); err != nil {
+		return nil, nil, err
+	}
 	ctx, cancel := context.WithCancel(boxContext(context.Background()))
+	// The setup deadline cancels startup I/O, but does not expire a live Box.
+	stop := context.AfterFunc(parent, cancel)
+	defer stop()
 	b, err := box.New(box.Options{Context: ctx, Options: options})
 	if err != nil {
 		cancel()
 		return nil, nil, err
 	}
-	b.Router().AppendTracker(v.tracker)
-	if err = b.Start(); err != nil {
+	guard, err := newEgressTracker(v.Config.OutboundAllowCIDRs)
+	if err != nil {
 		cancel()
 		_ = b.Close()
 		return nil, nil, err
+	}
+	b.Router().AppendTracker(guard)
+	b.Router().AppendTracker(v.tracker)
+	if err = b.Start(); err == nil {
+		err = parent.Err()
+	}
+	if err != nil {
+		cancel()
+		_ = b.Close()
+		return nil, nil, err
+	}
+	if !stop() {
+		cancel()
+		_ = b.Close()
+		return nil, nil, parent.Err()
 	}
 	return b, cancel, nil
 }
@@ -93,6 +114,13 @@ func (v *V2Core) SetUsers(tag string, users []panel.UserInfo) error {
 // commit updates controller limits only after authentication validation succeeds.
 // It runs before new streams are admitted and must not call back into the core.
 func (v *V2Core) SetUsersWithCommit(tag string, users []panel.UserInfo, commit func()) error {
+	return v.setUsersContext(context.Background(), tag, users, commit)
+}
+
+func (v *V2Core) setUsersContext(ctx context.Context, tag string, users []panel.UserInfo, commit func()) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	v.access.Lock()
 	defer v.access.Unlock()
 	n, ok := v.nodes[tag]
@@ -129,7 +157,7 @@ func (v *V2Core) SetUsersWithCommit(tag string, users []panel.UserInfo, commit f
 	if err = v.tracker.updateUsers(tag, identities, func() error { return nil }); err != nil {
 		return err
 	}
-	b, cancel, err := v.newBox(options)
+	b, cancel, err := v.newBox(ctx, options)
 	if err != nil {
 		_ = v.tracker.updateUsers(tag, n.identities, func() error { return nil })
 		return err
@@ -142,7 +170,11 @@ func (v *V2Core) SetUsersWithCommit(tag string, users []panel.UserInfo, commit f
 	return nil
 }
 func (v *V2Core) AddUsers(p *AddUsersParams) (int, error) {
-	err := v.SetUsers(p.Tag, p.Users)
+	return v.AddUsersContext(context.Background(), p)
+}
+
+func (v *V2Core) AddUsersContext(ctx context.Context, p *AddUsersParams) (int, error) {
+	err := v.setUsersContext(ctx, p.Tag, p.Users, nil)
 	if err != nil {
 		return 0, err
 	}
@@ -215,6 +247,7 @@ func sortedUsers(users []panel.UserInfo) []panel.UserInfo {
 
 func (v *V2Core) TakeOnlineActivity(tag string) map[int]int64 { return v.tracker.takeActivity(tag) }
 
-// PreserveAccountingFrom is used only after old.Close has stopped its nodes.
-// Failed final reports for retained node tags can then retry after a reload.
+// PreserveAccountingFrom attaches a tracker before this core starts nodes.
+// Owners on the same backend share physical-server budgets while replacements
+// retain pending traffic. Callers must not change the tracker on a running core.
 func (v *V2Core) PreserveAccountingFrom(old *V2Core) { v.tracker = old.tracker }
