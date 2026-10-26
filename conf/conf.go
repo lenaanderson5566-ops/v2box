@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"github.com/spf13/viper"
@@ -28,6 +29,7 @@ type LogConfig struct {
 }
 
 type NodeConfig struct {
+	SharedListener        string      `mapstructure:"SharedListener"`
 	CertificateDirectory  string      `mapstructure:"CertificateDirectory"`
 	TrafficSpoolDirectory string      `mapstructure:"TrafficSpoolDirectory"`
 	APIVersion            string      `mapstructure:"ApiVersion"`
@@ -45,6 +47,10 @@ type LandingPage struct {
 	Enabled   bool   `mapstructure:"Enabled" json:"enabled"`
 	Directory string `mapstructure:"Directory" json:"directory"`
 }
+
+var sharedListenerName = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$`)
+
+func ValidSharedListener(name string) bool { return name == "" || sharedListenerName.MatchString(name) }
 
 func New() *Conf {
 	return &Conf{
@@ -75,6 +81,9 @@ func (p *Conf) LoadFromPath(filePath string) error {
 	}
 	for i := range p.NodeConfigs {
 		node := p.NodeConfigs[i]
+		if !ValidSharedListener(node.SharedListener) {
+			return fmt.Errorf("invalid SharedListener for node %d", i+1)
+		}
 		host, err := url.Parse(node.APIHost)
 		if err != nil || host.Hostname() == "" || (host.Scheme != "https" && host.Scheme != "http") || host.User != nil || host.RawQuery != "" || host.Fragment != "" || strings.EqualFold(strings.TrimSuffix(host.Hostname(), "."), "panel.example.com") || node.NodeID <= 0 || strings.TrimSpace(node.Key) == "" || node.Key == "REPLACE_ME" {
 			return fmt.Errorf("node %d has incomplete or example enrollment configuration; resume deployment from the panel before starting V2Box", i+1)

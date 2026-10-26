@@ -23,7 +23,8 @@ type nodeGroup struct {
 	ctx        context.Context
 	mu         sync.Mutex
 	accounting map[string]*core.V2Core
-	resources  map[string]*nodeWorker
+	resources  map[string]map[*nodeWorker]string
+	shared     *core.SharedListeners
 	retiring   map[string]<-chan struct{}
 	workers    map[string]*nodeWorker
 	all        sync.WaitGroup
@@ -49,17 +50,22 @@ type nodeWorker struct {
 }
 
 func newNodeGroup(ctx context.Context) *nodeGroup {
-	return &nodeGroup{ctx: ctx, workers: make(map[string]*nodeWorker), resources: make(map[string]*nodeWorker), accounting: make(map[string]*core.V2Core), retiring: make(map[string]<-chan struct{}), retry: 30 * time.Second}
+	return &nodeGroup{ctx: ctx, workers: make(map[string]*nodeWorker), resources: make(map[string]map[*nodeWorker]string), shared: core.NewSharedListeners(), accounting: make(map[string]*core.V2Core), retiring: make(map[string]<-chan struct{}), retry: 30 * time.Second}
 }
 func (g *nodeGroup) Apply(config *conf.Conf) error {
 	desired := make(map[string]*conf.Conf, len(config.NodeConfigs))
+	seen := make(map[string]bool)
 	for _, entry := range config.NodeConfigs {
 		key, err := conf.NodeIdentity(entry)
 		if err != nil {
 			return err
 		}
-		if _, exists := desired[key]; exists {
+		if seen[key] {
 			return fmt.Errorf("duplicate panel/node identity")
+		}
+		seen[key] = true
+		if !conf.ValidSharedListener(entry.SharedListener) {
+			return fmt.Errorf("invalid SharedListener")
 		}
 		local := *config
 		local.OutboundAllowCIDRs = append([]string(nil), config.OutboundAllowCIDRs...)
@@ -259,7 +265,7 @@ func (w *nodeWorker) reconcile(ctx context.Context, config *conf.Conf) error {
 }
 
 func (w *nodeWorker) claimResources(candidate *node.Node) (func(bool), error) {
-	paths := make(map[string]bool)
+	paths := make(map[string]string)
 	for _, info := range candidate.NodeInfos {
 		if info.Security != panel.Tls || info.Common.CertInfo.CertMode == "remote" {
 			continue
@@ -274,31 +280,65 @@ func (w *nodeWorker) claimResources(candidate *node.Node) (func(bool), error) {
 			if err != nil {
 				return nil, err
 			}
-			paths[absolute] = true
+			if previous, ok := paths[absolute]; ok && previous != info.SharedListener {
+				return nil, fmt.Errorf("certificate path has incompatible sharing owners")
+			}
+			paths[absolute] = info.SharedListener
 		}
 	}
 	w.group.mu.Lock()
 	defer w.group.mu.Unlock()
-	for name := range paths {
-		if owner := w.group.resources[name]; owner != nil && owner != w {
-			return nil, fmt.Errorf("certificate/key path is already owned by another node; use independent paths")
+	for name, sharing := range paths {
+		for owner, ownerSharing := range w.group.resources[name] {
+			if owner != w && (sharing == "" || ownerSharing != sharing) {
+				return nil, fmt.Errorf("certificate/key path is already owned by another node; use independent paths or the same explicit SharedListener")
+			}
 		}
 	}
 	previous := w.claims
-	for name := range paths {
-		w.group.resources[name] = w
+	previousGroups := make(map[string]string)
+	for name := range previous {
+		previousGroups[name] = w.group.resources[name][w]
+	}
+	for name, sharing := range paths {
+		if w.group.resources[name] == nil {
+			w.group.resources[name] = make(map[*nodeWorker]string)
+		}
+		// A sharing-mode transition reserves the old path exclusively until the
+		// replacement commits. New peers cannot race an old ACME owner or rollback.
+		if previous[name] && previousGroups[name] != sharing {
+			w.group.resources[name][w] = ""
+		} else {
+			w.group.resources[name][w] = sharing
+		}
 	}
 	return func(commit bool) {
 		w.group.mu.Lock()
 		defer w.group.mu.Unlock()
-		keep, remove := previous, paths
 		if commit {
-			keep, remove = paths, previous
-			w.claims = paths
-		}
-		for name := range remove {
-			if !keep[name] && w.group.resources[name] == w {
-				delete(w.group.resources, name)
+			w.claims = make(map[string]bool)
+			for name, sharing := range paths {
+				w.claims[name] = true
+				w.group.resources[name][w] = sharing
+			}
+			for name := range previous {
+				if _, keep := paths[name]; !keep {
+					delete(w.group.resources[name], w)
+					if len(w.group.resources[name]) == 0 {
+						delete(w.group.resources, name)
+					}
+				}
+			}
+		} else {
+			for name := range paths {
+				if previous[name] {
+					w.group.resources[name][w] = previousGroups[name]
+				} else {
+					delete(w.group.resources[name], w)
+				}
+				if len(w.group.resources[name]) == 0 {
+					delete(w.group.resources, name)
+				}
 			}
 		}
 	}, nil
@@ -307,7 +347,8 @@ func (w *nodeWorker) releaseClaims() {
 	w.group.mu.Lock()
 	defer w.group.mu.Unlock()
 	for name := range w.claims {
-		if w.group.resources[name] == w {
+		delete(w.group.resources[name], w)
+		if len(w.group.resources[name]) == 0 {
 			delete(w.group.resources, name)
 		}
 	}
@@ -321,6 +362,7 @@ func (g *nodeGroup) backendAccounting(config *conf.Conf) *core.V2Core {
 	previous := g.accounting[host]
 	if previous == nil {
 		previous = core.New(config)
+		previous.UseSharedListeners(g.shared)
 		g.accounting[host] = previous
 	}
 	return previous

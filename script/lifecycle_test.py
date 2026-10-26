@@ -93,6 +93,39 @@ esac
         calls=(self.root/'service-calls').read_text()
         self.assertIn('kill --kill-whom=main --signal=HUP v2box',calls);self.assertNotIn('restart',calls)
         self.assertTrue(self.active.exists());self.assertEqual((self.config/'config.json').read_bytes(),self.original_config)
+    def test_shared_listener_rejects_old_program_without_changing_config(self):
+        result = subprocess.run(['bash', str(self.root/'usr/local/bin/v2box'), 'share-listener', 'public', '1'], env=self.env, capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Upgrade V2Box', result.stderr)
+        self.assertEqual((self.config/'config.json').read_bytes(), self.original_config)
+        self.assertEqual((self.config/'saved.cer').read_text(), 'retain certificate')
+
+    def test_shared_listener_checks_running_program_before_writing(self):
+        self.write(self.lib/'v2box', "#!/bin/sh\necho '" + json.dumps({'features': ['multi-panel-v1', 'reload-signal-v1', 'shared-listener-v1']}) + "'\n")
+        process = self.root/'proc/123'
+        process.mkdir(parents=True)
+        self.write(process/'exe', "#!/bin/sh\necho '" + json.dumps({'features': ['multi-panel-v1', 'reload-signal-v1']}) + "'\n")
+        (self.root/'mainpid').write_text('123')
+        result = subprocess.run(['bash', str(self.root/'usr/local/bin/v2box'), 'share-listener', 'public', '1'], env=self.env, capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual((self.config/'config.json').read_bytes(), self.original_config)
+
+    def test_shared_listener_supported_program_preserves_stopped_service(self):
+        capabilities = json.dumps({'features': ['multi-panel-v1', 'reload-signal-v1', 'shared-listener-v1']})
+        self.write(self.lib/'v2box', "#!/bin/sh\necho '" + capabilities + "'\n")
+        source = Path(__file__).with_name('node-credentials.py').read_text()
+        source = source.replace('"/etc/v2box/config.json"', repr(str(self.config/'config.json')))
+        self.write(self.lib/'node-credentials.py', source)
+        self.active.unlink()
+        result = subprocess.run(['bash', str(self.root/'usr/local/bin/v2box'), 'share-listener', 'public', '1'], env=self.env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        expected = json.loads(self.original_config)
+        expected['Nodes'][0]['SharedListener'] = 'public'
+        self.assertEqual(json.loads((self.config/'config.json').read_text()), expected)
+        self.assertFalse(self.active.exists())
+        self.assertNotIn('restart', (self.root/'service-calls').read_text())
+        self.assertEqual((self.config/'saved.cer').read_text(), 'retain certificate')
+
     def test_reload_rejects_unsupported_running_binary(self):
         process=self.root/'proc/123';process.mkdir(parents=True)
         self.write(process/'exe','#!/bin/sh\necho old-version\n');(self.root/'mainpid').write_text('123')

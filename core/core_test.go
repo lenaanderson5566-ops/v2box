@@ -104,7 +104,11 @@ func clientBox(t *testing.T, n *panel.NodeInfo, uuid string) *box.Box {
 	case "shadowsocks":
 		out["method"] = n.Common.Cipher
 		if n.Common.ServerKey != "" {
-			out["password"] = n.Common.ServerKey + ":" + base64.StdEncoding.EncodeToString([]byte(uuid[:16]))
+			size := 16
+			if n.Common.Cipher == "2022-blake3-aes-256-gcm" {
+				size = 32
+			}
+			out["password"] = n.Common.ServerKey + ":" + base64.StdEncoding.EncodeToString([]byte(uuid[:size]))
 		} else {
 			out["password"] = uuid
 		}

@@ -26,6 +26,32 @@ class CredentialsTest(unittest.TestCase):
                 self.assertEqual(path.stat().st_mode & 0o777, 0o600)
             self.assertEqual(len(list(Path(directory).iterdir())), 1)
 
+    def test_shared_listener_selection_preserves_unrelated_settings(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            original = {"Nodes": [{"ApiKey": "first", "CertificateDirectory": "/keep"}, {"ApiKey": "second"}, {"ApiKey": "third"}], "Log": {"Level": "warn"}}
+            path.write_text(json.dumps(original))
+            module.set_shared_listener(path, [0, 1], "public-443")
+            updated = json.loads(path.read_text())
+            self.assertEqual(updated["Nodes"][0]["SharedListener"], "public-443")
+            self.assertEqual(updated["Nodes"][1]["SharedListener"], "public-443")
+            self.assertEqual(updated["Nodes"][2], original["Nodes"][2])
+            self.assertEqual(updated["Nodes"][0]["CertificateDirectory"], "/keep")
+            self.assertEqual(updated["Log"], original["Log"])
+            self.assertEqual([n["ApiKey"] for n in updated["Nodes"]], ["first", "second", "third"])
+            module.set_shared_listener(path, [1], "-")
+            self.assertNotIn("SharedListener", json.loads(path.read_text())["Nodes"][1])
+            before = path.read_bytes()
+            for indices, group in [([], "g"), ([0, 0], "g"), ([99], "g"), ([0], "../invalid")]:
+                with self.assertRaises(ValueError):
+                    module.set_shared_listener(path, indices, group)
+                self.assertEqual(path.read_bytes(), before)
+            with patch.object(module.os, "replace", side_effect=OSError("disk failure")):
+                with self.assertRaises(OSError):
+                    module.set_shared_listener(path, [0], "new-group")
+            self.assertEqual(path.read_bytes(), before)
+            self.assertEqual(len(list(Path(directory).iterdir())), 1)
+
     def test_bad_key_and_failed_write_preserve_config(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "config.json"

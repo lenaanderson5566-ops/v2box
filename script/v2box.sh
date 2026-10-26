@@ -19,7 +19,7 @@ check_runtime() {
     read -r pid < /run/v2box.pid
   fi
   [[ "$pid" =~ ^[1-9][0-9]*$ && -x /proc/$pid/exe ]] || { echo 'Cannot verify running V2Box identity; existing nodes preserved.' >&2; return 1; }
-  timeout -k 2 10 /proc/"$pid"/exe capabilities | jq -e '.features | index("multi-panel-v1") != null and index("reload-signal-v1") != null' >/dev/null || {
+  timeout -k 2 10 /proc/"$pid"/exe capabilities | jq -e --arg required "${1:-multi-panel-v1}" '.features | index("multi-panel-v1") != null and index("reload-signal-v1") != null and index($required) != null' >/dev/null || {
     echo 'Running V2Box lacks independent multi-panel reload. Upgrade it in a maintenance window before deploying another node.' >&2; return 1;
   }
 }
@@ -105,7 +105,23 @@ case "$1" in
     fi
     rm -f -- /usr/local/lib/v2box/v2box /usr/local/lib/v2box/v2box.previous /usr/local/lib/v2box/manager.sh /usr/local/lib/v2box/install.sh /usr/local/lib/v2box/node-credentials.py /usr/local/lib/v2box/node-network.py /usr/local/bin/v2box
     echo 'V2Box uninstalled. Configuration and certificates remain in /etc/v2box. Revoke node credentials and review domain bindings in the panel.';;
-  check-runtime) check_runtime;;
+  check-runtime)
+    shift
+    (($# <= 1)) || exit 1
+    check_runtime "${1:-multi-panel-v1}"
+    if (($#)); then printf '%s\n' "$1"; fi;;
+  share-listener)
+    shift
+    [[ $EUID -eq 0 && $# -ge 2 ]] || { echo 'Usage: v2box share-listener GROUP NODE_NUMBER [NODE_NUMBER ...] (use - to disable)' >&2; exit 1; }
+    timeout -k 2 10 "$binary" capabilities | jq -e '.features | index("shared-listener-v1") != null' >/dev/null || { echo 'Upgrade V2Box and scripts before configuring shared listeners.' >&2; exit 1; }
+    check_runtime shared-listener-v1
+    [[ ! -L /etc/v2box && ! -L /etc/v2box/.bootstrap.lock && ! -L /etc/v2box/.maintenance.lock ]] || exit 1
+    exec 9>/etc/v2box/.bootstrap.lock
+    flock -n 9 || { echo 'A deployment is running; retry later.' >&2; exit 1; }
+    exec 8>/etc/v2box/.maintenance.lock
+    flock -n 8 || exit 1
+    python3 /usr/local/lib/v2box/node-credentials.py --shared-listener "$@"
+    echo 'Initial shared-listener migration can replace the selected listeners. File watching may apply this immediately; otherwise run v2box reload. A stopped service stays stopped.';;
   reload)
     check_runtime
     if command -v systemctl >/dev/null; then
@@ -134,6 +150,6 @@ case "$1" in
   credential) exec python3 /usr/local/lib/v2box/node-credentials.py;;
   ddns) shift; exec python3 /usr/local/lib/v2box/node-network.py "${@:-status}";;
   version|server|capabilities) exec "$binary" "$@";;
-  help) echo 'Usage: v2box {start|stop|restart|reload|status|enable|disable|log|version|server|ip|credential|ddns|resume|update [release-tag]|uninstall [--stop-network] [--yes]|help}';;
+  help) echo 'Usage: v2box {start|stop|restart|reload|status|enable|disable|log|version|server|ip|credential|share-listener GROUP NODE_NUMBER...|ddns|resume|update [release-tag]|uninstall [--stop-network] [--yes]|help}';;
   *) echo 'Unknown command. Run: v2box help'; exit 1;;
 esac

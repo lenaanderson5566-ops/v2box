@@ -29,6 +29,7 @@ type groupPanel struct {
 	blocked  atomic.Bool
 	requests atomic.Int64
 	failed   atomic.Int64
+	applied  atomic.Int64
 	uuid     string
 	key      string
 }
@@ -43,7 +44,7 @@ func groupFreePort(t *testing.T) int {
 	listener.Close()
 	return port
 }
-func newGroupPanel(t *testing.T, uuid, key string) *groupPanel {
+func newGroupPanel(t *testing.T, uuid, key string, tlsSettings ...map[string]any) *groupPanel {
 	t.Helper()
 	fixture := &groupPanel{uuid: uuid, key: key}
 	fixture.port.Store(int64(groupFreePort(t)))
@@ -64,6 +65,11 @@ func newGroupPanel(t *testing.T, uuid, key string) *groupPanel {
 				return
 			}
 			port := fixture.port.Load()
+			if len(tlsSettings) > 0 {
+				w.Header().Set("ETag", fmt.Sprintf(`W/"%064x"`, port))
+				json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"protocol": "anytls", "tls": 1, "tlsSettings": tlsSettings[0], "listenAddress": "127.0.0.1", "listenPort": port, "intervals": map[string]any{"pushInterval": 3600, "pullInterval": 3600}}})
+				return
+			}
 			w.Header().Set("ETag", fmt.Sprintf(`W/"%064x"`, port))
 			fmt.Fprintf(w, `{"data":{"protocol":"vless","tls":0,"listenAddress":"127.0.0.1","listenPort":%d,"intervals":{"pushInterval":3600,"pullInterval":3600}}}`, port)
 			return
@@ -74,6 +80,9 @@ func newGroupPanel(t *testing.T, uuid, key string) *groupPanel {
 		case "/api/v10/server/capabilities":
 			var body struct{ Configuration struct{ State string } }
 			json.NewDecoder(r.Body).Decode(&body)
+			if body.Configuration.State == "applied" {
+				fixture.applied.Add(1)
+			}
 			if body.Configuration.State == "failed" {
 				fixture.failed.Add(1)
 			}
@@ -364,5 +373,50 @@ func TestNodeGroupSharesQuotasWithinBackendOnly(t *testing.T) {
 	}
 	if got := other.TrafficBudgetSnapshot("other"); got == nil || got.UsedBytes != 10 {
 		t.Fatal("another backend's same server ID shared a quota")
+	}
+}
+
+func TestNodeGroupSharedCertificateClaimsRetainOtherOwner(t *testing.T) {
+	group := newNodeGroup(context.Background())
+	a := &nodeWorker{group: group, claims: map[string]bool{}}
+	b := &nodeWorker{group: group, claims: map[string]bool{}}
+	outsider := &nodeWorker{group: group, claims: map[string]bool{}}
+	candidate := &node.Node{NodeInfos: []*panel.NodeInfo{{SharedListener: "shared", Security: panel.Tls, Common: &panel.CommonNode{CertInfo: &panel.CertInfo{CertMode: "file", CertFile: filepath.Join(t.TempDir(), "shared.cer"), KeyFile: filepath.Join(t.TempDir(), "shared.key")}}}}}
+	for _, worker := range []*nodeWorker{a, b} {
+		finish, err := worker.claimResources(candidate)
+		if err != nil {
+			t.Fatal(err)
+		}
+		finish(true)
+	}
+	a.releaseClaims()
+	unshared := *candidate.NodeInfos[0]
+	unshared.SharedListener = ""
+	if _, err := outsider.claimResources(&node.Node{NodeInfos: []*panel.NodeInfo{&unshared}}); err == nil {
+		t.Fatal("peer lost certificate ownership after first owner left")
+	}
+	b.releaseClaims()
+	if len(group.resources) != 0 {
+		t.Fatal("shared certificate claims leaked")
+	}
+}
+
+func TestInvalidSharedOptInPreservesExistingListener(t *testing.T) {
+	limiter.Init()
+	panel := newGroupPanel(t, "b831381d-6324-4d53-ad4f-8cda48b30811", "panel")
+	cfg := conf.New()
+	cfg.NodeConfigs = []conf.NodeConfig{panel.entry(t)}
+	group := newNodeGroup(context.Background())
+	defer group.Close()
+	if err := group.Apply(cfg); err != nil {
+		t.Fatal(err)
+	}
+	waitGroup(t, func() bool { return panel.applied.Load() > 0 })
+	cfg.NodeConfigs[0].SharedListener = "../invalid"
+	if err := group.Apply(cfg); err == nil {
+		t.Fatal("invalid sharing selection accepted")
+	}
+	if !groupListening(panel.port.Load()) {
+		t.Fatal("invalid sharing selection stopped an existing node")
 	}
 }

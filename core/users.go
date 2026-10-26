@@ -1,6 +1,7 @@
 package core
 
 import (
+	"crypto/sha256"
 	"fmt"
 	panel "github.com/lenaanderson5566-ops/v2box/api/v2board"
 	hotnaive "github.com/lenaanderson5566-ops/v2box/internal/inbound/naive"
@@ -21,6 +22,9 @@ func (v *V2Core) identities(n *nodeState, users []panel.UserInfo) map[string]pan
 		if name == "" {
 			v.generation++
 			name = fmt.Sprintf("%s/%d/%d", u.Uuid, u.Id, v.generation)
+			if n.info != nil && n.info.SharedListener != "" {
+				name = fmt.Sprintf("%x/%d/%d", sha256.Sum256([]byte(n.info.Tag+"\x00"+u.Uuid)), u.Id, v.generation)
+			}
 		}
 		result[name] = u
 	}

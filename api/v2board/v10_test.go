@@ -557,3 +557,32 @@ func TestDomainTransitionRequiresPublicationAcknowledgement(t *testing.T) {
 		t.Fatal("acknowledged transition continued to block future configuration fetches")
 	}
 }
+
+func TestSharedListenerSelectionCannotBeProvidedByPanel(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/capabilities") {
+			ioBody := `{"data":{"accepted":true}}`
+			w.Write([]byte(ioBody))
+			return
+		}
+		w.Header().Set("ETag", `"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"`)
+		w.Write([]byte(`{"data":{"protocol":"vless","tls":0,"listenAddress":"127.0.0.1","listenPort":443,"sharedListener":"remote-cannot-enable","intervals":{"pushInterval":60,"pullInterval":60}}}`))
+	}))
+	defer server.Close()
+	for _, group := range []string{"", "local-group"} {
+		client, err := newTestPanel(t, server, &conf.NodeConfig{APIHost: server.URL, NodeType: "v2box", NodeID: 1, Key: "fixture", SharedListener: group})
+		if err != nil {
+			t.Fatal(err)
+		}
+		info, err := client.GetNodeInfo(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.SharedListener != group {
+			t.Fatal("panel changed local sharing selection")
+		}
+	}
+	if _, err := New(&conf.NodeConfig{APIHost: server.URL, NodeType: "v2box", NodeID: 1, Key: "fixture", SharedListener: "../invalid"}); err == nil {
+		t.Fatal("invalid shared listener group accepted")
+	}
+}

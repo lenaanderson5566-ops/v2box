@@ -176,6 +176,7 @@ func reloadConfiguration(ctx context.Context, newConf *conf.Conf, nodes **node.N
 		return nil
 	}
 	newCore := core.New(newConf)
+	newCore.InheritSharedListeners(*v2core)
 	defer func() {
 		if *v2core != newCore {
 			_ = newCore.Close()

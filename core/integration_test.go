@@ -70,12 +70,14 @@ func exchangeUDP(t *testing.T, b *box.Box, destination net.Addr) {
 	t.Helper()
 	out, _ := b.Outbound().Outbound("proxy")
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
-	defer cancel()
+	t.Cleanup(cancel)
 	c, err := out.ListenPacket(ctx, M.ParseSocksaddr(destination.String()))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer c.Close()
+	// Keep the session alive until accounting assertions finish. Closing the
+	// client can retire target caches before the server publishes its last write.
+	t.Cleanup(func() { c.Close() })
 	_ = c.SetDeadline(time.Now().Add(8 * time.Second))
 	payload := []byte("udp-accounting-echo")
 	if _, err = c.WriteTo(payload, destination); err != nil {

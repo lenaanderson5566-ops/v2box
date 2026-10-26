@@ -19,6 +19,7 @@ import (
 // Panel is the interface for different panel's api.
 
 type Client struct {
+	sharedListener        string
 	configurationReport   atomic.Pointer[ConfigurationReport]
 	targetPolicy          atomic.Pointer[cachedTargetPolicy]
 	trafficMu             sync.Mutex
@@ -42,6 +43,9 @@ type Client struct {
 }
 
 func New(c *conf.NodeConfig) (*Client, error) {
+	if !conf.ValidSharedListener(c.SharedListener) {
+		return nil, errors.New("invalid SharedListener")
+	}
 	endpoint, err := url.Parse(c.APIHost)
 	if err != nil || endpoint.Scheme != "https" || endpoint.Hostname() == "" || endpoint.User != nil || endpoint.RawQuery != "" || endpoint.ForceQuery || endpoint.Fragment != "" || endpoint.Opaque != "" {
 		return nil, errors.New("ApiHost must be an HTTPS URL without credentials, query or fragment; update the panel address before upgrading this node")
@@ -105,6 +109,7 @@ func New(c *conf.NodeConfig) (*Client, error) {
 
 	return &Client{
 		v10:                   version == "v10",
+		sharedListener:        c.SharedListener,
 		certificateDirectory:  c.CertificateDirectory,
 		nodeType:              nodeType,
 		trafficSpoolDirectory: c.TrafficSpoolDirectory,

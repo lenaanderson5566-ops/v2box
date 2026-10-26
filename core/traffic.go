@@ -23,6 +23,7 @@ type trafficKey struct {
 	uid int
 }
 type trafficTracker struct {
+	shared      atomic.Pointer[SharedListeners]
 	targets     targetTracker
 	budgets     map[string]*localTrafficBudget
 	hasBudgets  atomic.Bool
@@ -223,6 +224,12 @@ type meter struct {
 }
 
 func (t *trafficTracker) newMeter(ctx context.Context, m adapter.InboundContext) *meter {
+	if hub := t.shared.Load(); hub != nil {
+		if owner, ok := hub.owner(m.Inbound, m.User); ok {
+			m.Inbound = owner.tag
+			return owner.tracker.newMeter(ctx, m)
+		}
+	}
 	if ctx.Err() != nil {
 		return nil
 	}
@@ -399,7 +406,7 @@ func (t *trafficTracker) RoutedConnection(ctx context.Context, c net.Conn, m ada
 	}
 	meter.targetFixed = true
 	wrapped := &meteredConn{Conn: c, m: meter, prefix: prefix}
-	if !t.register(m.Inbound, wrapped, meter) {
+	if !meter.tracker.register(meter.tag, wrapped, meter) {
 		_ = wrapped.Close()
 	}
 	return wrapped
@@ -411,7 +418,7 @@ func (t *trafficTracker) RoutedPacketConnection(ctx context.Context, c N.PacketC
 		return &deniedPacketConn{PacketConn: c}
 	}
 	wrapped := &meteredPacketConn{PacketConn: c, m: meter}
-	if !t.register(m.Inbound, wrapped, meter) {
+	if !meter.tracker.register(meter.tag, wrapped, meter) {
 		_ = wrapped.Close()
 	}
 	return wrapped

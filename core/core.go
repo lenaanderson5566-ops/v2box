@@ -14,18 +14,20 @@ import (
 	"github.com/sagernet/sing-box/option"
 )
 
-// Each panel node owns a Box. Authentication updates preserve its listeners
-// and unaffected sessions; accounting lives independently of the Box.
+// Independent panel nodes normally own a Box. Explicit protocol groups share
+// only a compatible listener; authentication policy and accounting stay per node.
 type V2Core struct {
 	Config     *conf.Conf
 	ReloadCh   chan struct{}
 	access     sync.Mutex
+	shared     *SharedListeners
 	nodes      map[string]*nodeState
 	tracker    *trafficTracker
 	closed     bool
 	generation uint64
 }
 type nodeState struct {
+	shared     bool
 	info       *panel.NodeInfo
 	users      []panel.UserInfo
 	server     *box.Box
@@ -39,7 +41,9 @@ type AddUsersParams struct {
 }
 
 func New(c *conf.Conf) *V2Core {
-	return &V2Core{Config: c, nodes: make(map[string]*nodeState), tracker: newTrafficTracker()}
+	v := &V2Core{Config: c, nodes: make(map[string]*nodeState), tracker: newTrafficTracker()}
+	v.UseSharedListeners(NewSharedListeners())
+	return v
 }
 func (v *V2Core) Start(infos []*panel.NodeInfo) error {
 	for _, n := range infos {
@@ -53,6 +57,9 @@ func (v *V2Core) Start(infos []*panel.NodeInfo) error {
 // ValidateNodeUsers checks a replacement authentication table without opening listeners.
 func (v *V2Core) ValidateNodeUsers(info *panel.NodeInfo, users []panel.UserInfo) error {
 	_, err := buildOptions(info, users, v.Config)
+	if err == nil && info.SharedListener != "" {
+		err = v.shared.validate(v, info, users)
+	}
 	return err
 }
 
@@ -132,6 +139,9 @@ func (v *V2Core) setUsersContext(ctx context.Context, tag string, users []panel.
 		return err
 	}
 	identities := v.identities(n, users)
+	if n.info.SharedListener != "" {
+		return v.shared.setUsers(ctx, v, n, users, identities, commit)
+	}
 	nameUsers(options.Inbounds[0].Options, identities)
 	if n.server != nil {
 		in, found := n.server.Inbound().Get(tag)
@@ -188,6 +198,9 @@ func (v *V2Core) DelNode(tag string) error {
 		return nil
 	}
 	delete(v.nodes, tag)
+	if n.shared {
+		return v.shared.remove(v, n)
+	}
 	v.revokeNode(tag, n)
 	v.tracker.setUsers(tag, nil)
 	if n.cancel != nil {
@@ -206,6 +219,10 @@ func (v *V2Core) Close() error {
 	v.closed = true
 	var errs []error
 	for tag, n := range v.nodes {
+		if n.shared {
+			errs = append(errs, v.shared.remove(v, n))
+			continue
+		}
 		v.revokeNode(tag, n)
 		v.tracker.setUsers(tag, nil)
 		if n.cancel != nil {
@@ -250,4 +267,14 @@ func (v *V2Core) TakeOnlineActivity(tag string) map[int]int64 { return v.tracker
 // PreserveAccountingFrom attaches a tracker before this core starts nodes.
 // Owners on the same backend share physical-server budgets while replacements
 // retain pending traffic. Callers must not change the tracker on a running core.
-func (v *V2Core) PreserveAccountingFrom(old *V2Core) { v.tracker = old.tracker }
+func (v *V2Core) PreserveAccountingFrom(old *V2Core) {
+	v.tracker = old.tracker
+	v.UseSharedListeners(old.shared)
+}
+
+// UseSharedListeners is called only before this core starts nodes.
+func (v *V2Core) UseSharedListeners(hub *SharedListeners) {
+	v.shared = hub
+	v.tracker.shared.Store(hub)
+}
+func (v *V2Core) InheritSharedListeners(old *V2Core) { v.UseSharedListeners(old.shared) }

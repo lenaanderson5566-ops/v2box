@@ -23,6 +23,7 @@ const (
 )
 
 type NodeInfo struct {
+	SharedListener         string
 	CertificateFingerprint string
 	ConfigurationHash      string
 	Id                     int
@@ -193,6 +194,7 @@ func (c *Client) GetNodeInfo(ctx context.Context) (node *NodeInfo, err error) {
 	}
 	node = &NodeInfo{
 		ConfigurationHash: configurationHash,
+		SharedListener:    c.sharedListener,
 		Id:                c.NodeId,
 	}
 	// parse protocol params
