@@ -2,6 +2,7 @@ package panel
 
 import (
 	"context"
+	"fmt"
 	"github.com/lenaanderson5566-ops/v2box/conf"
 	"net"
 	"net/http"
@@ -182,5 +183,41 @@ func TestCloseIdleConnectionsReleasesSocketAndAllowsReuse(t *testing.T) {
 		case <-time.After(time.Second):
 			t.Fatal("idle panel socket retained")
 		}
+	}
+}
+
+func TestSharedACMEBindingPreservesModeAndPinsDomain(t *testing.T) {
+	for _, mode := range []string{"http", "dns"} {
+		t.Run(mode, func(t *testing.T) {
+			server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				fmt.Fprintf(w, `{"protocol":"vless","network":"tcp","tls":1,"server_port":20001,"tls_settings":{"cert_mode":%q,"server_name":"node.example.test"},"base_config":{"push_interval":60,"pull_interval":60}}`, mode)
+			}))
+			defer server.Close()
+			binding := &conf.CertificateBinding{Domain: "node.example.test", CertFile: "/existing/cert.pem", KeyFile: "/existing/key.pem"}
+			client, err := newTestPanel(t, server, &conf.NodeConfig{APIVersion: "legacy", APIHost: server.URL, NodeType: "v2box", NodeID: 14, Key: "test", SharedListener: "automatic", SharedCertificate: binding})
+			if err != nil {
+				t.Fatal(err)
+			}
+			info, err := client.GetNodeInfo(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			cert := info.Common.CertInfo
+			if cert.CertMode != mode || cert.CertFile != binding.CertFile || cert.KeyFile != binding.KeyFile || cert.LegacyCertFile != "" {
+				t.Fatal("binding rewrote renewal mode or source paths")
+			}
+			binding.LegacyCertFile, binding.LegacyKeyFile = "/old/cert.pem", "/old/key.pem"
+			client.nodeEtag, client.responseBodyHash = "", ""
+			migrated, err := client.GetNodeInfo(context.Background())
+			if err != nil || migrated.Common.CertInfo.LegacyCertFile != binding.LegacyCertFile || migrated.Common.CertInfo.LegacyKeyFile != binding.LegacyKeyFile {
+				t.Fatal("binding lost legacy certificate/guard provenance", err)
+			}
+			binding.Domain = "another.example.test"
+			client.nodeEtag = ""
+			client.responseBodyHash = ""
+			if _, err := client.GetNodeInfo(context.Background()); err == nil {
+				t.Fatal("panel domain change reused an unrelated certificate binding")
+			}
+		})
 	}
 }

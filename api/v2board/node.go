@@ -247,6 +247,14 @@ func (c *Client) GetNodeInfo(ctx context.Context) (node *NodeInfo, err error) {
 			kf = filepath.Join(c.certificateDirectory, cm.Protocol+".key")
 		}
 	}
+	if binding := c.sharedCertificate; binding != nil {
+		legacyValid := (binding.LegacyCertFile == "" && binding.LegacyKeyFile == "") || (filepath.IsAbs(binding.LegacyCertFile) && filepath.IsAbs(binding.LegacyKeyFile) && filepath.Clean(binding.LegacyCertFile) != filepath.Clean(binding.LegacyKeyFile))
+		if !legacyValid || node.Security != Tls || c.sharedListener == "" || (cm.TlsSettings.CertMode != "http" && cm.TlsSettings.CertMode != "dns") || !strings.EqualFold(strings.TrimSuffix(binding.Domain, "."), strings.TrimSuffix(cm.TlsSettings.PrimaryServerName(), ".")) || !filepath.IsAbs(binding.CertFile) || !filepath.IsAbs(binding.KeyFile) || filepath.Clean(binding.CertFile) == filepath.Clean(binding.KeyFile) {
+			return nil, fmt.Errorf("invalid shared ACME certificate binding; original certificate paths retained")
+		}
+		cf, kf = binding.CertFile, binding.KeyFile
+		legacyCert, legacyKey = binding.LegacyCertFile, binding.LegacyKeyFile
+	}
 	cm.CertInfo = &CertInfo{
 		CertMode:       cm.TlsSettings.CertMode,
 		CertFile:       cf,

@@ -34,7 +34,7 @@ func naiveClient(t *testing.T, n *panel.NodeInfo) *http.ClientConn {
 	protocols.SetHTTP2(true)
 	// Native manually managed ClientConns otherwise retain a closed connection
 	// for up to five seconds in the transport's unused-connection error cache.
-	transport := &http.Transport{TLSClientConfig: &tls.Config{RootCAs: roots, ServerName: "localhost"}, Protocols: protocols, IdleConnTimeout: time.Second}
+	transport := &http.Transport{TLSClientConfig: &tls.Config{RootCAs: roots, ServerName: n.Common.CertInfo.CertDomain}, Protocols: protocols, IdleConnTimeout: time.Second}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	client, err := transport.NewClientConn(ctx, "https", net.JoinHostPort("127.0.0.1", strconv.Itoa(n.Common.ServerPort)))

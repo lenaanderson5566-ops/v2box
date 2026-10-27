@@ -271,6 +271,10 @@ func (w *nodeWorker) claimResources(candidate *node.Node) (func(bool), error) {
 			continue
 		}
 		cert := info.Common.CertInfo
+		sharing := info.SharedListener
+		if sharing != "" {
+			sharing += "\x00" + strings.ToLower(strings.TrimSuffix(cert.CertDomain, "."))
+		}
 		replace := strings.NewReplacer("{domain}", cert.CertDomain, "{email}", cert.Email)
 		for _, name := range []string{cert.CertFile, cert.KeyFile} {
 			if name == "" {
@@ -280,10 +284,10 @@ func (w *nodeWorker) claimResources(candidate *node.Node) (func(bool), error) {
 			if err != nil {
 				return nil, err
 			}
-			if previous, ok := paths[absolute]; ok && previous != info.SharedListener {
+			if previous, ok := paths[absolute]; ok && previous != sharing {
 				return nil, fmt.Errorf("certificate path has incompatible sharing owners")
 			}
-			paths[absolute] = info.SharedListener
+			paths[absolute] = sharing
 		}
 	}
 	w.group.mu.Lock()

@@ -78,11 +78,15 @@ func (v *V2Core) AddNode(tag string, info *panel.NodeInfo) error {
 	v.nodes[tag] = &nodeState{info: info}
 	return nil
 }
-func (v *V2Core) newBox(parent context.Context, options option.Options) (*box.Box, context.CancelFunc, error) {
+func (v *V2Core) newBox(parent context.Context, options option.Options, certificates ...*sharedCertificateStore) (*box.Box, context.CancelFunc, error) {
 	if err := parent.Err(); err != nil {
 		return nil, nil, err
 	}
-	ctx, cancel := context.WithCancel(boxContext(context.Background()))
+	base := boxContext(context.Background())
+	if len(certificates) != 0 {
+		base = context.WithValue(base, sharedCertificateContextKey{}, certificates[0])
+	}
+	ctx, cancel := context.WithCancel(base)
 	// The setup deadline cancels startup I/O, but does not expire a live Box.
 	stop := context.AfterFunc(parent, cancel)
 	defer stop()

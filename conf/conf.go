@@ -28,18 +28,28 @@ type LogConfig struct {
 	Access string `mapstructure:"Access"`
 }
 
+// CertificateBinding reuses an existing ACME pair without changing the panel's
+// renewal mode. Domain pinning prevents a later panel edit repurposing its paths.
+type CertificateBinding struct {
+	LegacyCertFile string `mapstructure:"LegacyCertFile"`
+	LegacyKeyFile  string `mapstructure:"LegacyKeyFile"`
+	Domain         string `mapstructure:"Domain"`
+	CertFile       string `mapstructure:"CertFile"`
+	KeyFile        string `mapstructure:"KeyFile"`
+}
 type NodeConfig struct {
-	SharedListener        string      `mapstructure:"SharedListener"`
-	CertificateDirectory  string      `mapstructure:"CertificateDirectory"`
-	TrafficSpoolDirectory string      `mapstructure:"TrafficSpoolDirectory"`
-	APIVersion            string      `mapstructure:"ApiVersion"`
-	LandingPage           LandingPage `mapstructure:"LandingPage"`
-	NodeType              string      `mapstructure:"NodeType"`
-	APIHost               string      `mapstructure:"ApiHost"`
-	NodeID                int         `mapstructure:"NodeID"`
-	Key                   string      `mapstructure:"ApiKey"`
-	Timeout               int         `mapstructure:"Timeout"`
-	RetryCount            *int        `mapstructure:"RetryCount"`
+	SharedCertificate     *CertificateBinding `mapstructure:"SharedCertificate"`
+	SharedListener        string              `mapstructure:"SharedListener"`
+	CertificateDirectory  string              `mapstructure:"CertificateDirectory"`
+	TrafficSpoolDirectory string              `mapstructure:"TrafficSpoolDirectory"`
+	APIVersion            string              `mapstructure:"ApiVersion"`
+	LandingPage           LandingPage         `mapstructure:"LandingPage"`
+	NodeType              string              `mapstructure:"NodeType"`
+	APIHost               string              `mapstructure:"ApiHost"`
+	NodeID                int                 `mapstructure:"NodeID"`
+	Key                   string              `mapstructure:"ApiKey"`
+	Timeout               int                 `mapstructure:"Timeout"`
+	RetryCount            *int                `mapstructure:"RetryCount"`
 }
 
 // LandingPage is local to the node; paths are never supplied by panel responses.

@@ -3,6 +3,7 @@ package node
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -65,15 +66,47 @@ func (r acmeResponse) err() error {
 	return errors.New("ACME operation failed; verify provider configuration and certificate guard state")
 }
 
+// HTTP-01 workers for different identities still need the same TCP port 80.
+var httpACMEGate = make(chan struct{}, 1)
+
 func runACME(ctx context.Context, cert *panel.CertInfo, renew bool) error {
-	ctx, cancel := context.WithTimeout(ctx, acmeTimeout)
-	defer cancel()
-	return guardedACMEContext(ctx, cert, func() error {
+	return coordinatedACME(ctx, cert, renew, func(ctx context.Context) error {
 		executable, err := os.Executable()
 		if err != nil {
 			return err
 		}
 		return runACMECommand(ctx, cert, renew, exec.CommandContext(ctx, executable, "internal-acme"))
+	})
+}
+
+func coordinatedACME(ctx context.Context, cert *panel.CertInfo, renew bool, operation func(context.Context) error) error {
+	if cert.CertMode == "http" {
+		select {
+		case httpACMEGate <- struct{}{}:
+			defer func() { <-httpACMEGate }()
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	// Queuing behind another HTTP identity must not consume this order's
+	// network timeout; shutdown/caller cancellation still interrupts the wait.
+	ctx, cancel := context.WithTimeout(ctx, acmeTimeout)
+	defer cancel()
+	return guardedACMEContext(ctx, cert, func() error {
+		// Peers share paths, not credentials. Recheck the pair under its lock:
+		// another controller may have completed the order while we waited.
+		// Trust is checked by requestCertContext and before any worker publishes.
+		if pem, readErr := os.ReadFile(cert.CertFile); readErr == nil {
+			if key, keyErr := os.ReadFile(cert.KeyFile); keyErr == nil {
+				if _, validErr := validateCertificate(pem, key, cert.CertDomain, false, false); validErr == nil {
+					due, dueErr := (&Lego{}).CheckCert(pem)
+					if dueErr == nil && (!renew || !due) {
+						return nil
+					}
+				}
+			}
+		}
+		return operation(ctx)
 	})
 }
 
@@ -87,6 +120,14 @@ func (b *limitedACMEOutput) Write(p []byte) (int, error) {
 }
 
 func runACMECommand(ctx context.Context, cert *panel.CertInfo, renew bool, command *exec.Cmd) error {
+	var retainedKey []byte
+	if renew {
+		resource, err := renewalResource(cert)
+		if err != nil {
+			return err
+		}
+		retainedKey = resource.PrivateKey
+	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -118,6 +159,12 @@ func runACMECommand(ctx context.Context, cert *panel.CertInfo, renew bool, comma
 	if result.Certificate == nil {
 		return errors.New("missing ACME certificate result")
 	}
+	if renew {
+		if _, err := tls.X509KeyPair(result.Certificate.Certificate, retainedKey); err != nil {
+			return errors.New("renewed certificate does not match the retained private key")
+		}
+		result.Certificate.PrivateKey = retainedKey
+	}
 	return (&Lego{config: cert}).writeCert(&certificate.Resource{Certificate: result.Certificate.Certificate, PrivateKey: result.Certificate.PrivateKey})
 }
 
@@ -138,11 +185,11 @@ func RunACMEWorker(input io.Reader, output io.Writer) error {
 			return err
 		}
 		if request.Renew {
-			pem, err := os.ReadFile(request.Config.CertFile)
+			resource, err := renewalResource(request.Config)
 			if err != nil {
 				return err
 			}
-			obtained, err = l.client.Certificate.Renew(certificate.Resource{Domain: request.Config.CertDomain, Certificate: pem}, true, false, "")
+			obtained, err = l.client.Certificate.Renew(resource, true, false, "")
 			return err
 		}
 		obtained, err = l.client.Certificate.Obtain(certificate.ObtainRequest{Domains: []string{request.Config.CertDomain}, Bundle: true})

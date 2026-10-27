@@ -1,6 +1,7 @@
 package node
 
 import (
+	"bytes"
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -117,13 +118,15 @@ func (l *Lego) RenewCert() error {
 	} else if !due {
 		return nil
 	}
-	res, err := l.client.Certificate.Renew(certificate.Resource{
-		Domain:      l.config.CertDomain,
-		Certificate: file,
-	}, true, false, "")
+	resource, err := renewalResource(l.config)
 	if err != nil {
 		return err
 	}
+	res, err := l.client.Certificate.Renew(resource, true, false, "")
+	if err != nil {
+		return err
+	}
+	res.PrivateKey = resource.PrivateKey
 	err = l.writeCert(res)
 	if err != nil {
 		return fmt.Errorf("write certificate error: %w", err)
@@ -202,6 +205,11 @@ func (l *Lego) writeCert(certificates *certificate.Resource) error {
 	existed := err == nil
 	if err != nil && !os.IsNotExist(err) {
 		return err
+	}
+	// Renewal with the retained key only needs to replace the certificate.
+	// Keep the key inode and permissions, and avoid a transient mismatched pair.
+	if existed && bytes.Equal(previous, certificates.PrivateKey) {
+		return os.Rename(certTmp, certPath)
 	}
 	backup := ""
 	if existed {
@@ -348,4 +356,29 @@ func (u *User) Load(path string) error {
 		return fmt.Errorf("decode private key error: %w", err)
 	}
 	return nil
+}
+
+// Supplying the previous private key tells lego to renew without rotating it.
+// Expired certificates can still be renewed; key/identity checks remain strict.
+func renewalResource(info *panel.CertInfo) (certificate.Resource, error) {
+	certPEM, err := os.ReadFile(info.CertFile)
+	if err != nil {
+		return certificate.Resource{}, err
+	}
+	keyPEM, err := os.ReadFile(info.KeyFile)
+	if err != nil {
+		return certificate.Resource{}, err
+	}
+	pair, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		return certificate.Resource{}, fmt.Errorf("renewal requires the existing matching private key")
+	}
+	leaf, err := x509.ParseCertificate(pair.Certificate[0])
+	if err != nil {
+		return certificate.Resource{}, err
+	}
+	if err = leaf.VerifyHostname(info.CertDomain); err != nil {
+		return certificate.Resource{}, err
+	}
+	return certificate.Resource{Domain: info.CertDomain, Certificate: certPEM, PrivateKey: keyPEM}, nil
 }

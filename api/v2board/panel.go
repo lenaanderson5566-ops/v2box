@@ -19,6 +19,7 @@ import (
 // Panel is the interface for different panel's api.
 
 type Client struct {
+	sharedCertificate     *conf.CertificateBinding
 	sharedListener        string
 	configurationReport   atomic.Pointer[ConfigurationReport]
 	targetPolicy          atomic.Pointer[cachedTargetPolicy]
@@ -110,6 +111,7 @@ func New(c *conf.NodeConfig) (*Client, error) {
 	return &Client{
 		v10:                   version == "v10",
 		sharedListener:        c.SharedListener,
+		sharedCertificate:     c.SharedCertificate,
 		certificateDirectory:  c.CertificateDirectory,
 		nodeType:              nodeType,
 		trafficSpoolDirectory: c.TrafficSpoolDirectory,

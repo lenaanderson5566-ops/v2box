@@ -59,5 +59,7 @@ func boxContext(ctx context.Context) context.Context {
 	transport.RegisterTCP(d)
 	transport.RegisterTLS(d)
 	transport.RegisterHTTPS(d)
-	return box.Context(ctx, in, out, endpoint.NewRegistry(), d, service.NewRegistry(), certificate.NewRegistry())
+	certificates := certificate.NewRegistry()
+	registerSharedCertificateProvider(certificates)
+	return box.Context(ctx, in, out, endpoint.NewRegistry(), d, service.NewRegistry(), certificates)
 }

@@ -116,7 +116,7 @@ func clientBox(t *testing.T, n *panel.NodeInfo, uuid string) *box.Box {
 		out["password"] = uuid
 	}
 	if n.Security == panel.Tls {
-		out["tls"] = object{"enabled": true, "server_name": "localhost", "certificate": []string{n.Common.CertInfo.TlsCert}}
+		out["tls"] = object{"enabled": true, "server_name": n.Common.CertInfo.CertDomain, "certificate": []string{n.Common.CertInfo.TlsCert}}
 		if n.Type == "tuic" || n.Type == "hysteria2" {
 			out["tls"].(object)["alpn"] = []string{"h3"}
 		}

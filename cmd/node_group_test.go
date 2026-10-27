@@ -420,3 +420,23 @@ func TestInvalidSharedOptInPreservesExistingListener(t *testing.T) {
 		t.Fatal("invalid sharing selection stopped an existing node")
 	}
 }
+
+func TestSharedCertificateClaimsRejectDifferentDomainWriters(t *testing.T) {
+	group := newNodeGroup(context.Background())
+	first := &nodeWorker{group: group, claims: map[string]bool{}}
+	second := &nodeWorker{group: group, claims: map[string]bool{}}
+	source := &panel.CertInfo{CertMode: "http", CertDomain: "first.example.test", CertFile: filepath.Join(t.TempDir(), "cert.pem"), KeyFile: filepath.Join(t.TempDir(), "key.pem")}
+	candidate := &node.Node{NodeInfos: []*panel.NodeInfo{{SharedListener: "shared", Security: panel.Tls, Common: &panel.CommonNode{CertInfo: source}}}}
+	finish, err := first.claimResources(candidate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	finish(true)
+	defer first.releaseClaims()
+	another := *source
+	another.CertDomain = "second.example.test"
+	conflicting := &node.Node{NodeInfos: []*panel.NodeInfo{{SharedListener: "shared", Security: panel.Tls, Common: &panel.CommonNode{CertInfo: &another}}}}
+	if _, err := second.claimResources(conflicting); err == nil {
+		t.Fatal("different domains were allowed to overwrite one certificate pair")
+	}
+}

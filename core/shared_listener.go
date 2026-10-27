@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"strings"
 	"sync"
 
@@ -27,6 +28,7 @@ type sharedListener struct {
 	server         *box.Box
 	cancel         context.CancelFunc
 	members        map[string]*sharedMember
+	certificates   *sharedCertificateStore
 }
 type sharedMember struct {
 	tracker *trafficTracker
@@ -50,19 +52,31 @@ func sharedOptions(v *V2Core, info *panel.NodeInfo) (option.Options, string, err
 	default:
 		return option.Options{}, "", fmt.Errorf("unsupported shared listener protocol")
 	}
-	// Shared TLS files have one external writer; embedded remote pairs are read-only.
+	// Certificate ownership and renewal stay with the panel controllers; the
+	// listener selects their validated pairs through a live SNI provider.
 	if info.Security == panel.Tls {
 		if info.Common.CertInfo == nil {
 			return option.Options{}, "", fmt.Errorf("shared TLS certificate is required")
 		}
 		mode := info.Common.CertInfo.CertMode
-		if mode != "file" && mode != "remote" {
-			return option.Options{}, "", fmt.Errorf("shared listeners require file or remote TLS certificates")
+		if mode != "file" && mode != "remote" && mode != "http" && mode != "dns" {
+			return option.Options{}, "", fmt.Errorf("unsupported shared TLS certificate mode")
 		}
 	}
 	o, err := buildOptions(info, nil, v.Config)
 	if err != nil {
 		return o, "", err
+	}
+	if info.Security == panel.Tls {
+		wrapper, ok := o.Inbounds[0].Options.(option.InboundTLSOptionsWrapper)
+		if !ok {
+			return o, "", fmt.Errorf("shared protocol lacks TLS options")
+		}
+		tlsOptions := wrapper.TakeInboundTLSOptions()
+		tlsOptions.ServerName = ""
+		tlsOptions.Certificate, tlsOptions.Key = nil, nil
+		tlsOptions.CertificatePath, tlsOptions.KeyPath = "", ""
+		tlsOptions.CertificateProvider = &option.CertificateProviderOptions{Type: sharedCertificateProviderType, Options: &struct{}{}}
 	}
 	o.Inbounds[0].Tag = ""
 	fingerprintOptions := o
@@ -88,6 +102,21 @@ func (h *SharedListeners) validateLocked(v *V2Core, info *panel.NodeInfo, users 
 		for tag, member := range group.members {
 			if tag == info.Tag {
 				continue
+			}
+			if info.Security == panel.Tls && member.state.info.Security == panel.Tls {
+				next, previous := info.Common.CertInfo, member.state.info.Common.CertInfo
+				sameDomain := certificateDomain(next.CertDomain) == certificateDomain(previous.CertDomain)
+				sameSource := sameCertificateSource(next, previous)
+				if sameDomain && !sameSource {
+					return o, "", fmt.Errorf("shared TLS identity has conflicting certificate sources; use one coordinated certificate binding")
+				}
+				if !sameDomain && sameSource {
+					return o, "", fmt.Errorf("different TLS identities must use independent certificate paths")
+				}
+				managed := next.CertMode == "http" || next.CertMode == "dns" || previous.CertMode == "http" || previous.CertMode == "dns"
+				if sameSource && managed && (next.CertMode != previous.CertMode || next.Provider != previous.Provider || !reflect.DeepEqual(next.DNSEnv, previous.DNSEnv)) {
+					return o, "", fmt.Errorf("shared ACME certificate has incompatible renewal owners")
+				}
 			}
 			if group.signature != signature {
 				return o, "", fmt.Errorf("shared listener configuration conflict: protocol, listener, TLS/Reality, transport, padding and routing must match")
@@ -123,11 +152,27 @@ func (h *SharedListeners) setUsers(ctx context.Context, v *V2Core, n *nodeState,
 	}
 	key, tag := n.info.SharedListener, n.info.Tag
 	g := h.groups[key]
+	certificateStore := &sharedCertificateStore{}
+	if g != nil {
+		certificateStore = g.certificates
+	}
+	infos := []*panel.NodeInfo{n.info}
+	if g != nil {
+		for memberTag, member := range g.members {
+			if memberTag != tag {
+				infos = append(infos, member.state.info)
+			}
+		}
+	}
+	certificates, err := certificateStore.prepare(infos)
+	if err != nil {
+		return err
+	}
 	if g != nil && g.members[tag] != nil && g.members[tag].state != n {
 		return fmt.Errorf("shared listener node is still owned by a live controller")
 	}
 	if g == nil {
-		g = &sharedListener{tag: fmt.Sprintf("shared-listener/%x", sha256.Sum256([]byte(key))), signature: signature, members: make(map[string]*sharedMember)}
+		g = &sharedListener{tag: fmt.Sprintf("shared-listener/%x", sha256.Sum256([]byte(key))), signature: signature, members: make(map[string]*sharedMember), certificates: certificateStore}
 		o.Inbounds[0].Tag = g.tag
 		if err = mergeSharedUsers(v, &o, g, tag, n.info, identities); err != nil {
 			return err
@@ -135,7 +180,8 @@ func (h *SharedListeners) setUsers(ctx context.Context, v *V2Core, n *nodeState,
 		if err = v.tracker.updateUsers(tag, identities, func() error { return nil }); err != nil {
 			return err
 		}
-		b, cancel, startErr := v.newBox(ctx, o)
+		certificateStore.current.Store(certificates)
+		b, cancel, startErr := v.newBox(ctx, o, certificateStore)
 		if startErr != nil {
 			_ = v.tracker.updateUsers(tag, n.identities, func() error { return nil })
 			return startErr
@@ -167,6 +213,7 @@ func (h *SharedListeners) setUsers(ctx context.Context, v *V2Core, n *nodeState,
 			return err
 		}
 		g.members[tag] = &sharedMember{tracker: v.tracker, state: n}
+		certificateStore.current.Store(certificates)
 	}
 	n.shared = true
 	n.users, n.identities = append([]panel.UserInfo(nil), users...), identities
@@ -276,6 +323,20 @@ func (h *SharedListeners) remove(v *V2Core, n *nodeState) error {
 			return updateInboundUsers(in, o.Inbounds[0].Options)
 		})
 	}
+	if err != nil {
+		return err
+	}
+	infos := make([]*panel.NodeInfo, 0, len(g.members)-1)
+	for tag, member := range g.members {
+		if tag != n.info.Tag {
+			infos = append(infos, member.state.info)
+		}
+	}
+	certificates, prepareErr := g.certificates.prepare(infos)
+	if prepareErr != nil {
+		return prepareErr
+	}
+	g.certificates.current.Store(certificates)
 	delete(g.members, n.info.Tag)
 	v.tracker.setUsers(n.info.Tag, nil)
 	v.tracker.closeNode(n.info.Tag)
