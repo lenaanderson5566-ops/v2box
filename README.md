@@ -139,6 +139,8 @@ sudo bash install.sh v1.0.1 --api-host https://panel.example.com --node-id 1 --p
 v2box update             # 更新至 GitHub 最新正式版
 v2box update RELEASE_TAG # 指定已有正式版本
 v2box resume             # 继续保留的未完成部署
+v2box deploy-status      # 查询后台部署任务
+v2box deploy-log         # 查看部署日志（包括 DNS 等待）
 v2box uninstall         # 交互确认后卸载，保留独立 IP 上报服务
 v2box uninstall --stop-network # 同时停用本机共享的 IP 上报 / DDNS 调度
 ```
@@ -493,3 +495,10 @@ v2box reload
 证书更新后新 TLS/QUIC 握手直接读取更新的证书，不需要重启监听；短暂不完整或无效的新文件对不替换缓存的有效证书，也不会影响其他域名。首次把现有独占监听转成共享仍会重启一次，之后新增兼容成员及续签无需重启。执行普通后台部署命令即可，助手自动判断，不需追加共享参数。
 
 v1.0.14 不包含此能力。助手会在写入配置前同时检查已安装程序和运行实例，旧版需要先升级到包含新能力的发布版本；仅推送源码或更新后台不会升级线上节点。HTTP-01 仍要求证书域名正确解析、80 端口可用且可被 CA 访问；DNS 验证仍使用各后台既有提供商配置，不自动重写 DNS 凭据。
+
+
+### 部署任务与日志
+
+使用配套新版后台脚本时，systemd 主机上的部署及恢复任务由 `v2box-deployment.service` 托管，关闭 SSH 不会中断。DNS 检查通过后自动继续，后台等待上限 24 小时；配置、证书保护及失败回滚保持生效。非 systemd 环境仍以前台执行，并提示保持窗口开启。该任务不承诺服务器重启后的自动恢复；任务停止后使用原面板命令的 `--resume` 恢复。
+
+`v2box status` 禁用分页并限制查询时间；服务未运行时 `v2box log` 显示最近日志后返回，不再无提示地等待。运行中的服务仍实时跟随日志，Ctrl+C 只退出查看。部署日志与服务日志分开，可使用 `journalctl -u v2box-deployment -n 100 --no-pager` 查看；journal 跨重启保留取决于系统配置。新版管理脚本提供 `deploy-status`、`deploy-log`，旧管理脚本可直接使用 systemctl/journalctl。

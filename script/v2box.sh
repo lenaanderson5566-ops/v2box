@@ -44,6 +44,10 @@ case "$1" in
     flock -n 9 || { echo 'Another deployment or maintenance operation is running.' >&2; exit 1; }
     check_runtime
     timeout -k 2 10 python3 /usr/local/lib/v2box/node-network.py capabilities | jq -e '.features | index("report-multi-target-v1") != null' >/dev/null || { echo 'Reporting helper lacks multi-target support; update node scripts before resuming.' >&2; exit 1; }
+    if grep -q '^def launch_managed(' /usr/local/lib/v2box/panel-deploy.py; then
+      exec python3 /usr/local/lib/v2box/panel-deploy.py --managed "${states[0]}"
+    fi
+    echo 'Legacy deployment helper runs in foreground. Use the latest panel bootstrap with --resume for managed recovery.'
     exec python3 /usr/local/lib/v2box/panel-deploy.py "${states[0]}";;
   uninstall)
     shift
@@ -132,7 +136,19 @@ case "$1" in
       [[ "$pid" =~ ^[1-9][0-9]*$ ]] || exit 1
       kill -HUP "$pid"
     fi;;
-  start|stop|restart|status|enable|disable)
+  status)
+    if command -v systemctl >/dev/null; then
+      result=0
+      SYSTEMD_PAGER=cat timeout -k 2 10 systemctl status v2box --no-pager -l || result=$?
+      if ((result == 124 || result == 137)); then
+        echo 'Status query timed out. Check the system service manager; no node settings were changed.' >&2
+      elif [[ -f /etc/v2box/.deployment-pending ]]; then
+        echo 'Deployment is pending. Run v2box deploy-status and v2box deploy-log; use v2box resume if the task has stopped.'
+      fi
+      exit "$result"
+    fi
+    run_service rc-service v2box status;;
+  start|stop|restart|enable|disable)
     action=$1
     if command -v systemctl >/dev/null; then
       run_service systemctl "$action" v2box
@@ -143,13 +159,31 @@ case "$1" in
         *) run_service rc-service v2box "$action";;
       esac
     fi;;
-  log)
-    if command -v journalctl >/dev/null; then journalctl -u v2box -n 100 -f
-    else tail -n 100 -f /var/log/v2box.log; fi;;
+  deploy-status)
+    command -v systemctl >/dev/null || { echo 'Managed deployment requires systemd. Check the foreground deployment output.'; exit 1; }
+    SYSTEMD_PAGER=cat timeout -k 2 10 systemctl status v2box-deployment --no-pager -l;;
+  log|deploy-log)
+    unit=v2box
+    [[ "$1" != deploy-log ]] || unit=v2box-deployment
+    if command -v journalctl >/dev/null; then
+      if timeout -k 2 10 systemctl is-active --quiet "$unit"; then
+        echo "Following $unit logs. Ctrl+C exits this view without stopping the service."
+        exec journalctl -u "$unit" -n 100 --no-pager -f
+      fi
+      echo "$unit is not active (or its status could not be queried). Showing recent logs without waiting."
+      if [[ "$unit" == v2box && -f /etc/v2box/.deployment-pending ]]; then
+        echo 'Deployment is pending. Run v2box deploy-status and v2box deploy-log.'
+      fi
+      exec timeout -k 2 10 journalctl -u "$unit" -n 100 --no-pager
+    fi
+    [[ "$unit" == v2box ]] || { echo 'No systemd journal; check the foreground deployment output.'; exit 1; }
+    [[ -f /var/log/v2box.log ]] || { echo 'No V2Box log file yet. Check v2box status or deployment output.'; exit 0; }
+    echo 'Following V2Box logs. Ctrl+C exits this view.'
+    exec tail -n 100 -f /var/log/v2box.log;;
   ip) exec python3 /usr/local/lib/v2box/node-network.py ip;;
   credential) exec python3 /usr/local/lib/v2box/node-credentials.py;;
   ddns) shift; exec python3 /usr/local/lib/v2box/node-network.py "${@:-status}";;
   version|server|capabilities) exec "$binary" "$@";;
-  help) echo 'Usage: v2box {start|stop|restart|reload|status|enable|disable|log|version|server|ip|credential|share-listener GROUP NODE_NUMBER...|ddns|resume|update [release-tag]|uninstall [--stop-network] [--yes]|help}';;
+  help) echo 'Usage: v2box {start|stop|restart|reload|status|enable|disable|log|version|server|ip|credential|share-listener GROUP NODE_NUMBER...|ddns|resume|deploy-status|deploy-log|update [release-tag]|uninstall [--stop-network] [--yes]|help}';;
   *) echo 'Unknown command. Run: v2box help'; exit 1;;
 esac

@@ -85,6 +85,32 @@ esac
         path.write_text(value)
         path.chmod(0o755)
 
+    def test_status_does_not_page_or_wait_for_deployment_lock(self):
+        (self.config/'.deployment-pending').touch()
+        self.write(self.bin/'systemctl', '#!/bin/sh\necho "$*"\nexit 3\n')
+        result=subprocess.run(['bash',str(self.root/'usr/local/bin/v2box'),'status'],env=self.env,capture_output=True,text=True,timeout=5)
+        self.assertEqual(result.returncode,3)
+        self.assertIn('--no-pager -l',result.stdout)
+        self.assertIn('Deployment is pending',result.stdout)
+
+    def test_inactive_log_returns_and_explains_pending_deployment(self):
+        self.active.unlink()
+        (self.config/'.deployment-pending').touch()
+        self.write(self.bin/'journalctl', '#!/bin/sh\nprintf "%s\\n" "$*"\n')
+        result=subprocess.run(['bash',str(self.root/'usr/local/bin/v2box'),'log'],env=self.env,capture_output=True,text=True,timeout=5)
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertIn('without waiting',result.stdout)
+        self.assertIn('deploy-log',result.stdout)
+        self.assertNotIn(' -f',result.stdout)
+
+    def test_active_log_follows_correct_service(self):
+        self.write(self.bin/'journalctl', '#!/bin/sh\necho "$*"\n')
+        for command,unit in [('log','v2box'),('deploy-log','v2box-deployment')]:
+            result=subprocess.run(['bash',str(self.root/'usr/local/bin/v2box'),command],env=self.env,capture_output=True,text=True,timeout=5)
+            self.assertEqual(result.returncode,0,result.stderr)
+            self.assertIn('-u '+unit+' -n 100 --no-pager -f',result.stdout)
+            self.assertIn('Ctrl+C',result.stdout)
+
     def test_reload_verifies_running_capabilities_without_restart(self):
         process=self.root/'proc/123';process.mkdir(parents=True)
         self.write(process/'exe',"#!/bin/sh\necho '{\"features\":[\"multi-panel-v1\",\"reload-signal-v1\"]}'\n")
