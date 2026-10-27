@@ -9,11 +9,77 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 )
+
+func TestPanelRoutingFixtureAcrossAPIs(t *testing.T) {
+	file := os.Getenv("V2BOX_ROUTING_FIXTURE")
+	if file == "" {
+		t.Skip("panel routing fixture not provided")
+	}
+	raw, err := os.ReadFile(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fixture struct {
+		Legacy json.RawMessage `json:"legacy"`
+		V10    json.RawMessage `json:"v10"`
+	}
+	if err = json.Unmarshal(raw, &fixture); err != nil {
+		t.Fatal(err)
+	}
+	var legacy map[string]json.RawMessage
+	if err = json.Unmarshal(fixture.Legacy, &legacy); err != nil {
+		t.Fatal(err)
+	}
+	var expected any
+	if err = json.Unmarshal(legacy["sing_box"], &expected); err != nil || expected == nil {
+		t.Fatal("missing native routing in PHP fixture")
+	}
+	for _, version := range []string{"legacy", "v10"} {
+		t.Run(version, func(t *testing.T) {
+			var conditional atomic.Bool
+			server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				if strings.HasSuffix(r.URL.Path, "/capabilities") {
+					_, _ = w.Write([]byte(`{"data":{"accepted":true}}`))
+					return
+				}
+				w.Header().Set("ETag", `"routing-fixture"`)
+				if r.Header.Get("If-None-Match") == `"routing-fixture"` {
+					conditional.Store(true)
+					w.WriteHeader(304)
+					return
+				}
+				if version == "legacy" {
+					_, _ = w.Write(fixture.Legacy)
+				} else {
+					_, _ = w.Write(fixture.V10)
+				}
+			}))
+			defer server.Close()
+			client, err := newTestPanel(t, server, &conf.NodeConfig{APIHost: server.URL, NodeID: 1, NodeType: "v2box", Key: "fixture-only", APIVersion: version})
+			if err != nil {
+				t.Fatal(err)
+			}
+			node, err := client.GetNodeInfo(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			var received any
+			if err = json.Unmarshal(node.Common.SingBox, &received); err != nil || !reflect.DeepEqual(received, expected) {
+				t.Fatal("PHP routing changed during API decoding")
+			}
+			if next, err := client.GetNodeInfo(context.Background()); err != nil || next != nil || !conditional.Load() {
+				t.Fatal("conditional configuration request failed", err)
+			}
+		})
+	}
+}
 
 func TestIndependentLegacyCredentialNeverEntersURL(t *testing.T) {
 	s := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

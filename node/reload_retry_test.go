@@ -15,11 +15,53 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
 
 var fixtureRootsOnce sync.Once
+
+func TestNativeRuleOnlyChangeRequestsReload(t *testing.T) {
+	var changed atomic.Bool
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v2/server/config" {
+			t.Errorf("unexpected request: %s", r.URL.Path)
+			w.WriteHeader(404)
+			return
+		}
+		domain := "before.example"
+		if changed.Load() {
+			domain = "after.example"
+		}
+		_, _ = fmt.Fprintf(w, `{"protocol":"vless","tls":0,"server_port":12345,"base_config":{"push_interval":60,"pull_interval":60},"sing_box":{"route":{"rules":[{"domain_suffix":[%q],"action":"reject"}]}}}`, domain)
+	}))
+	defer server.Close()
+	roots := x509.NewCertPool()
+	roots.AddCert(server.Certificate())
+	t.Setenv("GODEBUG", os.Getenv("GODEBUG")+",x509usefallbackroots=1")
+	fixtureRootsOnce.Do(func() { x509.SetFallbackRoots(roots) })
+	retries := 0
+	api, err := panel.New(&conf.NodeConfig{APIHost: server.URL, NodeID: 1, Key: "fixture-only", APIVersion: "legacy", RetryCount: &retries})
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := api.GetNodeInfo(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	changed.Store(true)
+	ch := make(chan struct{}, 1)
+	controller := &Controller{info: before, apiClient: api, server: &core.V2Core{ReloadCh: ch}}
+	if err := controller.nodeInfoMonitor(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-ch:
+	default:
+		t.Fatal("native routing edit did not trigger reload")
+	}
+}
 
 func TestRejectedReloadIsRetriedWithoutConfigChange(t *testing.T) {
 	calls := 0
