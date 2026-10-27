@@ -107,18 +107,17 @@ jobs:
           generate_release_notes: true
           make_latest: true
           body: |
-            V2Box v1.0.14：显式多后台共享监听与部署保护。
+            V2Box v1.0.15：多后台自动证书续签与 SNI 共享监听。
 
-            - 多个独立后台可显式按同一种协议共享一个实际监听器，支持 VLESS、VMess、Trojan、Shadowsocks（AEAD/2022）、Hysteria2、TUIC、AnyTLS 和 Naive。
-            - 用户认证、流量、在线活动、限速和配额独立；重复有效凭据或配置冲突拒绝更新，保留其他后台连接。
-            - SharedListener 默认关闭，不自动合并现有节点，不提供不同协议的自动分流。组内监听、传输、TLS/Reality、路由等必须兼容。
-            - 普通 TLS 共享模式仅允许 file 或 remote 证书；文件证书统一由外部维护，避免多个 ACME 任务争用密钥。
-            - 保留已有 Nodes、自定义配置、证书、密钥、ACME 账户及保护状态和多目标 IP 上报配置。
-            - 升级失败恢复原程序；已停止的服务保持停止。新增后台部署失败仅回滚新增身份，不覆盖其他后台。
-            - 非法日志级别在替换监听器前拒绝。安装包使用干净临时目录，每个平台检查必需文件、压缩包完整性和 SHA-256。
+            - 普通后台部署命令按需共享兼容端口，支持 HTTP/DNS 自动证书；不同端口继续独立运行。
+            - 同域名复用原证书、私钥和 ACME 保护来源，锁内复查避免重复签发；不同域名使用独立证书并按 SNI 选择。
+            - 多个 HTTP-01 任务协调使用 80 端口；续签复用旧私钥，证书热更新保留现有连接，失败保留旧有效证书与保护状态。
+            - VLESS、VMess、Trojan、AnyTLS、Hysteria2、TUIC、Naive 的多域名共享和证书更新已覆盖真实连接测试；Shadowsocks 与 Reality 保持既有共享能力。
+            - 后台认证、流量、额度、在线活动和 IP 上报仍独立；不兼容配置或重复凭据拒绝合并。
+            - 升级保留 Nodes、证书、密钥、ACME 状态及 IP 上报配置；失败恢复旧程序，停止状态保持停止。
 
-            现有节点升级：v2box update v1.0.14
-            旧管理入口不支持 update 时，下载本版本 script/install.sh，执行 bash install.sh v1.0.14 --update。
-            升级运行中的 V2Box 会重启本机整个实例，影响其全部节点，请安排维护窗口；停止状态保持停止。
-            首次启用共享监听需显式配置并安排维护窗口；仅升级不会自动启用共享，不会改写节点、证书或 IP 上报设置。
+            现有节点升级：v2box update v1.0.15
+            旧管理入口不支持 update 时，下载本版本 script/install.sh，执行 bash install.sh v1.0.15 --update。
+            升级运行中的 V2Box 会重启本机实例；首次把独占监听转换为共享也会重启一次，请安排维护时间。
+            后台须同步更新部署助手。多域名客户端需发送 SNI；HTTP 验证仍要求正确 DNS 和公网 80 端口可用。
             提供 Linux、Windows、macOS 的 amd64/arm64 安装包与 SHA-256；服务管理脚本适用于 Linux。
