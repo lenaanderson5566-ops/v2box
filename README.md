@@ -502,3 +502,10 @@ v1.0.14 不包含此能力。助手会在写入配置前同时检查已安装程
 使用配套新版后台脚本时，systemd 主机上的部署及恢复任务由 `v2box-deployment.service` 托管，关闭 SSH 不会中断。DNS 检查通过后自动继续，后台等待上限 24 小时；配置、证书保护及失败回滚保持生效。非 systemd 环境仍以前台执行，并提示保持窗口开启。该任务不承诺服务器重启后的自动恢复；任务停止后使用原面板命令的 `--resume` 恢复。
 
 `v2box status` 禁用分页并限制查询时间；服务未运行时 `v2box log` 显示最近日志后返回，不再无提示地等待。运行中的服务仍实时跟随日志，Ctrl+C 只退出查看。部署日志与服务日志分开，可使用 `journalctl -u v2box-deployment -n 100 --no-pager` 查看；journal 跨重启保留取决于系统配置。新版管理脚本提供 `deploy-status`、`deploy-log`，旧管理脚本可直接使用 systemctl/journalctl。
+
+
+### 仅刷新管理脚本
+
+新版面板的公开 bootstrap 包含经过回归验证的管理脚本和安装器，不依赖旧版本 Release 内的管理脚本。新安装、恢复和面板升级命令都会安装这些脚本；只配置 IP 上报的命令不安装节点管理程序。已有节点可下载所属面板的最新 bootstrap 后执行 `sh install-v2box.sh --refresh-scripts`，仅刷新管理、安装及部署辅助脚本，不更换核心，不重启服务，不修改 Nodes、证书、密钥或 IP 上报设置。面板必须先更新到包含该功能的代码。
+
+刷新后执行 `v2box status`、`v2box log`、`v2box deploy-status` 和 `v2box deploy-log`。以后 `v2box update` 安装旧 Release 时会保留已验证的面板脚本补丁；包含对应脚本能力的新 Release 使用自身配套脚本。安装器仍验证发行包 SHA256，脚本语法验证失败时不替换程序。
