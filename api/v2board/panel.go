@@ -53,9 +53,9 @@ func New(c *conf.NodeConfig) (*Client, error) {
 	}
 	nodeType := c.NodeType
 	if nodeType == "" {
-		nodeType = "v2node"
-	} // Preserve existing deployments.
-	if nodeType != "v2node" && nodeType != "v2box" {
+		nodeType = "v2box"
+	} // V2Box is the only supported backend.
+	if nodeType != "v2box" {
 		return nil, fmt.Errorf("unsupported NodeType %q", nodeType)
 	}
 	client := resty.New()

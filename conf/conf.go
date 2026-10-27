@@ -126,9 +126,9 @@ func NodeIdentity(entry NodeConfig) (string, error) {
 	}
 	kind := entry.NodeType
 	if kind == "" {
-		kind = "v2node"
+		kind = "v2box"
 	}
-	if (kind != "v2node" && kind != "v2box") || entry.NodeID <= 0 || strings.TrimSpace(entry.Key) == "" {
+	if (kind != "v2box") || entry.NodeID <= 0 || strings.TrimSpace(entry.Key) == "" {
 		return "", fmt.Errorf("invalid node identity")
 	}
 	return fmt.Sprintf("%s|%s|%d", host, kind, entry.NodeID), nil
@@ -138,7 +138,7 @@ func NodeCertificateDirectory(entry NodeConfig) string {
 	digest := sha256.Sum256([]byte(host))
 	kind := entry.NodeType
 	if kind == "" {
-		kind = "v2node"
+		kind = "v2box"
 	}
 	return filepath.Join("/etc/v2box/panels", fmt.Sprintf("%x", digest[:8]), fmt.Sprintf("%s-%d", kind, entry.NodeID))
 }

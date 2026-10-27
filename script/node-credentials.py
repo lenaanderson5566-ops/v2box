@@ -83,7 +83,7 @@ def main():
     with path.open(encoding="utf-8") as stream:
         nodes = json.load(stream).get("Nodes", [])
     for index, node in enumerate(nodes):
-        print(f"{index + 1}: {node.get('ApiHost', '')} / {node.get('NodeType', 'v2node')} #{node.get('NodeID')}")
+        print(f"{index + 1}: {node.get('ApiHost', '')} / {node.get('NodeType', 'v2box')} #{node.get('NodeID')}")
     index = int(input("Select node number: ")) - 1
     # Require a real terminal: never fall back to echoing a secret through stdin.
     with open("/dev/tty", "r+") as terminal:

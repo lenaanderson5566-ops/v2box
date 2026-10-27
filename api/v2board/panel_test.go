@@ -61,7 +61,7 @@ func TestPanelRejectsUnsafeEndpoints(t *testing.T) {
 }
 
 func TestNodeTypeCompatibility(t *testing.T) {
-	for _, tc := range []struct{ configured, expected string }{{"", "v2node"}, {"v2node", "v2node"}, {"v2box", "v2box"}} {
+	for _, tc := range []struct{ configured, expected string }{{"", "v2box"}, {"v2box", "v2box"}} {
 		t.Run(tc.expected+tc.configured, func(t *testing.T) {
 			server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if r.URL.Query().Get("node_type") != tc.expected {
@@ -82,8 +82,10 @@ func TestNodeTypeCompatibility(t *testing.T) {
 			}
 		})
 	}
-	if _, err := New(&conf.NodeConfig{APIVersion: "legacy", NodeType: "unsupported"}); err == nil {
-		t.Fatal("invalid type accepted")
+	for _, retired := range []string{"v2node", "unsupported"} {
+		if _, err := New(&conf.NodeConfig{APIHost: "https://panel.example.test", APIVersion: "legacy", NodeType: retired}); err == nil {
+			t.Fatal("retired or invalid type accepted")
+		}
 	}
 }
 

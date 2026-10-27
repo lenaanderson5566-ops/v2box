@@ -14,7 +14,7 @@ Cloudflare 公网 HTTPS 地址可用于节点通讯，后台不以源站连接�
 
 V2Box 节点默认使用 `/api/v10/server/...`，包括 configuration、users、online-counts、traffic、online-users 和 capabilities。每个 `Nodes[]` 设置 `"NodeType": "v2box"`；`ApiVersion` 留空即使用 V10，也可显式填写 `"ApiVersion": "v10"`。凭据放在 Authorization Bearer 请求头，配置和用户列表支持 ETag。节点上报核心版本及能力，面板仅向声明支持原生路由的节点下发高级配置。
 
-**升级顺序：先更新面板并运行数据库迁移，再更新节点。** 旧面板可显式设置 `"ApiVersion": "legacy"`，沿用 `/api/v2/server/config` 和 `/api/v1/server/UniProxy/{user,alivelist,push,alive}`，但无法使用新的原生配置功能；不会自动降级到旧接口。未填写 NodeType 的既有配置仍按 v2node 走旧接口，避免节点编号串用。新安装器及示例配置默认 v2box。V10 用户列表使用 JSON；旧接口保留 JSON / MessagePack。
+**升级顺序：先更新面板并运行数据库迁移，再更新节点。** 旧面板可显式设置 `"ApiVersion": "legacy"`，沿用 `/api/v2/server/config` 和 `/api/v1/server/UniProxy/{user,alivelist,push,alive}`，但无法使用新的原生配置功能；不会自动降级到旧接口。NodeType 缺省为 v2box；显式 v2node 配置被拒绝。安装器及示例配置统一使用 v2box。V10 用户列表使用 JSON；旧接口保留 JSON / MessagePack。
 
 
 节点协议：VMess、VLESS、Trojan、Shadowsocks AEAD / SS2022 AES、Hysteria2、TUIC、AnyTLS、Naive。VMess/VLESS/Trojan 支持 TCP、WebSocket、gRPC、HTTPUpgrade。支持 TLS 证书文件、面板远程证书、原有 ACME 申请/续期和 VLESS Reality。
@@ -151,7 +151,7 @@ v2box uninstall --stop-network # 同时停用本机共享的 IP 上报 / DDNS �
 
 生命周期测试复用实际安装器与命令包装脚本，在临时目录内模拟 Release 下载及服务管理：`python3 -m unittest discover -s script -p '*_test.py'`。需要 Linux、bash、jq、unzip、flock 和 sha256sum；测试不会运行真实系统服务或调用证书服务。
 
-旧 `v2node` 服务独立保留。迁移同一端口时先停止旧节点服务，再启动 v2box；回退时停止 v2box，启动旧服务。不要同时监听同一端口。
+仅支持 V2Box 节点。升级保留已有 V2Box 配置；旧 v2node 类型不再接受，不能通过改名复用旧节点编号。
 
 ## Docker
 
@@ -168,7 +168,7 @@ docker run --rm --network host -v /etc/v2box:/etc/v2box:ro v2box
 
 独立 V2Box 一键安装参数：`--node-type v2box`。安装器保留已有配置；已有机器需手动核对并更新 `NodeType` 和面板对应的 `NodeID`。面板和包含 NodeType 支持的 V2Box 二进制须一起升级。
 
-V10 节点身份通过 `X-Node-Type: v2box` 和 `X-Node-ID: 节点编号` 请求头传递；URL 统一为 `/api/v10/server/...`。当前仅接受 v2box 类型，V2Node 继续使用旧接口。类型或编号缺失、非法时返回 422；未知节点返回 404。旧 `/api/v10/nodes/v2box/{id}/...` 路径已移除，面板与节点应同步升级。
+V10 节点身份通过 `X-Node-Type: v2box` 和 `X-Node-ID: 节点编号` 请求头传递；URL 统一为 `/api/v10/server/...`。当前仅接受 v2box 类型。类型或编号缺失、非法时返回 422；未知节点返回 404。旧 `/api/v10/nodes/v2box/{id}/...` 路径已移除，面板与节点应同步升级。
 
 
 ### Public IP and optional Cloudflare DDNS
@@ -199,7 +199,7 @@ Settings are mode 0600 under `/etc/node-network/`. HTTPS requests do not follow 
 Authentication/configuration errors pause reporting until reconfiguration; 429 responses
 use bounded backoff. Existing DNS records are retained on disable or lookup failure.
 Use `v2box ddns status`, `v2box ddns disable`, or the independent `node-network` command,
-which also supports V2Node hosts. Ordinary reinstall preserves the configured mode.
+for V2Box hosts. Ordinary reinstall preserves the configured mode.
 Allow DNS propagation before issuing an ACME certificate.
 
 Tests: `python3 -m unittest discover -s script -p '*_test.py'` (mock DNS APIs only).
@@ -215,7 +215,7 @@ and `go test -tags with_quic,with_utls ./core -run TestPanelAnyTLSPresets`.
 
 ### V10 流量批次去重与补报
 
-先升级 V2Board 并迁移数据库，再升级节点。配置接口声明 `trafficBatchDedup: true` 时启用批次 ID、上报前持久化和失败补报；V2Node/legacy 模式及旧面板继续使用原上报方式。
+先升级 V2Board 并迁移数据库，再升级节点。配置接口声明 `trafficBatchDedup: true` 时启用批次 ID、上报前持久化和失败补报；显式 legacy 模式及旧面板继续使用原上报方式。
 
 待确认批次默认保存在 `/var/lib/v2box/traffic`（目录 0700、文件 0600），可通过 Nodes 中的 `TrafficSpoolDirectory` 修改路径。服务运行用户需要写权限。面板地址和节点 ID 隔离，每个节点最多占用 64 MiB。明确确认后删除批次；每周期最多补报 16 批，重启、重载后继续补报。存在待确认批次时，面板降级为不支持去重的版本会暂停流量上报。
 

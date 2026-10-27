@@ -14,6 +14,15 @@ import time
 import textwrap
 
 
+@unittest.skipUnless(os.name == 'posix' and shutil.which('bash'), 'Linux test environment with bash required')
+class InstallerTypeTest(unittest.TestCase):
+    def test_retired_node_type_is_rejected_before_installation(self):
+        installer = Path(__file__).with_name('install.sh')
+        result = subprocess.run(['bash', str(installer), '--node-type', 'v2node'], capture_output=True, text=True, timeout=5)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Invalid node type', result.stderr)
+
+
 @unittest.skipUnless(os.name == 'posix' and shutil.which('jq'), 'Linux test environment with jq required')
 class LifecycleTest(unittest.TestCase):
     def setUp(self):

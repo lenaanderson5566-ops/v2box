@@ -43,12 +43,12 @@ while (($#)); do
     --update) update_only=true; shift;;
     --prompt-api-key) prompt_api_key=true; shift;;
     --landing-page) landing_page=true; shift;;
-    -h|--help) echo "Usage: $0 [release-tag] [--update] [--api-host URL --node-id ID --prompt-api-key] [--node-type v2node|v2box] [--landing-page | --landing-dir /path/to/site] [--ddns --ddns-domain HOST --ddns-zone-id ZONE --ddns-token-file FILE --ddns-family ipv4|ipv6|dual]"; exit 0;;
+    -h|--help) echo "Usage: $0 [release-tag] [--update] [--api-host URL --node-id ID --prompt-api-key] [--node-type v2box] [--landing-page | --landing-dir /path/to/site] [--ddns --ddns-domain HOST --ddns-zone-id ZONE --ddns-token-file FILE --ddns-family ipv4|ipv6|dual]"; exit 0;;
     --*) echo "Unknown option: $1" >&2; exit 1;;
     *) [[ -z "$version" ]] || { echo 'Only one version is allowed' >&2; exit 1; }; version=$1; shift;;
   esac
 done
-[[ "$node_type" == v2node || "$node_type" == v2box ]] || { echo "Invalid node type" >&2; exit 1; }
+[[ "$node_type" == v2box ]] || { echo "Invalid node type" >&2; exit 1; }
 if [[ -n "$landing_dir" ]]; then
   [[ "$landing_dir" == /* && -f "$landing_dir/index.html" && -r "$landing_dir/index.html" ]] || { echo 'Landing directory must be absolute and contain a readable index.html' >&2; exit 1; }
 fi
@@ -285,7 +285,7 @@ else
   echo 'Edit /etc/v2box/config.json, then run: v2box start'
 fi
 rollback=false
-echo "Installed v2box $version. Existing v2node services are separate; avoid listening on the same port."
+echo "Installed v2box $version."
 
 if $pending_deployment; then
   echo 'Program updated; pending deployment, configuration and certificates retained. Next: /usr/local/bin/v2box resume'
