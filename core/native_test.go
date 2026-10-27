@@ -2,10 +2,39 @@ package core
 
 import (
 	"encoding/json"
+	"os"
+	"testing"
+
 	"github.com/lenaanderson5566-ops/v2box/conf"
 	"github.com/lenaanderson5566-ops/v2box/limiter"
-	"testing"
 )
+
+// Snapshot of the panel's node-route-presets.json, checked by the pinned core parser.
+func TestPanelRoutingPresets(t *testing.T) {
+	raw, err := os.ReadFile("testdata/panel-routing-presets.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var presets []struct {
+		ID     string          `json:"id"`
+		Config json.RawMessage `json:"config"`
+	}
+	if err = json.Unmarshal(raw, &presets); err != nil {
+		t.Fatal(err)
+	}
+	if len(presets) == 0 {
+		t.Fatal("panel routing presets must not be empty")
+	}
+	for _, preset := range presets {
+		t.Run(preset.ID, func(t *testing.T) {
+			n := testNode(t, "vless")
+			n.Common.SingBox = preset.Config
+			if _, err := buildOptions(n, nil, conf.New()); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
 
 func TestNativeRoutingAndAccounting(t *testing.T) {
 	limiter.Init()
