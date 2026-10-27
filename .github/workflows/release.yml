@@ -107,17 +107,15 @@ jobs:
           generate_release_notes: true
           make_latest: true
           body: |
-            V2Box v1.0.15：多后台自动证书续签与 SNI 共享监听。
+            V2Box v1.0.16：管理命令、部署状态及日志体验修复。
 
-            - 普通后台部署命令按需共享兼容端口，支持 HTTP/DNS 自动证书；不同端口继续独立运行。
-            - 同域名复用原证书、私钥和 ACME 保护来源，锁内复查避免重复签发；不同域名使用独立证书并按 SNI 选择。
-            - 多个 HTTP-01 任务协调使用 80 端口；续签复用旧私钥，证书热更新保留现有连接，失败保留旧有效证书与保护状态。
-            - VLESS、VMess、Trojan、AnyTLS、Hysteria2、TUIC、Naive 的多域名共享和证书更新已覆盖真实连接测试；Shadowsocks 与 Reality 保持既有共享能力。
-            - 后台认证、流量、额度、在线活动和 IP 上报仍独立；不兼容配置或重复凭据拒绝合并。
-            - 升级保留 Nodes、证书、密钥、ACME 状态及 IP 上报配置；失败恢复旧程序，停止状态保持停止。
+            - status 禁用分页并限制查询时间，避免终端查询长时间等待。
+            - log 在服务未运行时显示最近记录后返回，提示待部署任务；运行中仍实时跟随。
+            - 新增 deploy-status / deploy-log，配合新版后台查看独立部署任务和 DNS 等待日志。
+            - resume 支持新版后台部署辅助脚本；关闭 SSH 后继续部署需同步更新面板。
+            - 安装器、管理脚本、IP 上报工具和节点二进制统一随 Release 打包。
+            - 保留现有 Nodes、证书、密钥、IP 上报设置；运行中的服务升级后重启，停止的服务保持停止。
 
-            现有节点升级：v2box update v1.0.15
-            旧管理入口不支持 update 时，下载本版本 script/install.sh，执行 bash install.sh v1.0.15 --update。
-            升级运行中的 V2Box 会重启本机实例；首次把独占监听转换为共享也会重启一次，请安排维护时间。
-            后台须同步更新部署助手。多域名客户端需发送 SNI；HTTP 验证仍要求正确 DNS 和公网 80 端口可用。
-            提供 Linux、Windows、macOS 的 amd64/arm64 安装包与 SHA-256；服务管理脚本适用于 Linux。
+            升级：v2box update（自动获取最新正式版），或 v2box update v1.0.16。
+            旧管理入口不支持 update 时，下载本版本 script/install.sh，执行 bash install.sh v1.0.16 --update。
+            本版未修改代理核心逻辑。

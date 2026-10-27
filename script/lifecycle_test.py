@@ -219,39 +219,6 @@ esac
         self.preserved()
         self.assertFalse((self.lib/'v2box').exists())
 
-    def test_legacy_release_uses_panel_scripts_and_preserves_them_next_update(self):
-        manager=(self.root/'usr/local/bin/v2box').read_text()
-        installer=self.installer.read_text()
-        self.write(self.lib/'panel-manager.sh',manager)
-        self.write(self.lib/'panel-install.sh',installer)
-        self.package(overrides={'v2box.sh':'#!/bin/bash\necho legacy-manager\n','install.sh':'#!/bin/bash\necho legacy-installer\n'})
-        result=self.install()
-        self.assertEqual(result.returncode,0,result.stderr)
-        self.assertEqual((self.lib/'manager.sh').read_text(),manager)
-        self.assertEqual((self.lib/'install.sh').read_text(),installer)
-        result=self.run_script(self.root/'usr/local/bin/v2box','update')
-        self.assertEqual(result.returncode,0,result.stderr)
-        self.assertEqual((self.lib/'manager.sh').read_text(),manager)
-        self.assertEqual((self.lib/'install.sh').read_text(),installer)
-        self.preserved()
-
-    def test_new_release_keeps_its_scripts_over_panel_overlay(self):
-        self.write(self.lib/'panel-manager.sh','#!/bin/bash\n# v2box-manager-v2\necho stale-overlay\n')
-        self.write(self.lib/'panel-install.sh','#!/bin/bash\n# v2box-script-overlay-v1\necho stale-overlay\n')
-        result=self.install()
-        self.assertEqual(result.returncode,0,result.stderr)
-        self.assertNotIn('stale-overlay',(self.lib/'manager.sh').read_text())
-        self.assertNotIn('stale-overlay',(self.lib/'install.sh').read_text())
-        self.preserved()
-
-    def test_invalid_panel_overlay_keeps_programs_unchanged(self):
-        self.write(self.lib/'panel-manager.sh','#!/bin/bash\n# v2box-manager-v2\nif then\n')
-        self.package(overrides={'v2box.sh':'#!/bin/bash\necho legacy\n'})
-        result=self.install()
-        self.assertNotEqual(result.returncode,0)
-        self.assertIn('old-version',(self.lib/'v2box').read_text())
-        self.preserved()
-
     def test_update_preserves_settings_and_supports_next_update(self):
         r = self.install()
         self.assertEqual(r.returncode, 0, r.stderr)

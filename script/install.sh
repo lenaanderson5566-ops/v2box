@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
 set -euo pipefail
-# v2box-script-overlay-v1
 run_service() {
   local result=0
   timeout -k 5 90 "$@" 7>&- 8>&- 9>&- || result=$?
@@ -171,18 +170,6 @@ curl -fSL --proto '=https' --proto-redir '=https' --connect-timeout 10 --max-tim
 for file in v2box v2box.sh install.sh node-network.py node-credentials.py config.example.json LICENSE LICENSE.sing-box NOTICE.md README.md; do
   [[ -s "$stage/$file" && ! -L "$stage/$file" ]] || { echo "Release is missing required file: $file" >&2; exit 1; }
 done
-# Panel-shipped fixes also apply when installing an older immutable release.
-# New releases carrying these capabilities keep their own bundled scripts.
-if ! grep -q '^# v2box-manager-v2$' "$stage/v2box.sh" && [[ -f /usr/local/lib/v2box/panel-manager.sh ]]; then
-  [[ ! -L /usr/local/lib/v2box/panel-manager.sh ]] || { echo 'Unsafe panel manager overlay' >&2; exit 1; }
-  grep -qx '# v2box-manager-v2' /usr/local/lib/v2box/panel-manager.sh || exit 1
-  cp -- /usr/local/lib/v2box/panel-manager.sh "$stage/v2box.sh"
-fi
-if ! grep -q '^# v2box-script-overlay-v1$' "$stage/install.sh" && [[ -f /usr/local/lib/v2box/panel-install.sh ]]; then
-  [[ ! -L /usr/local/lib/v2box/panel-install.sh ]] || { echo 'Unsafe panel installer overlay' >&2; exit 1; }
-  grep -qx '# v2box-script-overlay-v1' /usr/local/lib/v2box/panel-install.sh || exit 1
-  cp -- /usr/local/lib/v2box/panel-install.sh "$stage/install.sh"
-fi
 for script in v2box.sh install.sh; do
   bash -n "$stage/$script" || { echo "Release contains an invalid shell script: $script; installed programs were not changed." >&2; exit 1; }
 done

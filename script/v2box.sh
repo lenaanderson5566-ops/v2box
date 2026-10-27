@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
 set -euo pipefail
-# v2box-manager-v2
 run_service() {
   command -v timeout >/dev/null || { echo 'Required command timeout is missing. Use the latest panel installation script to repair dependencies.' >&2; return 1; }
   local result=0

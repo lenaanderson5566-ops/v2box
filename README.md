@@ -504,8 +504,8 @@ v1.0.14 不包含此能力。助手会在写入配置前同时检查已安装程
 `v2box status` 禁用分页并限制查询时间；服务未运行时 `v2box log` 显示最近日志后返回，不再无提示地等待。运行中的服务仍实时跟随日志，Ctrl+C 只退出查看。部署日志与服务日志分开，可使用 `journalctl -u v2box-deployment -n 100 --no-pager` 查看；journal 跨重启保留取决于系统配置。新版管理脚本提供 `deploy-status`、`deploy-log`，旧管理脚本可直接使用 systemctl/journalctl。
 
 
-### 仅刷新管理脚本
+### 管理命令与部署日志（v1.0.16）
 
-新版面板的公开 bootstrap 包含经过回归验证的管理脚本和安装器，不依赖旧版本 Release 内的管理脚本。新安装、恢复和面板升级命令都会安装这些脚本；只配置 IP 上报的命令不安装节点管理程序。已有节点可下载所属面板的最新 bootstrap 后执行 `sh install-v2box.sh --refresh-scripts`，仅刷新管理、安装及部署辅助脚本，不更换核心，不重启服务，不修改 Nodes、证书、密钥或 IP 上报设置。面板必须先更新到包含该功能的代码。
+本版 Release 包含修复后的管理脚本，已有节点执行 `v2box update` 或面板生成的 v1.0.16 升级命令即可更新。`status` 禁用分页并限制查询时间；未运行时 `log` 显示最近日志后返回，并提示查看待部署任务。`deploy-status` 和 `deploy-log` 分别查询部署状态及日志。后台 DNS 等待托管能力需要同时更新面板部署脚本。
 
-刷新后执行 `v2box status`、`v2box log`、`v2box deploy-status` 和 `v2box deploy-log`。以后 `v2box update` 安装旧 Release 时会保留已验证的面板脚本补丁；包含对应脚本能力的新 Release 使用自身配套脚本。安装器仍验证发行包 SHA256，脚本语法验证失败时不替换程序。
+升级保留 Nodes、证书、密钥及 IP 上报设置。运行中的服务升级后重启，停止的服务保持停止。脚本和安装器统一随 Release 交付，面板不再携带独立副本。
