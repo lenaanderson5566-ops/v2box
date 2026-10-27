@@ -14,7 +14,7 @@ Cloudflare 公网 HTTPS 地址可用于节点通讯，后台不以源站连接�
 
 V2Box 节点默认使用 `/api/v10/server/...`，包括 configuration、users、online-counts、traffic、online-users 和 capabilities。每个 `Nodes[]` 设置 `"NodeType": "v2box"`；`ApiVersion` 留空即使用 V10，也可显式填写 `"ApiVersion": "v10"`。凭据放在 Authorization Bearer 请求头，配置和用户列表支持 ETag。节点上报核心版本及能力，面板仅向声明支持原生路由的节点下发高级配置。
 
-**升级顺序：先更新面板并运行数据库迁移，再更新节点。** 旧面板可显式设置 `"ApiVersion": "legacy"`，沿用 `/api/v2/server/config` 和 `/api/v1/server/UniProxy/{user,alivelist,push,alive}`，但无法使用新的原生配置功能；不会自动降级到旧接口。NodeType 缺省为 v2box；显式 v2node 配置被拒绝。安装器及示例配置统一使用 v2box。V10 用户列表使用 JSON；旧接口保留 JSON / MessagePack。
+**升级顺序：先更新面板并运行数据库迁移，再更新节点。** 旧面板可显式设置 `"ApiVersion": "legacy"`，沿用 `/api/v2/server/config` 和 `/api/v1/server/UniProxy/{user,alivelist,push,alive}`，更新后的面板通过 `sing_box` 同样下发原生路由；不会自动降级到旧接口。NodeType 缺省为 v2box；显式 v2node 配置被拒绝。安装器及示例配置统一使用 v2box。V10 用户列表使用 JSON；旧接口保留 JSON / MessagePack。
 
 
 节点协议：VMess、VLESS、Trojan、Shadowsocks AEAD / SS2022 AES、Hysteria2、TUIC、AnyTLS、Naive。VMess/VLESS/Trojan 支持 TCP、WebSocket、gRPC、HTTPUpgrade。支持 TLS 证书文件、面板远程证书、原有 ACME 申请/续期和 VLESS Reality。
