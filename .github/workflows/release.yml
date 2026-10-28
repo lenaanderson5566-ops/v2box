@@ -1,177 +1,121 @@
 name: Build and Release
-
 on:
   workflow_dispatch:
   push:
-    branches:
-      - master
-    paths:
-      - "**/*.go"
-      - "go.mod"
-      - "go.sum"
-      - ".github/workflows/release.yml"
+    branches: [main, master]
+    tags: ["v*"]
   pull_request:
-    types: [opened, synchronize, reopened]
-    paths:
-      - "**/*.go"
-      - "go.mod"
-      - "go.sum"
-      - ".github/workflows/release.yml"
   release:
     types: [published]
-
+permissions:
+  contents: read
 jobs:
-
+  test:
+    runs-on: ubuntu-latest
+    env:
+      GOEXPERIMENT: jsonv2
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq jq unzip zip openssl
+      - run: go test -race -tags with_quic,with_utls ./... github.com/sagernet/fswatch
+      # Vision's upstream unsafe TLS access and shared filter state are not race-clean.
+      - run: go test -tags with_quic,with_utls ./core -run TestVLESSRealityVision -count=1
+      - run: go vet -tags with_quic,with_utls ./...
+      - run: bash -n script/install.sh && bash -n script/v2box.sh
+      - run: python3 -m unittest discover -s script -p '*_test.py'
   build:
+    needs: test
     strategy:
       matrix:
-        # Include amd64 on all platforms.
-        goos: [windows, freebsd, linux, darwin]
-        goarch: [amd64, 386]
-        exclude:
-          # Exclude i386 on darwin.
-          - goarch: 386
-            goos: darwin
-        include:
-          # BEIGIN MacOS ARM64
-          - goos: darwin
-            goarch: arm64
-          # END MacOS ARM64
-          # BEGIN Linux ARM 5 6 7
-          - goos: linux
-            goarch: arm
-            goarm: 7
-          - goos: linux
-            goarch: arm
-            goarm: 6
-          - goos: linux
-            goarch: arm
-            goarm: 5
-          # END Linux ARM 5 6 7
-          # BEGIN Other architectures
-          # BEGIN riscv64 & ARM64
-          - goos: linux
-            goarch: arm64
-          - goos: linux
-            goarch: riscv64
-          # END riscv64 & ARM64
-          # BEGIN MIPS
-          - goos: linux
-            goarch: mips64
-          - goos: linux
-            goarch: mips64le
-          - goos: linux
-            goarch: mipsle
-          - goos: linux
-            goarch: mips
-          # END MIPS
-          # BEGIN PPC
-          - goos: linux
-            goarch: ppc64
-          - goos: linux
-            goarch: ppc64le
-          # END PPC
-          # BEGIN FreeBSD ARM
-          - goos: freebsd
-            goarch: arm64
-          - goos: freebsd
-            goarch: arm
-            goarm: 7
-          # END FreeBSD ARM
-          # BEGIN S390X
-          - goos: linux
-            goarch: s390x
-          # END S390X
-          # END Other architectures
-      fail-fast: false
-
+        goos: [linux, windows, darwin]
+        goarch: [amd64, arm64]
     runs-on: ubuntu-latest
     env:
       GOOS: ${{ matrix.goos }}
       GOARCH: ${{ matrix.goarch }}
-      GOARM: ${{ matrix.goarm }}
       CGO_ENABLED: 0
+      GOEXPERIMENT: jsonv2
     steps:
-      - name: Checkout codebase
-        uses: actions/checkout@v5
-      - name: Show workflow information
-        id: get_filename
-        run: |
-          export _NAME=$(jq ".[\"$GOOS-$GOARCH$GOARM$GOMIPS\"].friendlyName" -r < .github/build/friendly-filenames.json)
-          echo "GOOS: $GOOS, GOARCH: $GOARCH, GOARM: $GOARM, GOMIPS: $GOMIPS, RELEASE_NAME: $_NAME"
-          echo "ASSET_NAME=$_NAME" >> $GITHUB_OUTPUT
-          echo "ASSET_NAME=$_NAME" >> $GITHUB_ENV
-      - name: Set up Go
-        uses: actions/setup-go@v6
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
         with:
-          go-version: '1.27.1'
-
-      - name: Get project dependencies
-        run: |
-          go mod download
-      - name: Get release version
-        if: ${{ github.event_name == 'release' }}
-        run: |
-          echo "version=$(echo $GITHUB_REF | cut -d / -f 3)" >> $GITHUB_ENV
-      - name: Get other version
-        if: ${{ github.event_name != 'release' }}
-        run: |
-          echo "version=${{ github.sha }}" >> $GITHUB_ENV
-      - name: Build v2node
-        run: |
-          echo "version: $version"
-          mkdir -p build_assets
-          GOEXPERIMENT=jsonv2 go build -v -o build_assets/v2node -trimpath -ldflags "-X 'github.com/wyx2685/v2node/cmd.version=$version' -s -w -buildid="
-
-      - name: Build Mips softfloat v2node
-        if: matrix.goarch == 'mips' || matrix.goarch == 'mipsle'
-        run: |
-          echo "version: $version"
-          GOEXPERIMENT=jsonv2 GOMIPS=softfloat go build -v -o build_assets/v2node_softfloat -trimpath -ldflags "-X 'github.com/wyx2685/v2node/cmd.version=$version' -s -w -buildid="
-      - name: Rename Windows v2node
-        if: matrix.goos == 'windows'
-        run: |
-          cd ./build_assets || exit 1
-          mv v2node v2node.exe
-      - name: Prepare to release
-        run: |
-          cp ${GITHUB_WORKSPACE}/README.md ./build_assets/README.md
-          cp ${GITHUB_WORKSPACE}/LICENSE ./build_assets/LICENSE
-          LIST=('geoip' 'geosite')
-          for i in "${LIST[@]}"
-          do
-            DOWNLOAD_URL="https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/${i}.dat"
-            FILE_NAME="${i}.dat"
-            echo -e "Downloading ${DOWNLOAD_URL}..."
-            curl -L "${DOWNLOAD_URL}" -o ./build_assets/${FILE_NAME}
-          done
-      - name: Create ZIP archive
+          go-version-file: go.mod
+      - name: Build
         shell: bash
         run: |
-          pushd build_assets || exit 1
-          touch -mt $(date +%Y01010000) *
-          zip -9vr ../v2node-$ASSET_NAME.zip .
-          popd || exit 1
-          FILE=./v2node-$ASSET_NAME.zip
-          DGST=$FILE.dgst
-          for METHOD in {"md5","sha1","sha256","sha512"}
-          do
-            openssl dgst -$METHOD $FILE | sed 's/([^)]*)//g' >>$DGST
+          set -euo pipefail
+          artifact_dir=$PWD
+          package_root=$(mktemp -d)
+          trap 'rm -rf -- "$package_root"' EXIT
+          mkdir "$package_root/package"
+          suffix=''
+          if [ "$GOOS" = windows ]; then suffix='.exe'; fi
+          go build -tags with_quic,with_utls -trimpath -ldflags "-s -w -X github.com/lenaanderson5566-ops/v2box/cmd.version=${GITHUB_REF_NAME}" -o "$package_root/package/v2box${suffix}" .
+          cp README.md LICENSE LICENSE.sing-box NOTICE.md config.example.json "$package_root/package/"
+          cp script/install.sh script/v2box.sh script/node-network.py script/node-credentials.py "$package_root/package/"
+          cp -r internal/licenses "$package_root/package/"
+          cd "$package_root/package"
+          zip -r "../v2box-${GOOS}-${GOARCH}.zip" .
+          cd "$artifact_dir"
+          mv -f "$package_root/v2box-${GOOS}-${GOARCH}.zip" .
+          sha256sum "v2box-${GOOS}-${GOARCH}.zip" > "v2box-${GOOS}-${GOARCH}.zip.sha256"
+          sha256sum -c "v2box-${GOOS}-${GOARCH}.zip.sha256"
+          unzip -tq "v2box-${GOOS}-${GOARCH}.zip"
+          listing=$(unzip -Z1 "v2box-${GOOS}-${GOARCH}.zip")
+          for file in "v2box${suffix}" README.md LICENSE LICENSE.sing-box NOTICE.md config.example.json install.sh v2box.sh node-network.py node-credentials.py; do
+            grep -Fxq "$file" <<< "$listing"
           done
-      - name: Change the name
+      - uses: actions/upload-artifact@v6
+        with:
+          name: v2box-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: v2box-*.zip*
+  publish:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'release'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v6
+        with:
+          pattern: v2box-*
+          merge-multiple: true
+          path: release-assets
+      - name: Verify complete release assets
+        shell: bash
         run: |
-          mv build_assets v2node-$ASSET_NAME
-      - name: Upload files to Artifacts
-        uses: actions/upload-artifact@v6
+          cd release-assets
+          for os in linux windows darwin; do
+            for arch in amd64 arm64; do
+              test -s "v2box-${os}-${arch}.zip"
+              test -s "v2box-${os}-${arch}.zip.sha256"
+              sha256sum -c "v2box-${os}-${arch}.zip.sha256"
+              listing=$(unzip -Z1 "v2box-${os}-${arch}.zip")
+              grep -Fxq node-credentials.py <<< "$listing"
+              grep -Fxq install.sh <<< "$listing"
+              grep -Fxq v2box.sh <<< "$listing"
+              grep -Fxq node-network.py <<< "$listing"
+            done
+          done
+      - uses: softprops/action-gh-release@v2
         with:
-          name: v2node-${{ steps.get_filename.outputs.ASSET_NAME }}
-          path: |
-            ./v2node-${{ steps.get_filename.outputs.ASSET_NAME }}/*
-      - name: Upload binaries to release
-        uses: svenstaro/upload-release-action@v2
-        if: github.event_name == 'release'
-        with:
-          repo_token: ${{ secrets.GITHUB_TOKEN }}
-          file: ./v2node-${{ steps.get_filename.outputs.ASSET_NAME }}.zip*
-          tag: ${{ github.ref }}
-          file_glob: true
+          files: release-assets/v2box-*.zip*
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+          make_latest: true
+          body: |
+            V2Box v1.0.16：管理命令、部署状态及日志体验修复。
+
+            - status 禁用分页并限制查询时间，避免终端查询长时间等待。
+            - log 在服务未运行时显示最近记录后返回，提示待部署任务；运行中仍实时跟随。
+            - 新增 deploy-status / deploy-log，配合新版后台查看独立部署任务和 DNS 等待日志。
+            - resume 支持新版后台部署辅助脚本；关闭 SSH 后继续部署需同步更新面板。
+            - 安装器、管理脚本、IP 上报工具和节点二进制统一随 Release 打包。
+            - 保留现有 Nodes、证书、密钥、IP 上报设置；运行中的服务升级后重启，停止的服务保持停止。
+
+            升级：v2box update（自动获取最新正式版），或 v2box update v1.0.16。
+            旧管理入口不支持 update 时，下载本版本 script/install.sh，执行 bash install.sh v1.0.16 --update。
+            本版未修改代理核心逻辑。

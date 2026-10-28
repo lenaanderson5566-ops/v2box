@@ -1,424 +1,293 @@
-#!/bin/bash
-
-red='\033[0;31m'
-green='\033[0;32m'
-yellow='\033[0;33m'
-plain='\033[0m'
-
-cur_dir=$(pwd)
-
-# check root
-[[ $EUID -ne 0 ]] && echo -e "${red}错误：${plain} 必须使用root用户运行此脚本！\n" && exit 1
-
-# check os
-if [[ -f /etc/redhat-release ]]; then
-    release="centos"
-elif cat /etc/issue | grep -Eqi "alpine"; then
-    release="alpine"
-elif cat /etc/issue | grep -Eqi "debian"; then
-    release="debian"
-elif cat /etc/issue | grep -Eqi "ubuntu"; then
-    release="ubuntu"
-elif cat /etc/issue | grep -Eqi "centos|red hat|redhat|rocky|alma|oracle linux"; then
-    release="centos"
-elif cat /proc/version | grep -Eqi "debian"; then
-    release="debian"
-elif cat /proc/version | grep -Eqi "ubuntu"; then
-    release="ubuntu"
-elif cat /proc/version | grep -Eqi "centos|red hat|redhat|rocky|alma|oracle linux"; then
-    release="centos"
-elif cat /proc/version | grep -Eqi "arch"; then
-    release="arch"
-else
-    echo -e "${red}未检测到系统版本，请联系脚本作者！${plain}\n" && exit 1
+#!/usr/bin/env bash
+set -euo pipefail
+run_service() {
+  local result=0
+  timeout -k 5 90 "$@" 7>&- 8>&- 9>&- || result=$?
+  if ((result == 124 || result == 137)); then
+    echo 'Service operation timed out. Check v2box status and journalctl -u v2box; configuration and certificates were retained.' >&2
+  fi
+  return "$result"
+}
+repo='lenaanderson5566-ops/v2box'
+version=''
+api_host=''
+node_id=''
+api_key=''
+prompt_api_key=false
+node_type='v2box'
+landing_page=false
+landing_dir=''
+ddns=false
+ddns_domain=''
+ddns_zone=''
+ddns_token_file=''
+ddns_family='ipv4'
+update_only=false
+while (($#)); do
+  case "$1" in
+    --api-host|--node-id|--api-key|--node-type|--landing-dir|--ddns-domain|--ddns-zone-id|--ddns-token-file|--ddns-family)
+      (($# >= 2)) || { echo "Missing value for $1" >&2; exit 1; }
+      case "$1" in
+        --api-host) api_host=$2;;
+        --node-id) node_id=$2;;
+        --api-key) api_key=$2;;
+        --node-type) node_type=$2;;
+        --landing-dir) landing_dir=$2; landing_page=true;;
+        --ddns-domain) ddns_domain=$2; ddns=true;;
+        --ddns-zone-id) ddns_zone=$2;;
+        --ddns-token-file) ddns_token_file=$2;;
+        --ddns-family) ddns_family=$2;;
+      esac
+      shift 2;;
+    --ddns) ddns=true; shift;;
+    --update) update_only=true; shift;;
+    --prompt-api-key) prompt_api_key=true; shift;;
+    --landing-page) landing_page=true; shift;;
+    -h|--help) echo "Usage: $0 [release-tag] [--update] [--api-host URL --node-id ID --prompt-api-key] [--node-type v2box] [--landing-page | --landing-dir /path/to/site] [--ddns --ddns-domain HOST --ddns-zone-id ZONE --ddns-token-file FILE --ddns-family ipv4|ipv6|dual]"; exit 0;;
+    --*) echo "Unknown option: $1" >&2; exit 1;;
+    *) [[ -z "$version" ]] || { echo 'Only one version is allowed' >&2; exit 1; }; version=$1; shift;;
+  esac
+done
+[[ "$node_type" == v2box ]] || { echo "Invalid node type" >&2; exit 1; }
+if [[ -n "$landing_dir" ]]; then
+  [[ "$landing_dir" == /* && -f "$landing_dir/index.html" && -r "$landing_dir/index.html" ]] || { echo 'Landing directory must be absolute and contain a readable index.html' >&2; exit 1; }
 fi
-
-########################
-# 参数解析
-########################
-VERSION_ARG=""
-API_HOST_ARG=""
-NODE_ID_ARG=""
-API_KEY_ARG=""
-
-parse_args() {
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            --api-host)
-                API_HOST_ARG="$2"; shift 2 ;;
-            --node-id)
-                NODE_ID_ARG="$2"; shift 2 ;;
-            --api-key)
-                API_KEY_ARG="$2"; shift 2 ;;
-            -h|--help)
-                echo "用法: $0 [版本号] [--api-host URL] [--node-id ID] [--api-key KEY]"
-                exit 0 ;;
-            --*)
-                echo "未知参数: $1"; exit 1 ;;
-            *)
-                # 兼容第一个位置参数作为版本号
-                if [[ -z "$VERSION_ARG" ]]; then
-                    VERSION_ARG="$1"; shift
-                else
-                    shift
-                fi ;;
-        esac
+if [[ "$landing_page" == true && -z "$api_host" ]]; then
+  echo 'Landing page flags require panel arguments when creating a config' >&2; exit 1
+fi
+if [[ "$ddns" == true ]]; then
+  command -v python3 >/dev/null || { echo 'Install python3 to configure Cloudflare DDNS' >&2; exit 1; }
+  [[ "$ddns_family" == ipv4 || "$ddns_family" == ipv6 || "$ddns_family" == dual ]] || { echo 'Invalid DDNS address family' >&2; exit 1; }
+fi
+[[ $EUID -eq 0 ]] || { echo 'Run as root' >&2; exit 1; }
+[[ $(uname -s) == Linux ]] || { echo 'This installer requires Linux' >&2; exit 1; }
+[[ ! -L /etc/v2box/.deployment.lock && ! -L /etc/v2box && ! -L /etc/v2box/config.json && ! -L /etc/v2box/.maintenance.lock && ! -L /etc/v2box/.bootstrap.lock && ! -L /usr/local/lib/v2box ]] || { echo 'Refusing symlinked installation paths' >&2; exit 1; }
+if $update_only; then
+  [[ -s /etc/v2box/config.json && -x /usr/local/lib/v2box/v2box ]] || { echo 'V2Box is not installed; use the panel deployment command.' >&2; exit 1; }
+  [[ -z "$api_host$node_id$api_key" && "$ddns" == false && "$landing_page" == false ]] || { echo 'Update preserves existing settings; do not supply deployment options.' >&2; exit 1; }
+fi
+pending_deployment=false
+if [[ -e /etc/v2box/.deployment-pending ]] || compgen -G '/etc/v2box/deployment-state*.json' >/dev/null; then
+  pending_deployment=true
+  [[ -z "$api_host$node_id$api_key" && "$ddns" == false && "$landing_page" == false && -z "$landing_dir" && "$prompt_api_key" == false ]] || { echo 'Pending deployment: update program files without new deployment options, then resume.' >&2; exit 1; }
+fi
+for tool in curl unzip sha256sum jq install flock timeout; do
+  command -v "$tool" >/dev/null || { echo "Install required command: $tool" >&2; exit 1; }
+done
+install -d -m 755 /etc/v2box
+# The root-owned panel bootstrap holds its lock while invoking this installer.
+# Keep that descriptor out of child services, including older release installers.
+if [[ "${V2BOX_BOOTSTRAP_LOCK_HELD:-}" != 1 ]]; then
+  exec 9>/etc/v2box/.bootstrap.lock
+  flock -n 9 || { echo 'Another deployment is running.' >&2; exit 1; }
+fi
+unset V2BOX_BOOTSTRAP_LOCK_HELD
+exec 7>/etc/v2box/.deployment.lock
+flock -n 7 || { echo 'Deployment is actively running. Wait for it to finish or stop its terminal command before updating.' >&2; exit 1; }
+exec 8>/etc/v2box/.maintenance.lock
+flock -n 8 || { echo 'Another maintenance operation is running.' >&2; exit 1; }
+case "$(uname -m)" in
+  x86_64|amd64) arch=amd64;;
+  aarch64|arm64) arch=arm64;;
+  *) echo 'Supported architectures: amd64, arm64' >&2; exit 1;;
+esac
+if command -v systemctl >/dev/null; then init=systemd
+elif command -v rc-service >/dev/null; then init=openrc
+else echo 'systemd or OpenRC is required' >&2; exit 1; fi
+if [[ "$prompt_api_key" == true && ! -f /etc/v2box/config.json ]]; then
+  [[ -z "$api_key" ]] || { echo 'Choose either interactive key input or --api-key' >&2; exit 1; }
+  read -r -s -p 'Node API key: ' api_key < /dev/tty
+  echo
+fi
+if [[ -n "$api_host$node_id$api_key" && ! -f /etc/v2box/config.json ]]; then
+  [[ "$api_host" =~ ^https://[^/?#[:space:]@]+(/[^?#[:space:]]*)?$ && "$node_id" =~ ^[1-9][0-9]*$ && -n "$api_key" ]] || { echo 'Supply an HTTPS panel URL without credentials/query/fragment, a node ID and an API key' >&2; exit 1; }
+fi
+if [[ -f /etc/v2box/config.json ]]; then
+  jq -e '.Nodes | type == "array" and length > 0 and all(.[]; (.ApiHost | type == "string") and (.ApiHost | test("^https://[^/?#\\s@]+(/[^?#\\s]*)?$")))' /etc/v2box/config.json >/dev/null || {
+    echo 'Existing config requires HTTPS ApiHost for every node. Correct it before upgrading; the installed binary and service have not been changed.' >&2
+    exit 1
+  }
+fi
+if [[ -z "$version" ]]; then
+  version=$(curl -fsSL --proto '=https' --proto-redir '=https' --connect-timeout 10 --max-time 30 "https://api.github.com/repos/$repo/releases/latest" | jq -er .tag_name)
+fi
+[[ "$version" =~ ^[a-zA-Z0-9._-]+$ ]] || { echo 'Invalid release tag' >&2; exit 1; }
+was_running=false
+had_binary=false
+[[ ! -f /usr/local/lib/v2box/v2box ]] || had_binary=true
+if [[ "$init" == systemd ]]; then
+  if run_service systemctl is-active --quiet v2box; then was_running=true;
+  else state=$?; [[ $state == 3 || $state == 4 ]] || { echo 'Cannot verify existing service state; programs were not changed.' >&2; exit "$state"; }; fi
+else
+  if run_service rc-service v2box status >/dev/null 2>&1; then was_running=true;
+  else state=$?; [[ $state == 3 ]] || { echo 'Cannot verify existing service state; programs were not changed.' >&2; exit "$state"; }; fi
+fi
+stage=$(mktemp -d)
+rollback=false
+program_files=(v2box v2box.previous manager.sh install.sh node-credentials.py node-network.py)
+cleanup() {
+  result=$?
+  trap - EXIT
+  trap '' INT TERM
+  rm -f -- /etc/v2box/config.json.new /etc/systemd/system/v2box.service.new /etc/init.d/v2box.new || true
+  if ((result != 0)) && $rollback; then
+    echo 'Update failed; restoring the previous program files. Configuration and certificates were preserved.' >&2
+    restore_failed=false
+    for file in "${program_files[@]}"; do
+      if [[ -f "$stage/previous/$file" ]]; then
+        if ! cp -p -- "$stage/previous/$file" "/usr/local/lib/v2box/$file.restore" || ! mv -f -- "/usr/local/lib/v2box/$file.restore" "/usr/local/lib/v2box/$file"; then
+          echo "Could not restore program file: $file" >&2; restore_failed=true
+        fi
+      else rm -f -- "/usr/local/lib/v2box/$file" || restore_failed=true; fi
     done
+    if [[ -f "$stage/previous/wrapper" ]]; then
+      if ! cp -p -- "$stage/previous/wrapper" /usr/local/bin/v2box.restore || ! mv -f -- /usr/local/bin/v2box.restore /usr/local/bin/v2box; then restore_failed=true; fi
+    else rm -f -- /usr/local/bin/v2box || restore_failed=true; fi
+    if $restore_failed; then
+      echo "Rollback incomplete. Backup retained at $stage" >&2
+      echo 'Fix disk space or file permissions and restore the retained previous programs before restarting. Configuration and certificates were not removed.' >&2
+      exit "$result"
+    fi
+    if $was_running; then
+      if [[ "$init" == systemd ]]; then run_service systemctl restart v2box || echo 'Previous service could not restart; inspect v2box log.' >&2
+      else run_service rc-service v2box restart || echo 'Previous service could not restart; inspect v2box log.' >&2; fi
+    fi
+  fi
+  if ((result != 0)) && ! $rollback; then
+    echo 'Installation did not complete. Resolve the error above, then rerun the panel installation command; do not remove configuration or certificates.' >&2
+  fi
+  rm -rf -- "$stage"
+  exit "$result"
 }
-
-arch=$(uname -m)
-
-if [[ $arch == "x86_64" || $arch == "x64" || $arch == "amd64" ]]; then
-    arch="64"
-elif [[ $arch == "aarch64" || $arch == "arm64" ]]; then
-    arch="arm64-v8a"
-elif [[ $arch == "s390x" ]]; then
-    arch="s390x"
-else
-    arch="64"
-    echo -e "${red}检测架构失败，使用默认架构: ${arch}${plain}"
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+archive="v2box-linux-${arch}.zip"
+base="https://github.com/$repo/releases/download/$version"
+curl -fSL --proto '=https' --proto-redir '=https' --connect-timeout 10 --max-time 180 "$base/$archive" -o "$stage/$archive"
+curl -fSL --proto '=https' --proto-redir '=https' --connect-timeout 10 --max-time 30 "$base/$archive.sha256" -o "$stage/$archive.sha256"
+(cd "$stage" && sha256sum -c "$archive.sha256" && unzip -q "$archive")
+for file in v2box v2box.sh install.sh node-network.py node-credentials.py config.example.json LICENSE LICENSE.sing-box NOTICE.md README.md; do
+  [[ -s "$stage/$file" && ! -L "$stage/$file" ]] || { echo "Release is missing required file: $file" >&2; exit 1; }
+done
+for script in v2box.sh install.sh; do
+  bash -n "$stage/$script" || { echo "Release contains an invalid shell script: $script; installed programs were not changed." >&2; exit 1; }
+done
+if command -v python3 >/dev/null; then
+  python3 -c 'import ast,sys; [ast.parse(open(path, encoding="utf-8").read(), filename=path) for path in sys.argv[1:]]' "$stage/node-network.py" "$stage/node-credentials.py" || { echo 'Release contains an invalid Python helper; installed programs were not changed.' >&2; exit 1; }
 fi
-
-if [ "$(getconf WORD_BIT)" != '32' ] && [ "$(getconf LONG_BIT)" != '64' ] ; then
-    echo "本软件不支持 32 位系统(x86)，请使用 64 位系统(x86_64)，如果检测有误，请联系作者"
-    exit 2
+chmod +x "$stage/v2box"
+timeout -k 5 15 "$stage/v2box" version || { echo 'Release binary did not pass the version check; installed programs were not changed.' >&2; exit 1; }
+install -d -m 755 /usr/local/lib/v2box /etc/v2box
+if $had_binary; then
+  mkdir "$stage/previous"
+  for file in "${program_files[@]}"; do
+    [[ ! -f "/usr/local/lib/v2box/$file" ]] || cp -p -- "/usr/local/lib/v2box/$file" "$stage/previous/$file"
+  done
+  [[ ! -f /usr/local/bin/v2box ]] || cp -p -- /usr/local/bin/v2box "$stage/previous/wrapper"
+  rollback=true
 fi
-
-# os version
-if [[ -f /etc/os-release ]]; then
-    os_version=$(awk -F'[= ."]' '/VERSION_ID/{print $3}' /etc/os-release)
+if [[ -f /usr/local/lib/v2box/v2box ]]; then
+  cp -p /usr/local/lib/v2box/v2box /usr/local/lib/v2box/v2box.previous
 fi
-if [[ -z "$os_version" && -f /etc/lsb-release ]]; then
-    os_version=$(awk -F'[= ."]+' '/DISTRIB_RELEASE/{print $2}' /etc/lsb-release)
+install -m 755 "$stage/v2box" /usr/local/lib/v2box/v2box.new
+mv -f /usr/local/lib/v2box/v2box.new /usr/local/lib/v2box/v2box
+install -m 755 "$stage/v2box.sh" /usr/local/lib/v2box/manager.sh.new
+mv -f -- /usr/local/lib/v2box/manager.sh.new /usr/local/lib/v2box/manager.sh
+install -m 755 "$stage/v2box.sh" /usr/local/bin/v2box.new
+mv -f -- /usr/local/bin/v2box.new /usr/local/bin/v2box
+install -m 755 "$stage/install.sh" /usr/local/lib/v2box/install.sh.new
+mv -f -- /usr/local/lib/v2box/install.sh.new /usr/local/lib/v2box/install.sh
+if [[ -f "$stage/node-credentials.py" ]]; then
+  install -m 755 "$stage/node-credentials.py" /usr/local/lib/v2box/node-credentials.py
 fi
-
-if [[ x"${release}" == x"centos" ]]; then
-    if [[ ${os_version} -le 6 ]]; then
-        echo -e "${red}请使用 CentOS 7 或更高版本的系统！${plain}\n" && exit 1
-    fi
-    if [[ ${os_version} -eq 7 ]]; then
-        echo -e "${red}注意： CentOS 7 无法使用hysteria1/2协议！${plain}\n"
-    fi
-elif [[ x"${release}" == x"ubuntu" ]]; then
-    if [[ ${os_version} -lt 16 ]]; then
-        echo -e "${red}请使用 Ubuntu 16 或更高版本的系统！${plain}\n" && exit 1
-    fi
-elif [[ x"${release}" == x"debian" ]]; then
-    if [[ ${os_version} -lt 8 ]]; then
-        echo -e "${red}请使用 Debian 8 或更高版本的系统！${plain}\n" && exit 1
-    fi
+if [[ -f "$stage/node-network.py" ]]; then
+  install -m 755 "$stage/node-network.py" /usr/local/lib/v2box/node-network.py
 fi
-
-install_base() {
-    # 优化版本：批量检查和安装包，减少系统调用
-    need_install_apt() {
-        local packages=("$@")
-        local missing=()
-        
-        # 批量检查已安装的包
-        local installed_list=$(dpkg-query -W -f='${Package}\n' 2>/dev/null | sort)
-        
-        for p in "${packages[@]}"; do
-            if ! echo "$installed_list" | grep -q "^${p}$"; then
-                missing+=("$p")
-            fi
-        done
-        
-        if [[ ${#missing[@]} -gt 0 ]]; then
-            echo "安装缺失的包: ${missing[*]}"
-            apt-get update -y >/dev/null 2>&1
-            DEBIAN_FRONTEND=noninteractive apt-get install -y "${missing[@]}" >/dev/null 2>&1
-        fi
-    }
-
-    need_install_yum() {
-        local packages=("$@")
-        local missing=()
-        
-        # 批量检查已安装的包
-        local installed_list=$(rpm -qa --qf '%{NAME}\n' 2>/dev/null | sort)
-        
-        for p in "${packages[@]}"; do
-            if ! echo "$installed_list" | grep -q "^${p}$"; then
-                missing+=("$p")
-            fi
-        done
-        
-        if [[ ${#missing[@]} -gt 0 ]]; then
-            echo "安装缺失的包: ${missing[*]}"
-            yum install -y "${missing[@]}" >/dev/null 2>&1
-        fi
-    }
-
-    need_install_apk() {
-        local packages=("$@")
-        local missing=()
-        
-        # 批量检查已安装的包
-        local installed_list=$(apk info 2>/dev/null | sort)
-        
-        for p in "${packages[@]}"; do
-            if ! echo "$installed_list" | grep -q "^${p}$"; then
-                missing+=("$p")
-            fi
-        done
-        
-        if [[ ${#missing[@]} -gt 0 ]]; then
-            echo "安装缺失的包: ${missing[*]}"
-            apk add --no-cache "${missing[@]}" >/dev/null 2>&1
-        fi
-    }
-
-    # 一次性安装所有必需的包
-    if [[ x"${release}" == x"centos" ]]; then
-        # 检查并安装 epel-release
-        if ! rpm -q epel-release >/dev/null 2>&1; then
-            echo "安装 EPEL 源..."
-            yum install -y epel-release >/dev/null 2>&1
-        fi
-        need_install_yum wget curl unzip tar cronie socat ca-certificates pv
-        update-ca-trust force-enable >/dev/null 2>&1 || true
-    elif [[ x"${release}" == x"alpine" ]]; then
-        need_install_apk wget curl unzip tar socat ca-certificates pv
-        update-ca-certificates >/dev/null 2>&1 || true
-    elif [[ x"${release}" == x"debian" ]]; then
-        need_install_apt wget curl unzip tar cron socat ca-certificates pv
-        update-ca-certificates >/dev/null 2>&1 || true
-    elif [[ x"${release}" == x"ubuntu" ]]; then
-        need_install_apt wget curl unzip tar cron socat ca-certificates pv
-        update-ca-certificates >/dev/null 2>&1 || true
-    elif [[ x"${release}" == x"arch" ]]; then
-        echo "更新包数据库..."
-        pacman -Sy --noconfirm >/dev/null 2>&1
-        # --needed 会跳过已安装的包，非常高效
-        echo "安装必需的包..."
-        pacman -S --noconfirm --needed wget curl unzip tar cronie socat ca-certificates pv >/dev/null 2>&1
-    fi
-}
-
-# 0: running, 1: not running, 2: not installed
-check_status() {
-    if [[ ! -f /usr/local/v2node/v2node ]]; then
-        return 2
-    fi
-    if [[ x"${release}" == x"alpine" ]]; then
-        temp=$(service v2node status | awk '{print $3}')
-        if [[ x"${temp}" == x"started" ]]; then
-            return 0
-        else
-            return 1
-        fi
-    else
-        temp=$(systemctl status v2node | grep Active | awk '{print $3}' | cut -d "(" -f2 | cut -d ")" -f1)
-        if [[ x"${temp}" == x"running" ]]; then
-            return 0
-        else
-            return 1
-        fi
-    fi
-}
-
-generate_v2node_config() {
-        local api_host="$1"
-        local node_id="$2"
-        local api_key="$3"
-
-        mkdir -p /etc/v2node >/dev/null 2>&1
-        cat > /etc/v2node/config.json <<EOF
-{
-    "Log": {
-        "Level": "warning",
-        "Output": "",
-        "Access": "none"
-    },
-    "Nodes": [
-        {
-            "ApiHost": "${api_host}",
-            "NodeID": ${node_id},
-            "ApiKey": "${api_key}",
-            "Timeout": 15
-        }
-    ]
-}
-EOF
-        echo -e "${green}V2node 配置文件生成完成,正在重新启动服务${plain}"
-        if [[ x"${release}" == x"alpine" ]]; then
-            service v2node restart
-        else
-            systemctl restart v2node
-        fi
-        sleep 2
-        check_status
-        echo -e ""
-        if [[ $? == 0 ]]; then
-            echo -e "${green}v2node 重启成功${plain}"
-        else
-            echo -e "${red}v2node 可能启动失败，请使用 v2node log 查看日志信息${plain}"
-        fi
-}
-
-install_v2node() {
-    local version_param="$1"
-    if [[ -e /usr/local/v2node/ ]]; then
-        rm -rf /usr/local/v2node/
-    fi
-
-    mkdir /usr/local/v2node/ -p
-    cd /usr/local/v2node/
-
-    if  [[ -z "$version_param" ]] ; then
-        last_version=$(curl -Ls "https://api.github.com/repos/wyx2685/v2node/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
-        if [[ ! -n "$last_version" ]]; then
-            echo -e "${red}检测 v2node 版本失败，可能是超出 Github API 限制，请稍后再试，或手动指定 v2node 版本安装${plain}"
-            exit 1
-        fi
-        echo -e "${green}检测到最新版本：${last_version}，开始安装...${plain}"
-        url="https://github.com/wyx2685/v2node/releases/download/${last_version}/v2node-linux-${arch}.zip"
-        curl -sL "$url" | pv -s 30M -W -N "下载进度" > /usr/local/v2node/v2node-linux.zip
-        if [[ $? -ne 0 ]]; then
-            echo -e "${red}下载 v2node 失败，请确保你的服务器能够下载 Github 的文件${plain}"
-            exit 1
-        fi
-    else
-        last_version="v${version_param#v}"
-        url="https://github.com/wyx2685/v2node/releases/download/${last_version}/v2node-linux-${arch}.zip"
-        curl -sL "$url" | pv -s 30M -W -N "下载进度" > /usr/local/v2node/v2node-linux.zip
-        if [[ $? -ne 0 ]]; then
-            echo -e "${red}下载 v2node $1 失败，请确保此版本存在${plain}"
-            exit 1
-        fi
-    fi
-
-    unzip v2node-linux.zip
-    rm v2node-linux.zip -f
-    chmod +x v2node
-    mkdir /etc/v2node/ -p
-    cp geoip.dat /etc/v2node/
-    cp geosite.dat /etc/v2node/
-    if [[ x"${release}" == x"alpine" ]]; then
-        rm /etc/init.d/v2node -f
-        cat <<EOF > /etc/init.d/v2node
-#!/sbin/openrc-run
-
-name="v2node"
-description="v2node"
-
-command="/usr/local/v2node/v2node"
-command_args="server"
-command_user="root"
-
-pidfile="/run/v2node.pid"
-command_background="yes"
-
-depend() {
-        need net
-}
-EOF
-        chmod +x /etc/init.d/v2node
-        rc-update add v2node default
-        echo -e "${green}v2node ${last_version}${plain} 安装完成，已设置开机自启"
-    else
-        rm /etc/systemd/system/v2node.service -f
-        cat <<EOF > /etc/systemd/system/v2node.service
+for file in LICENSE LICENSE.sing-box NOTICE.md README.md; do
+  install -m 644 "$stage/$file" "/usr/local/lib/v2box/$file"
+done
+if [[ ! -f /etc/v2box/config.json ]]; then
+  if [[ -n "$api_host" ]]; then
+    umask 077
+    printf '%s' "$api_key" > "$stage/api-key"
+    jq -n --arg host "$api_host" --argjson id "$node_id" --rawfile key "$stage/api-key" --arg type "$node_type" --argjson landing "$landing_page" --arg directory "$landing_dir" \
+      '{Log:{Level:"info"},Nodes:[{NodeType:$type,ApiHost:$host,NodeID:$id,ApiKey:$key,Timeout:15,RetryCount:1,LandingPage:{Enabled:$landing,Directory:$directory}}]}' > "$stage/config.json"
+    install -m 600 "$stage/config.json" /etc/v2box/config.json.new
+    mv -f -- /etc/v2box/config.json.new /etc/v2box/config.json
+  else
+    install -m 600 "$stage/config.example.json" /etc/v2box/config.json.new
+    mv -f -- /etc/v2box/config.json.new /etc/v2box/config.json
+  fi
+elif [[ "$landing_page" == true ]]; then
+  echo 'Existing config preserved. Set Nodes[].LandingPage.Enabled and Directory manually to enable the page.'
+fi
+if [[ "$init" == systemd && ! -f /etc/systemd/system/v2box.service ]]; then
+  cat > "$stage/v2box.service" <<'UNIT'
 [Unit]
-Description=v2node Service
-After=network.target nss-lookup.target
-Wants=network.target
-
+Description=V2box sing-box panel backend
+After=network-online.target
+Wants=network-online.target
 [Service]
-User=root
-Group=root
 Type=simple
-LimitAS=infinity
-LimitRSS=infinity
-LimitCORE=infinity
-LimitNOFILE=999999
-WorkingDirectory=/usr/local/v2node/
-ExecStart=/usr/local/v2node/v2node server
-Restart=always
-RestartSec=10
-
+WorkingDirectory=/usr/local/lib/v2box
+ExecStart=/usr/local/lib/v2box/v2box server --config /etc/v2box/config.json
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=1048576
 [Install]
 WantedBy=multi-user.target
-EOF
-        systemctl daemon-reload
-        systemctl stop v2node
-        systemctl enable v2node
-        echo -e "${green}v2node ${last_version}${plain} 安装完成，已设置开机自启"
-    fi
+UNIT
+  install -m 644 "$stage/v2box.service" /etc/systemd/system/v2box.service.new
+  mv -f -- /etc/systemd/system/v2box.service.new /etc/systemd/system/v2box.service
+  run_service systemctl daemon-reload
+  run_service systemctl enable v2box
+elif [[ "$init" == openrc && ! -f /etc/init.d/v2box ]]; then
+  cat > "$stage/v2box.openrc" <<'UNIT'
+#!/sbin/openrc-run
+name="v2box"
+command="/usr/local/lib/v2box/v2box"
+command_args="server --config /etc/v2box/config.json"
+command_background="yes"
+pidfile="/run/v2box.pid"
+output_log="/var/log/v2box.log"
+error_log="/var/log/v2box.log"
+depend() { need net; }
+UNIT
+  install -m 755 "$stage/v2box.openrc" /etc/init.d/v2box.new
+  mv -f -- /etc/init.d/v2box.new /etc/init.d/v2box
+  run_service rc-update add v2box default
+fi
+if [[ "$ddns" == true ]]; then
+  ddns_args=(configure --family "$ddns_family")
+  [[ -z "$ddns_domain" ]] || ddns_args+=(--domain "$ddns_domain")
+  [[ -z "$ddns_zone" ]] || ddns_args+=(--zone-id "$ddns_zone")
+  [[ -z "$ddns_token_file" ]] || ddns_args+=(--token-file "$ddns_token_file")
+  python3 /usr/local/lib/v2box/node-network.py "${ddns_args[@]}"
+fi
+if jq -e '.Nodes | length > 0 and all(.[]; .ApiKey != "REPLACE_ME")' /etc/v2box/config.json >/dev/null; then
+  if $was_running || { ! $had_binary && ! $pending_deployment; }; then
+    /usr/local/bin/v2box restart 7>&- 8>&- 9>&-
+    healthy=0
+    for attempt in 1 2 3 4 5; do
+      sleep 2
+      if [[ "$init" == systemd ]]; then check=(systemctl is-active --quiet v2box); else check=(rc-service v2box status); fi
+      if run_service "${check[@]}"; then
+        healthy=$((healthy+1)); ((healthy < 3)) || break
+      else
+        state=$?; [[ $state == 3 ]] || exit "$state"
+        healthy=0
+      fi
+    done
+    ((healthy >= 3)) || { echo 'Updated service did not remain active; inspect v2box log. Rolling back.' >&2; exit 1; }
+  else echo 'Updated without starting the previously stopped service. Run: v2box start'; fi
+else
+  echo 'Edit /etc/v2box/config.json, then run: v2box start'
+fi
+rollback=false
+echo "Installed v2box $version."
 
-    if [[ ! -f /etc/v2node/config.json ]]; then
-        # 如果通过 CLI 传入了完整参数，则直接生成配置并跳过交互
-        if [[ -n "$API_HOST_ARG" && -n "$NODE_ID_ARG" && -n "$API_KEY_ARG" ]]; then
-            generate_v2node_config "$API_HOST_ARG" "$NODE_ID_ARG" "$API_KEY_ARG"
-            echo -e "${green}已根据参数生成 /etc/v2node/config.json${plain}"
-            first_install=false
-        else
-            cp config.json /etc/v2node/
-            first_install=true
-        fi
-    else
-        if [[ x"${release}" == x"alpine" ]]; then
-            service v2node start
-        else
-            systemctl start v2node
-        fi
-        sleep 2
-        check_status
-        echo -e ""
-        if [[ $? == 0 ]]; then
-            echo -e "${green}v2node 重启成功${plain}"
-        else
-            echo -e "${red}v2node 可能启动失败，请使用 v2node log 查看日志信息${plain}"
-        fi
-        first_install=false
-    fi
-
-
-    curl -o /usr/bin/v2node -Ls https://raw.githubusercontent.com/wyx2685/v2node/main/script/v2node.sh
-    chmod +x /usr/bin/v2node
-
-    cd $cur_dir
-    rm -f install.sh
-    echo "------------------------------------------"
-    echo -e "管理脚本使用方法: "
-    echo "------------------------------------------"
-    echo "v2node              - 显示管理菜单 (功能更多)"
-    echo "v2node start        - 启动 v2node"
-    echo "v2node stop         - 停止 v2node"
-    echo "v2node restart      - 重启 v2node"
-    echo "v2node status       - 查看 v2node 状态"
-    echo "v2node enable       - 设置 v2node 开机自启"
-    echo "v2node disable      - 取消 v2node 开机自启"
-    echo "v2node log          - 查看 v2node 日志"
-    echo "v2node generate     - 生成 v2node 配置文件"
-    echo "v2node update       - 更新 v2node"
-    echo "v2node update x.x.x - 更新 v2node 指定版本"
-    echo "v2node install      - 安装 v2node"
-    echo "v2node uninstall    - 卸载 v2node"
-    echo "v2node version      - 查看 v2node 版本"
-    echo "------------------------------------------"
-    curl -fsS --max-time 10 "https://api.v-50.me/counter" || true
-
-    if [[ $first_install == true ]]; then
-        read -rp "检测到你为第一次安装 v2node，是否自动生成 /etc/v2node/config.json？(y/n): " if_generate
-        if [[ "$if_generate" =~ ^[Yy]$ ]]; then
-            # 交互式收集参数，提供示例默认值
-            read -rp "面板API地址[格式: https://example.com/]: " api_host
-            api_host=${api_host:-https://example.com/}
-            read -rp "节点ID: " node_id
-            node_id=${node_id:-1}
-            read -rp "节点通讯密钥: " api_key
-
-            # 生成配置文件（覆盖可能从包中复制的模板）
-            generate_v2node_config "$api_host" "$node_id" "$api_key"
-        else
-            echo "${green}已跳过自动生成配置。如需后续生成，可执行: v2node generate${plain}"
-        fi
-    fi
-}
-
-parse_args "$@"
-echo -e "${green}开始安装${plain}"
-install_base
-install_v2node "$VERSION_ARG"
+if $pending_deployment; then
+  echo 'Program updated; pending deployment, configuration and certificates retained. Next: /usr/local/bin/v2box resume'
+fi
+echo 'Management command: /usr/local/bin/v2box. Run hash -r if your shell cached an older path.'

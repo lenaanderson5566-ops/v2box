@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"encoding/json"
+	"github.com/lenaanderson5566-ops/v2box/conf"
 )
 
 // Security type
@@ -22,21 +23,33 @@ const (
 )
 
 type NodeInfo struct {
-	Id           int
-	Type         string
-	Security     int
-	PushInterval time.Duration
-	PullInterval time.Duration
-	Tag          string
-	Common       *CommonNode
+	SharedListener         string
+	CertificateFingerprint string
+	ConfigurationHash      string
+	Id                     int
+	Type                   string
+	Security               int
+	PushInterval           time.Duration
+	PullInterval           time.Duration
+	Tag                    string
+	Common                 *CommonNode
+}
+
+type DomainTransition struct {
+	ID        string            `json:"id"`
+	Domain    string            `json:"domain"`
+	Addresses map[string]string `json:"addresses"`
 }
 
 type CommonNode struct {
-	Protocol   string      `json:"protocol"`
-	ListenIP   string      `json:"listen_ip"`
-	ServerPort int         `json:"server_port"`
-	Routes     []Route     `json:"routes"`
-	BaseConfig *BaseConfig `json:"base_config"`
+	DomainTransition *DomainTransition `json:"domain_transition"`
+	SingBox          json.RawMessage   `json:"sing_box"`
+	LandingPage      conf.LandingPage  `json:"-"`
+	Protocol         string            `json:"protocol"`
+	ListenIP         string            `json:"listen_ip"`
+	ServerPort       int               `json:"server_port"`
+	Routes           []Route           `json:"routes"`
+	BaseConfig       *BaseConfig       `json:"base_config"`
 	//vless vmess trojan
 	Tls                  int         `json:"tls"`
 	TlsSettings          TlsSettings `json:"tls_settings"`
@@ -109,6 +122,8 @@ type CertInfo struct {
 	DNSEnv           map[string]string
 	Provider         string
 	RejectUnknownSni bool
+	LegacyCertFile   string
+	LegacyKeyFile    string
 }
 
 type EncSettings struct {
@@ -119,7 +134,13 @@ type EncSettings struct {
 }
 
 func (c *Client) GetNodeInfo(ctx context.Context) (node *NodeInfo, err error) {
-	const path = "/api/v2/server/config"
+	path := "/api/v2/server/config"
+	if c.v10 {
+		if err := c.announceCapabilities(ctx); err != nil {
+			return nil, err
+		}
+		path = c.nodePath("configuration")
+	}
 	r, err := c.client.
 		R().
 		SetContext(ctx).
@@ -133,16 +154,27 @@ func (c *Client) GetNodeInfo(ctx context.Context) (node *NodeInfo, err error) {
 		return nil, fmt.Errorf("received nil response")
 	}
 
+	if c.v10 && (r.StatusCode() == 200 || r.StatusCode() == 304) {
+		c.captureTargetPolicy(r.Header().Get("X-Target-Statistics-Policy"))
+	}
 	if r.StatusCode() == 304 {
 		return nil, nil
+	}
+	if r.StatusCode() < 200 || r.StatusCode() >= 300 {
+		return nil, fmt.Errorf("node API returned HTTP %d", r.StatusCode())
+	}
+	configurationHash := strings.Trim(r.Header().Get("ETag"), "\"")
+	if c.v10 {
+		configurationHash, err = configurationReceiptHash(r.Body(), r.Header().Get("ETag"))
+		if err != nil {
+			return nil, err
+		}
 	}
 	hash := sha256.Sum256(r.Body())
 	newBodyHash := hex.EncodeToString(hash[:])
 	if c.responseBodyHash == newBodyHash {
 		return nil, nil
 	}
-	c.responseBodyHash = newBodyHash
-	c.nodeEtag = r.Header().Get("ETag")
 
 	if r != nil {
 		defer func() {
@@ -153,17 +185,42 @@ func (c *Client) GetNodeInfo(ctx context.Context) (node *NodeInfo, err error) {
 	} else {
 		return nil, fmt.Errorf("received nil response")
 	}
+	if c.v10 {
+		defer func() {
+			if err != nil {
+				c.ReportConfiguration(ctx, configurationHash, "decode")
+			}
+		}()
+	}
 	node = &NodeInfo{
-		Id: c.NodeId,
+		ConfigurationHash: configurationHash,
+		SharedListener:    c.sharedListener,
+		Id:                c.NodeId,
 	}
 	// parse protocol params
 	cm := &CommonNode{}
-	err = json.Unmarshal(r.Body(), cm)
+	if c.v10 {
+		err = decodeV10Config(r.Body(), cm)
+		if err == nil {
+			var metadata struct {
+				Data struct {
+					TrafficBatchDedup      bool `json:"trafficBatchDedup"`
+					TrafficBudgetSupported bool `json:"trafficBudgetSupported"`
+				} `json:"data"`
+			}
+			if json.Unmarshal(r.Body(), &metadata) == nil {
+				c.trafficDedup.Store(metadata.Data.TrafficBatchDedup)
+				c.budgetSupported.Store(metadata.Data.TrafficBudgetSupported)
+			}
+		}
+	} else {
+		err = json.Unmarshal(r.Body(), cm)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("decode node params error: %s", err)
 	}
 	switch cm.Protocol {
-	case "vmess", "trojan", "hysteria2", "tuic", "anytls", "vless":
+	case "naive", "vmess", "trojan", "hysteria2", "tuic", "anytls", "vless":
 		node.Type = cm.Protocol
 		node.Security = cm.Tls
 	case "shadowsocks":
@@ -172,20 +229,38 @@ func (c *Client) GetNodeInfo(ctx context.Context) (node *NodeInfo, err error) {
 	default:
 		return nil, fmt.Errorf("unsupport protocol: %s", cm.Protocol)
 	}
-	node.Tag = fmt.Sprintf("[%s]-%s:%d", c.APIHost, node.Type, node.Id)
+	node.Tag = fmt.Sprintf("[%s]-%s-%s:%d", c.APIHost, c.nodeType, node.Type, node.Id)
 	cf := cm.TlsSettings.CertFile
+	legacyCert, legacyKey := "", ""
 	kf := cm.TlsSettings.KeyFile
 	if cf == "" {
-		cf = filepath.Join("/etc/v2node/", cm.Protocol+strconv.Itoa(c.NodeId)+".cer")
+		cf = filepath.Join("/etc/v2box/", cm.Protocol+strconv.Itoa(c.NodeId)+".cer")
+		if c.certificateDirectory != "" {
+			legacyCert = cf
+			cf = filepath.Join(c.certificateDirectory, cm.Protocol+".cer")
+		}
 	}
 	if kf == "" {
-		kf = filepath.Join("/etc/v2node/", cm.Protocol+strconv.Itoa(c.NodeId)+".key")
+		kf = filepath.Join("/etc/v2box/", cm.Protocol+strconv.Itoa(c.NodeId)+".key")
+		if c.certificateDirectory != "" {
+			legacyKey = kf
+			kf = filepath.Join(c.certificateDirectory, cm.Protocol+".key")
+		}
+	}
+	if binding := c.sharedCertificate; binding != nil {
+		legacyValid := (binding.LegacyCertFile == "" && binding.LegacyKeyFile == "") || (filepath.IsAbs(binding.LegacyCertFile) && filepath.IsAbs(binding.LegacyKeyFile) && filepath.Clean(binding.LegacyCertFile) != filepath.Clean(binding.LegacyKeyFile))
+		if !legacyValid || node.Security != Tls || c.sharedListener == "" || (cm.TlsSettings.CertMode != "http" && cm.TlsSettings.CertMode != "dns") || !strings.EqualFold(strings.TrimSuffix(binding.Domain, "."), strings.TrimSuffix(cm.TlsSettings.PrimaryServerName(), ".")) || !filepath.IsAbs(binding.CertFile) || !filepath.IsAbs(binding.KeyFile) || filepath.Clean(binding.CertFile) == filepath.Clean(binding.KeyFile) {
+			return nil, fmt.Errorf("invalid shared ACME certificate binding; original certificate paths retained")
+		}
+		cf, kf = binding.CertFile, binding.KeyFile
+		legacyCert, legacyKey = binding.LegacyCertFile, binding.LegacyKeyFile
 	}
 	cm.CertInfo = &CertInfo{
-		CertMode:         cm.TlsSettings.CertMode,
-		CertFile:         cf,
+		CertMode:       cm.TlsSettings.CertMode,
+		CertFile:       cf,
+		LegacyCertFile: legacyCert, LegacyKeyFile: legacyKey,
 		KeyFile:          kf,
-		Email:            "node@v2board.com",
+		Email:            "fastdog.ltd@gmail.com",
 		CertDomain:       cm.TlsSettings.PrimaryServerName(),
 		DNSEnv:           make(map[string]string),
 		Provider:         cm.TlsSettings.Provider,
@@ -204,16 +279,28 @@ func (c *Client) GetNodeInfo(ctx context.Context) (node *NodeInfo, err error) {
 		cm.CertInfo.TlsCert = cm.TlsSettings.TlsCert
 		cm.CertInfo.TlsKey = cm.TlsSettings.TlsKey
 	}
+	if cm.BaseConfig == nil {
+		return nil, fmt.Errorf("missing base_config")
+	}
 	// set interval
 	node.PushInterval = intervalToTime(cm.BaseConfig.PushInterval)
 	node.PullInterval = intervalToTime(cm.BaseConfig.PullInterval)
 
+	if node.PushInterval <= 0 || node.PullInterval <= 0 {
+		return nil, fmt.Errorf("invalid panel intervals")
+	}
 	node.Common = cm
+	cm.LandingPage = c.landingPage
+	c.responseBodyHash = newBodyHash
+	c.nodeEtag = r.Header().Get("ETag")
 
 	return node, nil
 }
 
 func intervalToTime(i interface{}) time.Duration {
+	if i == nil {
+		return 0
+	}
 	switch reflect.TypeOf(i).Kind() {
 	case reflect.Int:
 		return time.Duration(i.(int)) * time.Second
@@ -223,7 +310,7 @@ func intervalToTime(i interface{}) time.Duration {
 	case reflect.Float64:
 		return time.Duration(i.(float64)) * time.Second
 	default:
-		return time.Duration(reflect.ValueOf(i).Int()) * time.Second
+		return 0
 	}
 }
 
