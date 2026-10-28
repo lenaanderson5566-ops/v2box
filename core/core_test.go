@@ -34,6 +34,42 @@ func testConf() *conf.Conf {
 
 const testUUID = "b831381d-6324-4d53-ad4f-8cda48b30811"
 
+func TestRoutingShutdownDrainsPendingSelection(t *testing.T) {
+	gate := &routingShutdown{}
+	conn, peer := net.Pipe()
+	defer conn.Close()
+	defer peer.Close()
+	leave, ok := gate.enter(conn)
+	if !ok {
+		t.Fatal("open router rejected a connection")
+	}
+	closed := make(chan struct{})
+	go func() { gate.close(); close(closed) }()
+	_ = peer.SetReadDeadline(time.Now().Add(time.Second))
+	if _, err := peer.Read(make([]byte, 1)); err != io.EOF {
+		leave()
+		t.Fatalf("shutdown did not interrupt pending routing I/O: %v", err)
+	}
+	select {
+	case <-closed:
+		leave()
+		t.Fatal("shutdown released rule sets before route selection completed")
+	default:
+	}
+	if release, accepted := gate.enter(peer); accepted {
+		release()
+		leave()
+		t.Fatal("shutdown admitted another route selection")
+	}
+	leave()
+	select {
+	case <-closed:
+	case <-time.After(time.Second):
+		t.Fatal("shutdown did not finish after route selection drained")
+	}
+	gate.close()
+}
+
 func testNode(t *testing.T, protocol string) *panel.NodeInfo {
 	t.Helper()
 	// A free TCP port can still be reserved for UDP on Windows. Probe both.

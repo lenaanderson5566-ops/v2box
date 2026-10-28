@@ -115,10 +115,12 @@ func (c *Controller) prepareUsersContext(ctx context.Context) error {
 	}
 	alive, err := c.apiClient.GetUserAlive(ctx)
 	if err != nil {
+		c.apiClient.InvalidateUserCache()
 		return fmt.Errorf("get user alive list error: %w", err)
 	}
 	budget, err := c.apiClient.GetTrafficBudget(ctx)
 	if err != nil {
+		c.apiClient.InvalidateUserCache()
 		return fmt.Errorf("get traffic budget error: %w", err)
 	}
 	c.preparedBudget = budget

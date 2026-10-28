@@ -9,6 +9,7 @@ import (
 	"github.com/lenaanderson5566-ops/v2box/conf"
 	"github.com/lenaanderson5566-ops/v2box/core"
 	"github.com/lenaanderson5566-ops/v2box/limiter"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -21,6 +22,110 @@ import (
 )
 
 var fixtureRootsOnce sync.Once
+
+func TestUserRevocationSurvivesOnlineCountFailure(t *testing.T) {
+	for _, version := range []string{"legacy", "v10"} {
+		t.Run(version, func(t *testing.T) {
+			listener, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			port := listener.Addr().(*net.TCPAddr).Port
+			listener.Close()
+			var aliveReady atomic.Bool
+			var userRequests, aliveRequests atomic.Int32
+			s := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case strings.HasSuffix(r.URL.Path, "/capabilities"):
+					fmt.Fprint(w, `{"data":{"accepted":true}}`)
+				case strings.HasSuffix(r.URL.Path, "/configuration"), strings.HasSuffix(r.URL.Path, "/config"):
+					if r.Header.Get("If-None-Match") != "" {
+						w.WriteHeader(304)
+						return
+					}
+					w.Header().Set("ETag", `"`+strings.Repeat("a", 64)+`"`)
+					if version == "v10" {
+						fmt.Fprintf(w, `{"data":{"protocol":"vless","listenPort":%d,"tls":0,"intervals":{"pushInterval":60,"pullInterval":60}}}`, port)
+					} else {
+						fmt.Fprintf(w, `{"protocol":"vless","tls":0,"server_port":%d,"base_config":{"push_interval":60,"pull_interval":60}}`, port)
+					}
+				case strings.HasSuffix(r.URL.Path, "/users"), strings.HasSuffix(r.URL.Path, "/user"):
+					userRequests.Add(1)
+					if r.Header.Get("If-None-Match") != "" {
+						w.WriteHeader(304)
+						return
+					}
+					w.Header().Set("ETag", `"users-after-revocation"`)
+					if version == "v10" {
+						fmt.Fprint(w, `{"data":[]}`)
+					} else {
+						fmt.Fprint(w, `{"users":[]}`)
+					}
+				case strings.HasSuffix(r.URL.Path, "/online-counts"), strings.HasSuffix(r.URL.Path, "/alivelist"):
+					aliveRequests.Add(1)
+					if !aliveReady.Load() {
+						w.WriteHeader(503)
+						return
+					}
+					if version == "v10" {
+						fmt.Fprint(w, `{"data":[]}`)
+					} else {
+						fmt.Fprint(w, `{"alive":{}}`)
+					}
+				default:
+					t.Errorf("unexpected endpoint %s", r.URL.Path)
+					w.WriteHeader(404)
+				}
+			}))
+			defer s.Close()
+			roots := x509.NewCertPool()
+			roots.AddCert(s.Certificate())
+			t.Setenv("GODEBUG", os.Getenv("GODEBUG")+",x509usefallbackroots=1")
+			fixtureRootsOnce.Do(func() { x509.SetFallbackRoots(roots) })
+			retries := 0
+			api, err := panel.New(&conf.NodeConfig{APIHost: s.URL, NodeType: "v2box", NodeID: 1, Key: "test", APIVersion: version, RetryCount: &retries})
+			if err != nil {
+				t.Fatal(err)
+			}
+			info, err := api.GetNodeInfo(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			info.Tag = "user-sync-" + version
+			users := []panel.UserInfo{{Id: 1, Uuid: "a8389d79-d204-4f90-b8f0-cb4878a14933"}}
+			server := core.New(conf.New())
+			defer server.Close()
+			limits := limiter.AddLimiter("", info.Tag, users, map[int]int{1: 2})
+			defer limiter.DeleteLimiter(info.Tag)
+			if err = server.AddNode(info.Tag, info); err != nil {
+				t.Fatal(err)
+			}
+			if err = server.SetUsers(info.Tag, users); err != nil {
+				t.Fatal(err)
+			}
+			controller := &Controller{apiClient: api, server: server, tag: info.Tag, info: info, userList: users, limiter: limits}
+			if err = controller.prepareUsersContext(context.Background()); err == nil {
+				t.Fatal("startup must still require its online-count snapshot")
+			}
+			if controller.usersPrepared || len(controller.userList) != 1 {
+				t.Fatal("failed preparation replaced the current user snapshot")
+			}
+			if err = controller.nodeInfoMonitor(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if len(controller.userList) != 0 {
+				t.Fatal("online-count outage prevented user revocation")
+			}
+			aliveReady.Store(true)
+			if err = controller.nodeInfoMonitor(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if userRequests.Load() != 3 || aliveRequests.Load() != 3 || len(controller.userList) != 0 {
+				t.Fatal("304 must preserve applied revocation while online-count polling recovers")
+			}
+		})
+	}
+}
 
 func TestNativeRuleOnlyChangeRequestsReload(t *testing.T) {
 	var changed atomic.Bool

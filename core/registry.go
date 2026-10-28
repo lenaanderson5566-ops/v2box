@@ -61,5 +61,5 @@ func boxContext(ctx context.Context) context.Context {
 	transport.RegisterHTTPS(d)
 	certificates := certificate.NewRegistry()
 	registerSharedCertificateProvider(certificates)
-	return box.Context(ctx, in, out, endpoint.NewRegistry(), d, service.NewRegistry(), certificates)
+	return box.Context(ctx, guardedInboundRegistry{in}, out, endpoint.NewRegistry(), d, service.NewRegistry(), certificates)
 }

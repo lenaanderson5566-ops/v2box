@@ -82,11 +82,17 @@ func (v *V2Core) newBox(parent context.Context, options option.Options, certific
 	if err := parent.Err(); err != nil {
 		return nil, nil, err
 	}
-	base := boxContext(context.Background())
+	gate := &routingShutdown{}
+	base := boxContext(context.WithValue(context.Background(), routingShutdownKey{}, gate))
 	if len(certificates) != 0 {
 		base = context.WithValue(base, sharedCertificateContextKey{}, certificates[0])
 	}
-	ctx, cancel := context.WithCancel(base)
+	ctx, cancelContext := context.WithCancel(base)
+	var shutdown sync.Once
+	cancel := func() {
+		cancelContext()
+		shutdown.Do(gate.close)
+	}
 	// The setup deadline cancels startup I/O, but does not expire a live Box.
 	stop := context.AfterFunc(parent, cancel)
 	defer stop()

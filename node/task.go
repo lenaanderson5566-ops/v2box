@@ -120,7 +120,24 @@ func (c *Controller) nodeInfoMonitor(ctx context.Context) (err error) {
 		}).Error("Get user list failed")
 		return nil
 	}
-	// get user alive
+	// Commit authorization changes before optional online-count refreshes. The
+	// user response has already advanced its ETag; dropping it here can leave
+	// revoked accounts active indefinitely after the panel starts returning 304.
+	if newU != nil {
+		deleted, added, modified := compareUserList(c.userList, newU)
+		if len(added) > 0 || len(deleted) > 0 {
+			if err = c.server.SetUsersWithCommit(c.tag, newU, func() { c.limiter.UpdateUser(c.tag, added, deleted, modified) }); err != nil {
+				c.apiClient.InvalidateUserCache()
+				log.WithField("tag", c.tag).WithError(err).Error("Update node users failed")
+				return nil
+			}
+		} else if len(modified) > 0 {
+			c.limiter.UpdateUser(c.tag, nil, nil, modified)
+		}
+		c.userList = newU
+		log.WithField("tag", c.tag).Infof("%d user deleted, %d user added, %d user modified", len(deleted), len(added), len(modified))
+	}
+	// Refresh counts even on a 304 user response; failures retain prior limits.
 	newA, err := c.apiClient.GetUserAlive(ctx)
 	if err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
@@ -137,25 +154,6 @@ func (c *Controller) nodeInfoMonitor(ctx context.Context) (err error) {
 	if newA != nil {
 		c.limiter.SetAlive(newA)
 	}
-	// node no changed, check users
-	if newU == nil {
-		log.WithField("tag", c.tag).Debug("User list no change")
-		return nil
-	}
-	deleted, added, modified := compareUserList(c.userList, newU)
-	if len(added) > 0 || len(deleted) > 0 {
-		// Publish limits with the validated authentication table. Failed updates
-		// must not briefly revoke current users or discard their limiter state.
-		if err = c.server.SetUsersWithCommit(c.tag, newU, func() { c.limiter.UpdateUser(c.tag, added, deleted, modified) }); err != nil {
-			c.apiClient.InvalidateUserCache()
-			log.WithField("tag", c.tag).WithError(err).Error("Update node users failed")
-			return nil
-		}
-	} else if len(modified) > 0 {
-		c.limiter.UpdateUser(c.tag, nil, nil, modified)
-	}
-	c.userList = newU
-	log.WithField("tag", c.tag).Infof("%d user deleted, %d user added, %d user modified", len(deleted), len(added), len(modified))
 	return nil
 }
 
