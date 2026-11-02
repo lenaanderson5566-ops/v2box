@@ -1,9 +1,27 @@
 #!/usr/bin/env bash
 set -euo pipefail
 child_pid=''
+child_starting=false
+pending_signal=0
+handle_signal() {
+  # Do not exit between starting a child and recording its PID.
+  if $child_starting; then pending_signal=$1; else exit "$1"; fi
+}
 stop_child() {
   if [[ -n "$child_pid" ]]; then
-    kill -TERM -- "-$child_pid" 2>/dev/null || kill -TERM "$child_pid" 2>/dev/null || true
+    local active
+    for active in $(jobs -pr); do
+      [[ "$active" == "$child_pid" ]] || continue
+      # Keep our child alive until the final KILL, retaining its PID/PGID and
+      # locks even when timeout does not escalate an externally received TERM.
+      if kill -STOP "$child_pid" 2>/dev/null; then
+        kill -TERM -- "-$child_pid" 2>/dev/null || true
+        /bin/sleep 1 || true
+        kill -KILL -- "-$child_pid" 2>/dev/null || true
+        kill -KILL "$child_pid" 2>/dev/null || true
+      fi
+      break
+    done
     wait "$child_pid" 2>/dev/null || true
     child_pid=''
   fi
@@ -11,8 +29,11 @@ stop_child() {
 run_bounded() {
   local limit=$1 status=0
   shift
+  child_starting=true
   timeout -k 5 "$limit" "$@" </dev/null 7>&- 8>&- 9>&- &
   child_pid=$!
+  child_starting=false
+  ((pending_signal == 0)) || exit "$pending_signal"
   wait "$child_pid" || status=$?
   child_pid=''
   return "$status"
@@ -145,6 +166,8 @@ cleanup() {
   result=$?
   trap - EXIT
   trap '' INT TERM
+  pending_signal=0
+  child_starting=false
   stop_child
   rm -f -- /etc/v2box/config.json.new /etc/systemd/system/v2box.service.new /etc/init.d/v2box.new || true
   rm -f -- /usr/local/lib/v2box/v2box.new /usr/local/lib/v2box/manager.sh.new /usr/local/lib/v2box/install.sh.new /usr/local/lib/v2box/node-credentials.py.new /usr/local/lib/v2box/node-network.py.new /usr/local/bin/v2box.new || true
@@ -178,8 +201,8 @@ cleanup() {
   exit "$result"
 }
 trap cleanup EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
+trap 'handle_signal 130' INT
+trap 'handle_signal 143' TERM
 if [[ "$init" == systemd ]]; then
   if run_service systemctl is-active --quiet v2box; then was_running=true;
   else state=$?; [[ $state == 3 || $state == 4 ]] || { echo 'Cannot verify existing service state; programs were not changed.' >&2; exit "$state"; }; fi

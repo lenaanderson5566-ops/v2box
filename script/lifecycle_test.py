@@ -380,10 +380,30 @@ exec /bin/cp "$@"
     def test_resume_uses_retained_state(self):
         (self.lib/'node-network.py').write_text('import json; print(json.dumps({"features":["report-multi-target-v1"]}))')
         (self.config/'deployment-state.json').write_text('pending')
-        (self.lib/'panel-deploy.py').write_text('import sys; from pathlib import Path; assert Path(sys.argv[1]).read_text() == "pending"')
+        (self.lib/'panel-deploy.py').write_text('''import json,sys
+from pathlib import Path
+if sys.argv[1]=='--capabilities':print(json.dumps({'features':['management-lock-delegation-v1']}))
+else:
+ assert sys.argv[1]=='--managed'
+ assert Path(sys.argv[2]).read_text()=='pending'
+''')
         r = self.run_script(self.root/'usr/local/bin/v2box', 'resume')
         self.assertEqual(r.returncode, 0, r.stderr)
         self.preserved()
+
+    def test_resume_rejects_retained_helper_without_lock_delegation(self):
+        state=self.config/'deployment-state.json';state.write_text('pending')
+        (self.lib/'panel-deploy.py').write_text('''import json,sys
+def launch_managed(state):raise AssertionError('Old helper must not be launched')
+if sys.argv[1]=='--capabilities':print(json.dumps({'features':[]}))
+else:raise AssertionError('Deployment state must not be read')
+''')
+        result=self.run_script(self.root/'usr/local/bin/v2box','resume')
+        self.assertNotEqual(result.returncode,0)
+        self.assertIn('management lock delegation',result.stderr)
+        self.assertIn('re-download',result.stderr);self.assertIn('--resume',result.stderr)
+        self.assertEqual(state.read_text(),'pending')
+        self.assertFalse((self.root/'service-calls').exists());self.preserved()
 
     def test_repair_missing_program_preserves_pending_state_without_start(self):
         (self.config/'deployment-state.json').write_text('pending')
@@ -527,34 +547,77 @@ echo new-version
                 except ProcessLookupError:pass
 
     def test_manager_interrupt_cleans_timeout_group_and_term_ignoring_grandchild(self):
+        self.assert_interrupt_cleans_service_group()
+
+    def test_manager_interrupt_does_not_require_timeout_to_escalate_term(self):
+        self.stubborn_timeout()
+        self.assert_interrupt_cleans_service_group()
+
+    def test_manager_signal_between_spawn_and_pid_registration_cleans_group(self):
+        self.stubborn_timeout()
+        self.assert_interrupt_cleans_service_group(during_start=True)
+
+    def test_installer_signal_between_spawn_and_pid_registration_cleans_group(self):
+        self.stubborn_timeout()
+        self.assert_interrupt_cleans_service_group(during_start=True,installer=True)
+
+    def stubborn_timeout(self):
+        # Emulate a timeout supervisor that owns its group but does not escalate
+        # an external TERM. Cleanup must enforce its own deadline on every GNU
+        # coreutils version, rather than relying on that signal-handling detail.
+        self.write(self.bin/'timeout','''#!/usr/bin/env python3
+import os,signal,subprocess,sys
+if sys.argv[1]=='--foreground':os.execvp(sys.argv[3],sys.argv[3:])
+os.setpgid(0,0)
+signal.signal(signal.SIGTERM,signal.SIG_IGN)
+sys.exit(subprocess.Popen(sys.argv[4:]).wait())
+''')
+
+    def assert_interrupt_cleans_service_group(self,during_start=False,installer=False):
         self.write(self.bin/'systemctl','''#!/bin/bash
 trap '' TERM
 echo "$PPID" > "$TEST_ROOT/service-timeout-pid"
 /bin/bash -c 'trap "" TERM; echo $$ > "$TEST_ROOT/service-grandchild"; exec /bin/sleep 30' &
 wait
 ''')
-        process=subprocess.Popen(['bash',str(self.root/'usr/local/bin/v2box'),'restart'],env=self.env,text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,start_new_session=True)
+        script=self.installer if installer else self.root/'usr/local/bin/v2box'
+        if during_start:
+            source=script.read_text()
+            source=source.replace('  child_pid=$!', '''  while [[ ! -f "$TEST_ROOT/service-grandchild" ]]; do /bin/sleep .01; done
+  kill -TERM "$$"
+  child_pid=$!''',1)
+            self.write(script,source)
+        arguments=['--update','v-test'] if installer else ['restart']
+        process=subprocess.Popen(['bash',str(script),*arguments],env=self.env,text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,start_new_session=True)
         try:
             deadline=time.monotonic()+3
             while not (self.root/'service-grandchild').exists() and time.monotonic()<deadline:time.sleep(.02)
             self.assertTrue((self.root/'service-grandchild').exists())
-            process.send_signal(signal.SIGTERM)
+            if not during_start:process.send_signal(signal.SIGTERM)
             process.communicate(timeout=8)
             self.assertNotEqual(process.returncode,0)
-            pid=int((self.root/'service-grandchild').read_text())
-            stat=Path('/proc')/str(pid)/'stat'
-            self.assertTrue(not stat.exists() or stat.read_text().split()[2]=='Z','A service grandchild must not survive the manager deadline')
+            for name in ['service-grandchild','service-timeout-pid']:
+                pid=int((self.root/name).read_text())
+                stat=Path('/proc')/str(pid)/'stat'
+                self.assertTrue(not stat.exists() or stat.read_text().split()[2]=='Z','A service process must not survive or remain stopped after the interruption deadline')
             import fcntl
             for name in ['.bootstrap.lock','.deployment.lock','.maintenance.lock']:
                 with (self.config/name).open('w') as lock:fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
             self.preserved()
         finally:
-            if process.poll() is None:os.killpg(process.pid,signal.SIGKILL);process.communicate()
             if (self.root/'service-timeout-pid').exists():
                 try:os.killpg(int((self.root/'service-timeout-pid').read_text()),signal.SIGKILL)
                 except ProcessLookupError:pass
+            if process.poll() is None:os.killpg(process.pid,signal.SIGKILL)
+            process.communicate(timeout=5)
 
     def test_interrupt_after_publication_restores_program_and_running_service(self):
+        self.assert_interrupt_after_publication()
+
+    def test_signal_during_restart_spawn_restores_program_and_running_service(self):
+        self.assert_interrupt_after_publication(during_start=True)
+
+    def assert_interrupt_after_publication(self,during_start=False):
         self.write(self.bin/'systemctl','''#!/bin/sh
 echo "$*" >> "$TEST_ROOT/service-calls"
 case "$1" in
@@ -566,12 +629,20 @@ case "$1" in
   touch "$TEST_ROOT/active";;
 esac
 ''')
+        if during_start:
+            source=self.installer.read_text().replace('  child_pid=$!', '''  if [[ "$1" == systemctl && "${2:-}" == restart && ! -f "$TEST_ROOT/window-signalled" ]]; then
+    while [[ ! -f "$TEST_ROOT/restart-started" ]]; do /bin/sleep .01; done
+    touch "$TEST_ROOT/window-signalled"
+    kill -TERM "$$"
+  fi
+  child_pid=$!''',1)
+            self.write(self.installer,source)
         process=subprocess.Popen(['bash',str(self.installer),'--update','v-test'],env=self.env,text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,start_new_session=True)
         try:
             deadline=time.monotonic()+5
             while not (self.root/'restart-started').exists() and time.monotonic()<deadline:time.sleep(.02)
             self.assertTrue((self.root/'restart-started').exists())
-            process.send_signal(signal.SIGTERM)
+            if not during_start:process.send_signal(signal.SIGTERM)
             _,error=process.communicate(timeout=8)
             self.assertNotEqual(process.returncode,0)
             self.assertIn('restoring the previous',error)

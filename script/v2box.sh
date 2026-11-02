@@ -1,17 +1,38 @@
 #!/usr/bin/env bash
 set -euo pipefail
 child_pid=''
+child_starting=false
+pending_signal=0
 capture_file=''
+handle_signal() {
+  # Do not exit between starting a child and recording its PID.
+  if $child_starting; then pending_signal=$1; else exit "$1"; fi
+}
 cleanup_child() {
+  trap - EXIT
+  trap '' INT TERM
   if [[ -n "$child_pid" ]]; then
-    kill -TERM -- "-$child_pid" 2>/dev/null || kill -TERM "$child_pid" 2>/dev/null || true
+    local active
+    for active in $(jobs -pr); do
+      [[ "$active" == "$child_pid" ]] || continue
+      # Pin our still-running child before the grace period, so its PID/PGID
+      # cannot be reused. Do not rely on timeout escalating an external TERM.
+      if kill -STOP "$child_pid" 2>/dev/null; then
+        kill -TERM -- "-$child_pid" 2>/dev/null || true
+        /bin/sleep 1 || true
+        kill -KILL -- "-$child_pid" 2>/dev/null || true
+        kill -KILL "$child_pid" 2>/dev/null || true
+      fi
+      break
+    done
     wait "$child_pid" 2>/dev/null || true
+    child_pid=''
   fi
   [[ -z "$capture_file" ]] || rm -f -- "$capture_file"
 }
 trap cleanup_child EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
+trap 'handle_signal 130' INT
+trap 'handle_signal 143' TERM
 using_systemd() { [[ -d /run/systemd/system ]] && command -v systemctl >/dev/null; }
 require_timeout() {
   command -v timeout >/dev/null && timeout --foreground 1 true </dev/null 7>&- 8>&- 9>&- || {
@@ -41,8 +62,11 @@ lock_operation() {
 run_service() {
   require_timeout
   local result=0
+  child_starting=true
   timeout -k 5 90 "$@" </dev/null 7>&- 8>&- 9>&- &
   child_pid=$!
+  child_starting=false
+  ((pending_signal == 0)) || exit "$pending_signal"
   wait "$child_pid" || result=$?
   child_pid=''
   if ((result == 124 || result == 137)); then
@@ -115,17 +139,16 @@ case "$1" in
     states=(/etc/v2box/deployment-state*.json)
     ((${#states[@]} > 0)) || { echo 'No pending deployment.'; exit 0; }
     ((${#states[@]} == 1)) || { echo 'Multiple pending deployments. Re-run the original panel command to resume its selected node.' >&2; exit 1; }
-    [[ -f /usr/local/lib/v2box/panel-deploy.py ]] || { echo 'Download the panel installation command and run it with --resume.' >&2; exit 1; }
+    [[ -f /usr/local/lib/v2box/panel-deploy.py && ! -L /usr/local/lib/v2box/panel-deploy.py ]] || { echo 'Update the panel, then download its current bootstrap and run it with --resume. Deployment state and configuration were retained.' >&2; exit 1; }
+    timeout -k 2 10 python3 /usr/local/lib/v2box/panel-deploy.py --capabilities 7>&- 8>&- 9>&- 2>/dev/null | jq -e '.features | index("management-lock-delegation-v1") != null' >/dev/null || {
+      echo 'Deployment helper lacks management lock delegation. Update the panel, then re-download its current bootstrap and run it with --resume. Deployment state, configuration and certificates were retained.' >&2; exit 1;
+    }
     [[ ! -L /etc/v2box/.deployment.lock && ! -L /etc/v2box && ! -L /etc/v2box/.bootstrap.lock ]] || { echo 'Refusing symlinked deployment paths' >&2; exit 1; }
     exec 9>/etc/v2box/.bootstrap.lock
     flock -n 9 || { echo 'Another deployment or maintenance operation is running.' >&2; exit 1; }
     check_runtime
     timeout -k 2 10 python3 /usr/local/lib/v2box/node-network.py capabilities | jq -e '.features | index("report-multi-target-v1") != null' >/dev/null || { echo 'Reporting helper lacks multi-target support; update node scripts before resuming.' >&2; exit 1; }
-    if grep -q '^def launch_managed(' /usr/local/lib/v2box/panel-deploy.py; then
-      exec python3 /usr/local/lib/v2box/panel-deploy.py --managed "${states[0]}"
-    fi
-    echo 'Legacy deployment helper runs in foreground. Use the latest panel bootstrap with --resume for managed recovery.'
-    exec python3 /usr/local/lib/v2box/panel-deploy.py "${states[0]}";;
+    exec python3 /usr/local/lib/v2box/panel-deploy.py --managed "${states[0]}";;
   uninstall)
     shift
     stop_network=false
