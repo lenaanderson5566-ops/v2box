@@ -10,6 +10,7 @@ import (
 
 	"github.com/google/uuid"
 	panel "github.com/lenaanderson5566-ops/v2box/api/v2board"
+	"github.com/sagernet/sing-box/adapter"
 	M "github.com/sagernet/sing/common/metadata"
 	"golang.org/x/net/idna"
 )
@@ -143,11 +144,14 @@ func targetAddress(d M.Socksaddr) (string, string) {
 			return "", ""
 		}
 		if ip, err := netip.ParseAddr(name); err == nil {
+			if ip.Unmap().IsUnspecified() {
+				return "", ""
+			}
 			return ip.Unmap().WithZone("").String(), "ip"
 		}
 		return name, "domain"
 	}
-	if d.Addr.IsValid() {
+	if d.Addr.IsValid() && !d.Addr.Unmap().IsUnspecified() {
 		return d.Addr.Unmap().WithZone("").String(), "ip"
 	}
 	return "", ""
@@ -335,14 +339,21 @@ func (v *V2Core) AckTargets(tag, id string, accepted bool) {
 }
 
 // Prefer the pre-rewrite address. Never substitute sniffed Domain or reverse DNS.
-func originalTarget(destination, routeOriginal, origin M.Socksaddr) M.Socksaddr {
-	if origin.IsValid() {
-		return origin
+func originalTarget(metadata adapter.InboundContext) M.Socksaddr {
+	switch metadata.InboundType {
+	case "tuic", "hysteria2", "hysteria", "vless", "vmess", "trojan", "shadowsocks", "naive", "anytls", "socks", "http", "mixed":
+		// Explicit proxies carry the requested destination in the protocol.
+		// Their OriginDestination may describe the local listener socket instead.
+	default:
+		// Transparent inbounds use the intercepted socket's original destination.
+		if target, _ := targetAddress(metadata.OriginDestination); target != "" {
+			return metadata.OriginDestination
+		}
 	}
-	if routeOriginal.IsValid() {
-		return routeOriginal
+	if target, _ := targetAddress(metadata.RouteOriginalDestination); target != "" {
+		return metadata.RouteOriginalDestination
 	}
-	return destination
+	return metadata.Destination
 }
 func packetTarget(m *meter, d M.Socksaddr) M.Socksaddr {
 	// A packet destination can change within a UDP session. Preserve a domain

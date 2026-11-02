@@ -233,6 +233,10 @@ func (t *trafficTracker) newMeter(ctx context.Context, m adapter.InboundContext)
 	if ctx.Err() != nil {
 		return nil
 	}
+	source := m.Source.Addr.Unmap()
+	if !source.IsValid() || source.IsUnspecified() {
+		return nil
+	}
 	t.mu.Lock()
 	u := t.users[m.Inbound][m.User]
 	if t.budgetBlockedLocked(m.Inbound) {
@@ -247,13 +251,13 @@ func (t *trafficTracker) newMeter(ctx context.Context, m adapter.InboundContext)
 		return nil
 	}
 	user := format.UserTag(m.Inbound, u.Uuid)
-	ip := m.Source.Addr.Unmap().String()
+	ip := source.WithZone("").String()
 	if _, reject := l.CheckLimit(user, ip, true); reject {
 		return nil
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	return &meter{tracker: t, counter: t.counter(m.Inbound, u.Id), tag: m.Inbound, user: user, identity: m.User, ip: ip, uid: u.Id, ctx: ctx, cancel: cancel, limiter: l,
-		target: originalTarget(m.Destination, m.RouteOriginalDestination, m.OriginDestination), resolvedTarget: m.Destination}
+		target: originalTarget(m), resolvedTarget: m.Destination}
 }
 func (m *meter) account(up, down int) {
 	counter := m.counter

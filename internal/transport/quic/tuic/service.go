@@ -370,14 +370,16 @@ func (s *serverSession[U]) handleStream(stream *quic.Stream) error {
 		return s.connErr
 	case <-s.authDone:
 	}
+	source := M.SocksaddrFromNet(s.quicConn.RemoteAddr()).Unwrap()
 	var conn net.Conn = &serverConn{
 		Stream:      stream,
+		source:      source,
 		destination: destination,
 	}
 	if !buffer.IsEmpty() {
 		conn = bufio.NewCachedConn(conn, buffer.ToOwned())
 	}
-	s.handler.NewConnectionEx(auth.ContextWithUser(s.ctx, s.authUser), conn, M.SocksaddrFromNet(s.quicConn.RemoteAddr()).Unwrap(), destination, nil)
+	s.handler.NewConnectionEx(auth.ContextWithUser(s.ctx, s.authUser), conn, source, destination, nil)
 	return nil
 }
 
@@ -424,6 +426,7 @@ func (s *serverSession[U]) closeWithError(err error) {
 
 type serverConn struct {
 	*quic.Stream
+	source      M.Socksaddr
 	destination M.Socksaddr
 }
 
@@ -442,7 +445,7 @@ func (c *serverConn) LocalAddr() net.Addr {
 }
 
 func (c *serverConn) RemoteAddr() net.Addr {
-	return M.Socksaddr{}
+	return c.source
 }
 
 func (c *serverConn) Close() error {

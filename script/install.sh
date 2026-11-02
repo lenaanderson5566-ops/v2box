@@ -1,8 +1,32 @@
 #!/usr/bin/env bash
 set -euo pipefail
+child_pid=''
+stop_child() {
+  if [[ -n "$child_pid" ]]; then
+    kill -TERM -- "-$child_pid" 2>/dev/null || kill -TERM "$child_pid" 2>/dev/null || true
+    wait "$child_pid" 2>/dev/null || true
+    child_pid=''
+  fi
+}
+run_bounded() {
+  local limit=$1 status=0
+  shift
+  timeout -k 5 "$limit" "$@" </dev/null 7>&- 8>&- 9>&- &
+  child_pid=$!
+  wait "$child_pid" || status=$?
+  child_pid=''
+  return "$status"
+}
+run_step() {
+  local limit=$1 result=0
+  shift
+  run_bounded "$limit" "$@" || result=$?
+  if ((result == 124 || result == 137)); then echo 'Installation step timed out; retry after checking connectivity, disk space and service state.' >&2; fi
+  return "$result"
+}
 run_service() {
   local result=0
-  timeout -k 5 90 "$@" 7>&- 8>&- 9>&- || result=$?
+  run_bounded 90 "$@" || result=$?
   if ((result == 124 || result == 137)); then
     echo 'Service operation timed out. Check v2box status and journalctl -u v2box; configuration and certificates were retained.' >&2
   fi
@@ -74,6 +98,7 @@ fi
 for tool in curl unzip sha256sum jq install flock timeout; do
   command -v "$tool" >/dev/null || { echo "Install required command: $tool" >&2; exit 1; }
 done
+timeout --foreground 1 true </dev/null || { echo 'Install GNU coreutils timeout before updating (including on OpenRC/Alpine), or use the latest panel bootstrap to repair dependencies.' >&2; exit 1; }
 install -d -m 755 /etc/v2box
 # The root-owned panel bootstrap holds its lock while invoking this installer.
 # Keep that descriptor out of child services, including older release installers.
@@ -91,12 +116,14 @@ case "$(uname -m)" in
   aarch64|arm64) arch=arm64;;
   *) echo 'Supported architectures: amd64, arm64' >&2; exit 1;;
 esac
-if command -v systemctl >/dev/null; then init=systemd
+if [[ -d /run/systemd/system ]] && command -v systemctl >/dev/null; then init=systemd
 elif command -v rc-service >/dev/null; then init=openrc
 else echo 'systemd or OpenRC is required' >&2; exit 1; fi
 if [[ "$prompt_api_key" == true && ! -f /etc/v2box/config.json ]]; then
   [[ -z "$api_key" ]] || { echo 'Choose either interactive key input or --api-key' >&2; exit 1; }
-  read -r -s -p 'Node API key: ' api_key < /dev/tty
+  if ! read -r -s -t 120 -p 'Node API key (two-minute input limit): ' api_key < /dev/tty; then
+    echo 'Cannot read a key from the terminal, or input timed out. No program files were changed.' >&2; exit 1
+  fi
   echo
 fi
 if [[ -n "$api_host$node_id$api_key" && ! -f /etc/v2box/config.json ]]; then
@@ -108,20 +135,9 @@ if [[ -f /etc/v2box/config.json ]]; then
     exit 1
   }
 fi
-if [[ -z "$version" ]]; then
-  version=$(curl -fsSL --proto '=https' --proto-redir '=https' --connect-timeout 10 --max-time 30 "https://api.github.com/repos/$repo/releases/latest" | jq -er .tag_name)
-fi
-[[ "$version" =~ ^[a-zA-Z0-9._-]+$ ]] || { echo 'Invalid release tag' >&2; exit 1; }
 was_running=false
 had_binary=false
 [[ ! -f /usr/local/lib/v2box/v2box ]] || had_binary=true
-if [[ "$init" == systemd ]]; then
-  if run_service systemctl is-active --quiet v2box; then was_running=true;
-  else state=$?; [[ $state == 3 || $state == 4 ]] || { echo 'Cannot verify existing service state; programs were not changed.' >&2; exit "$state"; }; fi
-else
-  if run_service rc-service v2box status >/dev/null 2>&1; then was_running=true;
-  else state=$?; [[ $state == 3 ]] || { echo 'Cannot verify existing service state; programs were not changed.' >&2; exit "$state"; }; fi
-fi
 stage=$(mktemp -d)
 rollback=false
 program_files=(v2box v2box.previous manager.sh install.sh node-credentials.py node-network.py)
@@ -129,7 +145,9 @@ cleanup() {
   result=$?
   trap - EXIT
   trap '' INT TERM
+  stop_child
   rm -f -- /etc/v2box/config.json.new /etc/systemd/system/v2box.service.new /etc/init.d/v2box.new || true
+  rm -f -- /usr/local/lib/v2box/v2box.new /usr/local/lib/v2box/manager.sh.new /usr/local/lib/v2box/install.sh.new /usr/local/lib/v2box/node-credentials.py.new /usr/local/lib/v2box/node-network.py.new /usr/local/bin/v2box.new || true
   if ((result != 0)) && $rollback; then
     echo 'Update failed; restoring the previous program files. Configuration and certificates were preserved.' >&2
     restore_failed=false
@@ -162,22 +180,37 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+if [[ "$init" == systemd ]]; then
+  if run_service systemctl is-active --quiet v2box; then was_running=true;
+  else state=$?; [[ $state == 3 || $state == 4 ]] || { echo 'Cannot verify existing service state; programs were not changed.' >&2; exit "$state"; }; fi
+else
+  if run_service rc-service v2box status >/dev/null 2>&1; then was_running=true;
+  else state=$?; [[ $state == 3 ]] || { echo 'Cannot verify existing service state; programs were not changed.' >&2; exit "$state"; }; fi
+fi
+if [[ -z "$version" ]]; then
+  run_step 35 curl -fsSL --proto '=https' --proto-redir '=https' --connect-timeout 10 --max-time 30 "https://api.github.com/repos/$repo/releases/latest" -o "$stage/release.json"
+  version=$(jq -er .tag_name "$stage/release.json")
+fi
+[[ "$version" =~ ^[a-zA-Z0-9._-]+$ ]] || { echo 'Invalid release tag' >&2; exit 1; }
 archive="v2box-linux-${arch}.zip"
 base="https://github.com/$repo/releases/download/$version"
-curl -fSL --proto '=https' --proto-redir '=https' --connect-timeout 10 --max-time 180 "$base/$archive" -o "$stage/$archive"
-curl -fSL --proto '=https' --proto-redir '=https' --connect-timeout 10 --max-time 30 "$base/$archive.sha256" -o "$stage/$archive.sha256"
-(cd "$stage" && sha256sum -c "$archive.sha256" && unzip -q "$archive")
+run_step 185 curl -fSL --proto '=https' --proto-redir '=https' --connect-timeout 10 --max-time 180 "$base/$archive" -o "$stage/$archive"
+run_step 35 curl -fSL --proto '=https' --proto-redir '=https' --connect-timeout 10 --max-time 30 "$base/$archive.sha256" -o "$stage/$archive.sha256"
+pushd "$stage" >/dev/null
+run_step 30 sha256sum -c "$archive.sha256"
+run_step 60 unzip -oq "$archive"
+popd >/dev/null
 for file in v2box v2box.sh install.sh node-network.py node-credentials.py config.example.json LICENSE LICENSE.sing-box NOTICE.md README.md; do
   [[ -s "$stage/$file" && ! -L "$stage/$file" ]] || { echo "Release is missing required file: $file" >&2; exit 1; }
 done
 for script in v2box.sh install.sh; do
-  bash -n "$stage/$script" || { echo "Release contains an invalid shell script: $script; installed programs were not changed." >&2; exit 1; }
+  run_step 20 bash -n "$stage/$script" || { echo "Release contains an invalid shell script: $script; installed programs were not changed." >&2; exit 1; }
 done
 if command -v python3 >/dev/null; then
-  python3 -c 'import ast,sys; [ast.parse(open(path, encoding="utf-8").read(), filename=path) for path in sys.argv[1:]]' "$stage/node-network.py" "$stage/node-credentials.py" || { echo 'Release contains an invalid Python helper; installed programs were not changed.' >&2; exit 1; }
+  run_step 20 python3 -c 'import ast,sys; [ast.parse(open(path, encoding="utf-8").read(), filename=path) for path in sys.argv[1:]]' "$stage/node-network.py" "$stage/node-credentials.py" || { echo 'Release contains an invalid Python helper; installed programs were not changed.' >&2; exit 1; }
 fi
 chmod +x "$stage/v2box"
-timeout -k 5 15 "$stage/v2box" version || { echo 'Release binary did not pass the version check; installed programs were not changed.' >&2; exit 1; }
+run_step 15 "$stage/v2box" version || { echo 'Release binary did not pass the version check; installed programs were not changed.' >&2; exit 1; }
 install -d -m 755 /usr/local/lib/v2box /etc/v2box
 if $had_binary; then
   mkdir "$stage/previous"
@@ -199,10 +232,12 @@ mv -f -- /usr/local/bin/v2box.new /usr/local/bin/v2box
 install -m 755 "$stage/install.sh" /usr/local/lib/v2box/install.sh.new
 mv -f -- /usr/local/lib/v2box/install.sh.new /usr/local/lib/v2box/install.sh
 if [[ -f "$stage/node-credentials.py" ]]; then
-  install -m 755 "$stage/node-credentials.py" /usr/local/lib/v2box/node-credentials.py
+  install -m 755 "$stage/node-credentials.py" /usr/local/lib/v2box/node-credentials.py.new
+  mv -f -- /usr/local/lib/v2box/node-credentials.py.new /usr/local/lib/v2box/node-credentials.py
 fi
 if [[ -f "$stage/node-network.py" ]]; then
-  install -m 755 "$stage/node-network.py" /usr/local/lib/v2box/node-network.py
+  install -m 755 "$stage/node-network.py" /usr/local/lib/v2box/node-network.py.new
+  mv -f -- /usr/local/lib/v2box/node-network.py.new /usr/local/lib/v2box/node-network.py
 fi
 for file in LICENSE LICENSE.sing-box NOTICE.md README.md; do
   install -m 644 "$stage/$file" "/usr/local/lib/v2box/$file"
@@ -263,11 +298,14 @@ if [[ "$ddns" == true ]]; then
   [[ -z "$ddns_domain" ]] || ddns_args+=(--domain "$ddns_domain")
   [[ -z "$ddns_zone" ]] || ddns_args+=(--zone-id "$ddns_zone")
   [[ -z "$ddns_token_file" ]] || ddns_args+=(--token-file "$ddns_token_file")
-  python3 /usr/local/lib/v2box/node-network.py "${ddns_args[@]}"
+  run_step 600 python3 /usr/local/lib/v2box/node-network.py "${ddns_args[@]}"
 fi
-if jq -e '.Nodes | length > 0 and all(.[]; .ApiKey != "REPLACE_ME")' /etc/v2box/config.json >/dev/null; then
+if jq -e '.Nodes | type == "array" and length > 0 and all(.[]; (.ApiHost | type == "string" and test("^https://[^/?#\\s@]+(/[^?#\\s]*)?$") and (test("^https://panel\\.example\\.com([/:]|$)";"i") | not)) and ((.NodeID | tonumber? // 0) | . > 0 and . == floor) and (.ApiKey | type == "string" and test("\\S") and (test("^\\s*replace_me\\s*$";"i") | not)))' /etc/v2box/config.json >/dev/null; then
   if $was_running || { ! $had_binary && ! $pending_deployment; }; then
-    /usr/local/bin/v2box restart 7>&- 8>&- 9>&-
+    # This installer already owns all operation locks. Do not re-enter the CLI,
+    # which independently protects administrator start/stop/restart commands.
+    if [[ "$init" == systemd ]]; then run_service systemctl restart v2box
+    else run_service rc-service v2box restart; fi
     healthy=0
     for attempt in 1 2 3 4 5; do
       sleep 2
@@ -282,7 +320,7 @@ if jq -e '.Nodes | length > 0 and all(.[]; .ApiKey != "REPLACE_ME")' /etc/v2box/
     ((healthy >= 3)) || { echo 'Updated service did not remain active; inspect v2box log. Rolling back.' >&2; exit 1; }
   else echo 'Updated without starting the previously stopped service. Run: v2box start'; fi
 else
-  echo 'Edit /etc/v2box/config.json, then run: v2box start'
+  echo 'Node enrollment is incomplete. Resume the panel deployment with v2box resume, or complete /etc/v2box/config.json before v2box start.'
 fi
 rollback=false
 echo "Installed v2box $version."

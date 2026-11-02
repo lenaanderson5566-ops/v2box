@@ -42,6 +42,7 @@ class LifecycleTest(unittest.TestCase):
         unit = self.root / 'etc/systemd/system/v2box.service'
         unit.parent.mkdir(parents=True)
         unit.write_text('existing customized unit')
+        (self.root/'run/systemd/system').mkdir(parents=True)
         self.active = self.root / 'active'
         self.active.touch()
         self.env = dict(os.environ, PATH=str(self.bin)+':'+str(self.root/'usr/local/bin')+':'+os.environ['PATH'], TEST_ROOT=str(self.root))
@@ -52,7 +53,7 @@ class LifecycleTest(unittest.TestCase):
             # All mutating absolute paths below are redirected into the sandbox;
             # allow this copy to exercise root-only branches as an ordinary CI user.
             source = source.replace('$EUID', '0')
-            for prefix in ['/etc/v2box', '/etc/node-network', '/etc/systemd/system', '/etc/init.d', '/usr/local', '/var/log', '/proc/', '/run/v2box.pid']:
+            for prefix in ['/etc/v2box', '/etc/node-network', '/etc/systemd/system', '/etc/init.d', '/usr/local', '/var/log', '/proc/', '/run/v2box.pid', '/run/systemd/system']:
                 source = source.replace(prefix, str(self.root)+prefix)
             self.write(target, source)
         self.write(self.bin/'sleep', '#!/bin/sh\nexit 0\n')
@@ -66,11 +67,11 @@ case "$1" in
      if test "$count" -lt 2; then exit 3; fi
    fi
    test -e "$TEST_ROOT/active" || exit 3;;
- restart)
+ start|restart)
    if test -e "$TEST_ROOT/fail-start" && grep -q new-version "$TEST_ROOT/usr/local/lib/v2box/v2box"; then rm -f "$TEST_ROOT/active"; exit 1; fi
    touch "$TEST_ROOT/active"
    if test -e "$TEST_ROOT/slow-start"; then echo 0 > "$TEST_ROOT/slow-polls"; fi;;
- disable) if test -e "$TEST_ROOT/fail-stop"; then exit 1; fi; rm -f "$TEST_ROOT/active";;
+ stop|disable) if test -e "$TEST_ROOT/fail-stop"; then exit 1; fi; rm -f "$TEST_ROOT/active";;
 esac
 ''')
         self.write(self.bin/'curl', '''#!/bin/sh
@@ -83,7 +84,7 @@ while test "$#" -gt 0; do
  shift
 done
 case "$url" in
- */releases/latest) printf '{"tag_name":"v-test"}';;
+ */releases/latest) if test -n "$out"; then printf '{"tag_name":"v-test"}' > "$out"; else printf '{"tag_name":"v-test"}'; fi;;
  *.sha256) cp "$TEST_ROOT/release.zip.sha256" "$out";;
  *) cp "$TEST_ROOT/release.zip" "$out";;
 esac
@@ -424,6 +425,7 @@ exec /bin/cp "$@"
 
     def test_update_and_uninstall_support_openrc(self):
         (self.bin/'systemctl').unlink()
+        (self.root/'run/systemd/system').rmdir()
         # Alpine/CI test environment must not provide a real systemd daemon.
         self.write(self.bin/'rc-service', '''#!/bin/sh
 case "$2" in
@@ -436,10 +438,8 @@ esac
         init = self.root/'etc/init.d'
         init.mkdir()
         (init/'v2box').write_text('custom openrc service')
-        # Hide host systemctl without replacing production service selection.
+        # A systemctl executable on an OpenRC host is not an active systemd init.
         self.env['PATH'] = str(self.bin)+':'+str(self.root/'usr/local/bin')+':/usr/local/bin:/usr/bin:/bin'
-        if shutil.which('systemctl', path=self.env['PATH']):
-            self.skipTest('OpenRC test requires an environment without systemctl')
         r = self.install()
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual((init/'v2box').read_text(), 'custom openrc service')
@@ -448,6 +448,174 @@ esac
         self.assertFalse(self.active.exists())
         self.assertFalse((init/'v2box').exists())
         self.preserved()
+
+    def test_mutating_commands_cannot_race_deployment_or_maintenance(self):
+        import fcntl
+        for name in ['.bootstrap.lock','.deployment.lock','.maintenance.lock']:
+            with (self.config/name).open('w') as lock:
+                fcntl.flock(lock,fcntl.LOCK_EX)
+                for args in [('start',),('stop',),('restart',),('reload',),('enable',),('disable',),('credential',),('share-listener','group','1')]:
+                    result=self.run_script(self.root/'usr/local/bin/v2box',*args)
+                    self.assertNotEqual(result.returncode,0,(name,args,result.stdout,result.stderr))
+            self.assertTrue(self.active.exists())
+            self.preserved()
+
+    def test_panel_delegates_only_its_locks_and_maintenance_remains_exclusive(self):
+        import fcntl
+        self.env.update(V2BOX_BOOTSTRAP_LOCK_HELD='1',V2BOX_DEPLOYMENT_LOCK_HELD='1')
+        with (self.config/'.bootstrap.lock').open('w') as bootstrap,(self.config/'.deployment.lock').open('w') as deployment:
+            fcntl.flock(bootstrap,fcntl.LOCK_EX);fcntl.flock(deployment,fcntl.LOCK_EX)
+            result=self.run_script(self.root/'usr/local/bin/v2box','restart')
+            self.assertEqual(result.returncode,0,result.stderr)
+            with (self.config/'.maintenance.lock').open('w') as maintenance:
+                fcntl.flock(maintenance,fcntl.LOCK_EX)
+                result=self.run_script(self.root/'usr/local/bin/v2box','stop')
+                self.assertNotEqual(result.returncode,0)
+        self.assertTrue(self.active.exists());self.preserved()
+
+    def test_successful_service_command_does_not_hide_dead_start_or_failed_stop(self):
+        self.write(self.bin/'systemctl','''#!/bin/sh
+echo "$*" >> "$TEST_ROOT/service-calls"
+case "$1" in is-active) test -e "$TEST_ROOT/active" || exit 3;; esac
+''')
+        self.active.unlink()
+        for action in ['start','restart']:
+            result=self.run_script(self.root/'usr/local/bin/v2box',action)
+            self.assertNotEqual(result.returncode,0)
+            self.assertIn('did not remain active',result.stderr)
+        self.active.touch()
+        result=self.run_script(self.root/'usr/local/bin/v2box','stop')
+        self.assertNotEqual(result.returncode,0)
+        self.assertIn('did not remain stopped',result.stderr)
+        self.assertTrue(self.active.exists());self.preserved()
+
+    def test_archive_timeout_does_not_publish_or_keep_locks(self):
+        self.write(self.bin/'timeout','''#!/bin/sh
+if test "$4" = unzip; then exit 124; fi
+shift 3
+exec "$@"
+''')
+        result=self.install()
+        self.assertNotEqual(result.returncode,0)
+        self.assertIn('step timed out',result.stderr)
+        self.assertIn('old-version',(self.lib/'v2box').read_text())
+        self.preserved()
+        import fcntl
+        for name in ['.bootstrap.lock','.deployment.lock','.maintenance.lock']:
+            with (self.config/name).open('w') as lock:fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+
+    def test_version_child_cannot_inherit_installer_locks(self):
+        self.package(overrides={'v2box':'''#!/bin/sh
+if test "$1" = version; then
+ /bin/sleep 30 >/dev/null 2>&1 &
+ echo $! > "$TEST_ROOT/version-child"
+fi
+echo new-version
+'''})
+        try:
+            result=self.install()
+            self.assertEqual(result.returncode,0,result.stderr)
+            pid=int((self.root/'version-child').read_text())
+            os.kill(pid,0)
+            import fcntl
+            for name in ['.bootstrap.lock','.deployment.lock','.maintenance.lock']:
+                with (self.config/name).open('w') as lock:fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+            self.preserved()
+        finally:
+            if (self.root/'version-child').exists():
+                try:os.kill(int((self.root/'version-child').read_text()),signal.SIGTERM)
+                except ProcessLookupError:pass
+
+    def test_manager_interrupt_cleans_timeout_group_and_term_ignoring_grandchild(self):
+        self.write(self.bin/'systemctl','''#!/bin/bash
+trap '' TERM
+echo "$PPID" > "$TEST_ROOT/service-timeout-pid"
+/bin/bash -c 'trap "" TERM; echo $$ > "$TEST_ROOT/service-grandchild"; exec /bin/sleep 30' &
+wait
+''')
+        process=subprocess.Popen(['bash',str(self.root/'usr/local/bin/v2box'),'restart'],env=self.env,text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,start_new_session=True)
+        try:
+            deadline=time.monotonic()+3
+            while not (self.root/'service-grandchild').exists() and time.monotonic()<deadline:time.sleep(.02)
+            self.assertTrue((self.root/'service-grandchild').exists())
+            process.send_signal(signal.SIGTERM)
+            process.communicate(timeout=8)
+            self.assertNotEqual(process.returncode,0)
+            pid=int((self.root/'service-grandchild').read_text())
+            stat=Path('/proc')/str(pid)/'stat'
+            self.assertTrue(not stat.exists() or stat.read_text().split()[2]=='Z','A service grandchild must not survive the manager deadline')
+            import fcntl
+            for name in ['.bootstrap.lock','.deployment.lock','.maintenance.lock']:
+                with (self.config/name).open('w') as lock:fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+            self.preserved()
+        finally:
+            if process.poll() is None:os.killpg(process.pid,signal.SIGKILL);process.communicate()
+            if (self.root/'service-timeout-pid').exists():
+                try:os.killpg(int((self.root/'service-timeout-pid').read_text()),signal.SIGKILL)
+                except ProcessLookupError:pass
+
+    def test_interrupt_after_publication_restores_program_and_running_service(self):
+        self.write(self.bin/'systemctl','''#!/bin/sh
+echo "$*" >> "$TEST_ROOT/service-calls"
+case "$1" in
+ is-active) test -e "$TEST_ROOT/active" || exit 3;;
+ restart)
+  if grep -q new-version "$TEST_ROOT/usr/local/lib/v2box/v2box"; then
+   rm -f "$TEST_ROOT/active";touch "$TEST_ROOT/restart-started";exec /bin/sleep 30
+  fi
+  touch "$TEST_ROOT/active";;
+esac
+''')
+        process=subprocess.Popen(['bash',str(self.installer),'--update','v-test'],env=self.env,text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,start_new_session=True)
+        try:
+            deadline=time.monotonic()+5
+            while not (self.root/'restart-started').exists() and time.monotonic()<deadline:time.sleep(.02)
+            self.assertTrue((self.root/'restart-started').exists())
+            process.send_signal(signal.SIGTERM)
+            _,error=process.communicate(timeout=8)
+            self.assertNotEqual(process.returncode,0)
+            self.assertIn('restoring the previous',error)
+            self.assertIn('old-version',(self.lib/'v2box').read_text())
+            self.assertTrue(self.active.exists())
+            self.preserved()
+        finally:
+            if process.poll() is None:os.killpg(process.pid,signal.SIGKILL);process.communicate()
+
+    def test_non_gnu_timeout_is_rejected_before_mutation(self):
+        self.write(self.bin/'timeout','#!/bin/sh\necho unsupported >&2\nexit 2\n')
+        for result in [self.install(),self.run_script(self.root/'usr/local/bin/v2box','restart')]:
+            self.assertNotEqual(result.returncode,0)
+            self.assertIn('GNU coreutils timeout',result.stderr)
+            self.assertIn('old-version',(self.lib/'v2box').read_text())
+            self.assertTrue(self.active.exists());self.preserved()
+
+    def test_example_or_incomplete_active_configuration_never_starts_service(self):
+        original=json.loads(self.original_config)
+        for override in [{'ApiKey':'REPLACE_ME'},{'ApiKey':'  replace_me  '},{'ApiKey':' '},{'ApiHost':'https://panel.example.com'},{'NodeID':0},{'NodeID':1.5}]:
+            document=json.loads(self.original_config);document['Nodes'][0].update(override)
+            (self.config/'config.json').write_text(json.dumps(document))
+            for action in ['start','restart']:
+                result=self.run_script(self.root/'usr/local/bin/v2box',action)
+                self.assertNotEqual(result.returncode,0)
+                self.assertIn('resume',result.stderr)
+                self.assertFalse((self.root/'service-calls').exists())
+                self.assertEqual(json.loads((self.config/'config.json').read_text()),document)
+        (self.config/'config.json').write_bytes(self.original_config)
+        (self.config/'deployment-state-new.json').write_text('new deployment pending')
+        result=self.run_script(self.root/'usr/local/bin/v2box','restart')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertTrue(self.active.exists());self.preserved()
+
+    def test_partial_program_publication_is_removed_after_failed_update(self):
+        real_install=shutil.which('install')
+        for suffix in ['v2box.new','manager.sh.new','install.sh.new','node-credentials.py.new','node-network.py.new']:
+            self.write(self.bin/'install','#!/bin/bash\ncase "${@: -1}" in */'+suffix+') printf partial > "${@: -1}";exit 1;; esac\nexec '+shlex.quote(real_install)+' "$@"\n')
+            result=self.install()
+            self.assertNotEqual(result.returncode,0,(suffix,result.stdout,result.stderr))
+            self.assertFalse((self.lib/suffix).exists())
+            self.assertIn('old-version',(self.lib/'v2box').read_text())
+            self.preserved()
+        self.assertFalse((self.root/'usr/local/bin/v2box.new').exists())
 
     def test_uninstall_requires_valid_options_and_preserves_config(self):
         wrapper = self.root/'usr/local/bin/v2box'

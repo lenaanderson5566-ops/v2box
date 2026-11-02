@@ -125,7 +125,7 @@ func echoServer(t *testing.T) net.Listener {
 	}()
 	return l
 }
-func clientBox(t *testing.T, n *panel.NodeInfo, uuid string) *box.Box {
+func clientBox(t *testing.T, n *panel.NodeInfo, uuid string, overrides ...object) *box.Box {
 	t.Helper()
 	out := object{"type": n.Type, "tag": "proxy", "server": "127.0.0.1", "server_port": n.Common.ServerPort}
 	switch n.Type {
@@ -164,6 +164,11 @@ func clientBox(t *testing.T, n *panel.NodeInfo, uuid string) *box.Box {
 		}
 		if transport != nil {
 			out["transport"] = transport
+		}
+	}
+	for _, fields := range overrides {
+		for key, value := range fields {
+			out[key] = value
 		}
 	}
 	raw, _ := json.Marshal(object{"log": object{"disabled": true}, "outbounds": []any{out}})

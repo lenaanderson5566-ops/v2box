@@ -12,7 +12,10 @@ import (
 	"github.com/lenaanderson5566-ops/v2box/conf"
 	"github.com/lenaanderson5566-ops/v2box/limiter"
 	box "github.com/sagernet/sing-box"
+	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-tun"
 	M "github.com/sagernet/sing/common/metadata"
+	N "github.com/sagernet/sing/common/network"
 	"io"
 	"net"
 	"os"
@@ -24,6 +27,95 @@ import (
 
 func startTestNode(t *testing.T, n *panel.NodeInfo) *V2Core {
 	return startTestNodeWithConfig(t, n, testConf())
+}
+
+func TestQUICReportsActualSourceAndTarget(t *testing.T) {
+	for _, protocol := range []string{"tuic", "hysteria2"} {
+		modes := []string{"tcp", "udp-native"}
+		if protocol == "tuic" {
+			modes = append(modes, "udp-quic")
+		}
+		for _, mode := range modes {
+			t.Run(protocol+"/"+mode, func(t *testing.T) {
+				limiter.Init()
+				n := testNode(t, protocol)
+				n.Common.ListenIP = "0.0.0.0"
+				n.Security = panel.Tls
+				n.Common.CertInfo = testCertificate(t)
+				v := startTestNode(t, n)
+				v.SetTargetPolicy(n.Tag, panel.TargetPolicy{Enabled: true, Version: "actual-source-target", LeaseSeconds: 120})
+				observed := make(chan tuicSourceObservation, 1)
+				if protocol == "tuic" && mode == "tcp" {
+					v.nodes[n.Tag].server.Router().AppendTracker(&tuicSourceTracker{observed: observed})
+				}
+				fields := object{"inet4_bind_address": "127.0.0.2"}
+				if protocol == "tuic" {
+					if mode == "udp-quic" {
+						fields["udp_relay_mode"] = "quic"
+					} else {
+						fields["udp_relay_mode"] = "native"
+					}
+				}
+				b := clientBox(t, n, testUUID, fields)
+				expectedBytes := int64(len("sing-box-backend-echo") * 256)
+				if mode == "tcp" {
+					exchange(t, b, echoServer(t).Addr())
+					if protocol == "tuic" {
+						select {
+						case source := <-observed:
+							if source.metadata.Addr.Unmap().String() != "127.0.0.2" || source.remote.Addr.Unmap().String() != "127.0.0.2" {
+								t.Fatalf("TUIC stream lost actual QUIC remote address: metadata=%s remote=%s", source.metadata, source.remote)
+							}
+						case <-time.After(2 * time.Second):
+							t.Fatal("TUIC TCP source was not observed")
+						}
+					}
+				} else {
+					echo := udpEcho(t)
+					payload := protocol + "-actual-source"
+					expectedBytes = int64(len(payload))
+					if err := packetRoundTrip(packetClient(t, b, echo.LocalAddr()), echo.LocalAddr(), payload); err != nil {
+						t.Fatal(err)
+					}
+				}
+				awaitTraffic(t, v, n.Tag, expectedBytes)
+				limits, err := limiter.GetLimiter(n.Tag)
+				if err != nil {
+					t.Fatal(err)
+				}
+				devices, err := limits.GetOnlineDevice()
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(*devices) != 1 || (*devices)[0].UID != 42 || (*devices)[0].IP != "127.0.0.2" {
+					t.Fatalf("QUIC lost the actual remote source: %+v", devices)
+				}
+				targets := v.TargetBatch(n.Tag)
+				if targets == nil || len(targets.Records) != 1 || targets.Records[0].UserID != 42 || targets.Records[0].Target != "127.0.0.1" || targets.Records[0].Type != "ip" || targets.Records[0].Connections != 1 {
+					t.Fatalf("QUIC target statistics reported listener/client instead of requested destination: %+v", targets)
+				}
+			})
+		}
+	}
+}
+
+type tuicSourceObservation struct {
+	metadata, remote M.Socksaddr
+}
+
+type tuicSourceTracker struct {
+	observed chan tuicSourceObservation
+}
+
+func (s *tuicSourceTracker) RoutedConnection(_ context.Context, conn net.Conn, metadata adapter.InboundContext, _ adapter.Rule, _ adapter.Outbound) net.Conn {
+	s.observed <- tuicSourceObservation{metadata.Source, M.SocksaddrFromNet(conn.RemoteAddr()).Unwrap()}
+	return conn
+}
+func (*tuicSourceTracker) RoutedPacketConnection(_ context.Context, conn N.PacketConn, _ adapter.InboundContext, _ adapter.Rule, _ adapter.Outbound) N.PacketConn {
+	return conn
+}
+func (*tuicSourceTracker) RoutedFlow(context.Context, adapter.InboundContext, adapter.Rule, adapter.Outbound) tun.FlowTracker {
+	return nil
 }
 func startTestNodeWithConfig(t *testing.T, n *panel.NodeInfo, cfg *conf.Conf) *V2Core {
 	t.Helper()

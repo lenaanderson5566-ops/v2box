@@ -9,6 +9,7 @@ import (
 	"time"
 
 	panel "github.com/lenaanderson5566-ops/v2box/api/v2board"
+	"github.com/sagernet/sing-box/adapter"
 	M "github.com/sagernet/sing/common/metadata"
 )
 
@@ -81,13 +82,18 @@ func TestTargetStatisticsAddressesAndBounds(t *testing.T) {
 			t.Fatalf("%s: %s", raw, got)
 		}
 	}
+	for _, raw := range []string{"0.0.0.0:443", "[::]:443", "[::ffff:0.0.0.0]:443"} {
+		if target, kind := targetAddress(M.ParseSocksaddr(raw)); target != "" || kind != "" {
+			t.Fatalf("unspecified address became a target: %s", raw)
+		}
+	}
 	m := &meter{target: M.ParseSocksaddr("one.example:53"), resolvedTarget: M.ParseSocksaddr("one.example:53")}
 	other := M.ParseSocksaddr("two.example:53")
 	if packetTarget(m, other) != other {
 		t.Fatal("UDP destinations merged")
 	}
 	ip := M.ParseSocksaddr("192.0.2.1:443")
-	if originalTarget(other, ip, M.Socksaddr{}) != ip {
+	if originalTarget(adapter.InboundContext{Destination: other, RouteOriginalDestination: ip}) != ip {
 		t.Fatal("rewritten target leaked")
 	}
 	v := New(testConf())
@@ -98,6 +104,37 @@ func TestTargetStatisticsAddressesAndBounds(t *testing.T) {
 	b := v.TargetBatch("node")
 	if len(b.Records) != 500 || b.Dropped != 50 {
 		t.Fatal("unbounded aggregate")
+	}
+}
+
+func TestTargetStatisticsOriginalDestinationSemantics(t *testing.T) {
+	destination := M.ParseSocksaddr("requested.example.test:443")
+	routeOriginal := M.ParseSocksaddr("original.example.test:443")
+	for _, protocol := range []string{"tuic", "hysteria2", "hysteria", "vless", "vmess", "trojan", "shadowsocks", "naive", "anytls", "socks", "http", "mixed"} {
+		for _, listener := range []string{"0.0.0.0:8443", "[::]:8443", "127.0.0.3:8443"} {
+			metadata := adapter.InboundContext{InboundType: protocol, Destination: destination, OriginDestination: M.ParseSocksaddr(listener)}
+			if originalTarget(metadata) != destination {
+				t.Fatalf("%s listener replaced the requested destination", protocol)
+			}
+			metadata.RouteOriginalDestination = routeOriginal
+			if originalTarget(metadata) != routeOriginal {
+				t.Fatalf("%s lost the destination before a route rewrite", protocol)
+			}
+		}
+	}
+	for _, protocol := range []string{"direct", "redirect", "tproxy", "tun", "wireguard", ""} {
+		origin := M.ParseSocksaddr("192.0.2.10:443")
+		metadata := adapter.InboundContext{InboundType: protocol, Destination: destination, RouteOriginalDestination: routeOriginal, OriginDestination: origin}
+		if originalTarget(metadata) != origin {
+			t.Fatalf("%s lost the transparent original destination", protocol)
+		}
+		metadata.OriginDestination = M.ParseSocksaddr("0.0.0.0:8443")
+		if originalTarget(metadata) != routeOriginal {
+			t.Fatalf("%s kept an unspecified original destination", protocol)
+		}
+	}
+	if target, kind := targetAddress(M.Socksaddr{Fqdn: "0.0.0.0", Port: 443}); target != "" || kind != "" {
+		t.Fatal("unspecified textual IP became a domain target")
 	}
 }
 func TestTargetStatisticsConcurrentSwitch(t *testing.T) {

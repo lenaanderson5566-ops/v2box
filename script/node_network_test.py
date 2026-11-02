@@ -3,7 +3,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock
 
 spec = importlib.util.spec_from_file_location('network', Path(__file__).with_name('node-network.py'))
 m = importlib.util.module_from_spec(spec)
@@ -109,8 +109,71 @@ class NetworkTests(unittest.TestCase):
                 m.schedule(True)
                 self.assertIn('OnUnitActiveSec=5min',(root/'etc/systemd/system/node-network.timer').read_text())
                 self.assertIn('node-network.py run',(root/'etc/systemd/system/node-network.service').read_text())
+                self.assertIn('TimeoutStartSec=600',(root/'etc/systemd/system/node-network.service').read_text())
+                self.assertIn('TimeoutStopSec=15',(root/'etc/systemd/system/node-network.service').read_text())
                 m.schedule(False)
-                self.assertEqual(run.call_args.args[0],['systemctl','disable','--now','node-network.timer'])
+                run.assert_any_call(['systemctl','disable','--now','node-network.timer'],check=True,timeout=30)
+                self.assertEqual(run.call_args.args[0],['systemctl','stop','node-network.service'])
+                self.assertTrue(all(call.kwargs.get('timeout')==30 for call in run.call_args_list))
+    def test_local_service_timeout_is_bounded_and_does_not_expose_process_data(self):
+        with patch.object(m.subprocess,'run',side_effect=m.subprocess.TimeoutExpired(['systemctl'],30,output='private diagnostic')) as run:
+            with self.assertRaises(m.NetworkError) as caught:
+                m.local_command(['systemctl','daemon-reload'],check=True)
+            self.assertIn('timed out',str(caught.exception))
+            self.assertNotIn('private diagnostic',str(caught.exception))
+            self.assertEqual(run.call_args.kwargs['timeout'],30)
+    def test_trickled_response_has_a_progress_deadline_and_size_limit(self):
+        response=MagicMock();response.__enter__.return_value=response
+        response.read1.return_value=b'x'
+        with patch.object(m.urllib.request,'build_opener') as opener,patch.object(m.time,'monotonic',side_effect=[0,0,16]):
+            opener.return_value.open.return_value=response
+            with self.assertRaises(m.NetworkError) as caught:m.Client().request('https://example.test')
+            self.assertIn('time limit',str(caught.exception))
+            self.assertEqual(response.read1.call_count,1)
+            response.read.assert_not_called()
+        response.reset_mock();response.read1.return_value=b'x'*262145
+        with patch.object(m.urllib.request,'build_opener') as opener:
+            opener.return_value.open.return_value=response
+            with self.assertRaises(m.NetworkError) as caught:m.Client().request('https://example.test')
+            self.assertIn('size limit',str(caught.exception))
+    def test_missing_terminal_never_falls_back_to_reading_or_echoing_a_secret(self):
+        with patch('builtins.open',side_effect=OSError('No controlling terminal')),patch.object(m.getpass,'getpass') as prompt:
+            with self.assertRaises(OSError):m.terminal_input('Token: ',secret=True)
+            prompt.assert_not_called()
+    @unittest.skipUnless(m.sys.platform=='linux','Linux file permissions and directory synchronization')
+    def test_program_publication_failure_preserves_bytes_modes_and_no_partial_files(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);path=root/'node-network'
+            for mode in (0o755,0o600,0o400):
+                path.write_bytes(b'old helper');path.chmod(mode)
+                with patch.object(m.os,'replace',side_effect=OSError(28,'No space left')):
+                    with self.assertRaises(OSError):m.publish_file(path,b'new helper',0o755)
+                self.assertEqual(path.read_bytes(),b'old helper')
+                self.assertEqual(path.stat().st_mode&0o777,mode)
+                self.assertEqual(list(root.iterdir()),[path])
+                m.publish_file(path,b'complete helper',0o755)
+                self.assertEqual(path.read_bytes(),b'complete helper')
+                self.assertEqual(path.stat().st_mode&0o777,mode)
+            target=root/'target';target.write_bytes(b'private data')
+            link=root/'wrapper';link.symlink_to(target)
+            with self.assertRaises(m.NetworkError):m.publish_file(link,b'new wrapper',0o755)
+            self.assertTrue(link.is_symlink());self.assertEqual(target.read_bytes(),b'private data')
+    @unittest.skipUnless(m.sys.platform=='linux','Linux advisory locks')
+    def test_busy_configuration_lock_rejects_disable_and_configure_without_side_effects(self):
+        import fcntl
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);token=root/'token';token.write_text('a'*64)
+            config=root/'config.json';config.write_text('{"preserve":true}')
+            with (root/'lock').open('w') as lock:
+                fcntl.flock(lock,fcntl.LOCK_EX)
+                with patch.object(m,'STATE',root/'state'),patch.object(m,'CONFIG',config),patch.object(m.os,'geteuid',return_value=0),patch.object(m,'schedule') as schedule,patch.object(m,'execute') as execute:
+                    for arguments in [['node-network','disable'],['node-network','report-configure','--panel-url','https://panel.example.test','--token-file',str(token)]]:
+                        with patch.object(m.sys,'argv',arguments),patch.object(m.Path,'exists',return_value=True):
+                            with self.assertRaises(m.NetworkError) as caught:m.main()
+                            self.assertIn('Another node-network operation',str(caught.exception))
+                    schedule.assert_not_called();execute.assert_not_called()
+            self.assertEqual(config.read_text(),'{"preserve":true}')
+            self.assertFalse((root/'state').exists())
     def test_openrc_preserves_other_cron_jobs(self):
         result=m.subprocess.CompletedProcess([],0,'0 1 * * * existing-job\nold-command # node-network-ddns\n','')
         with patch.object(m.Path,'exists',return_value=False),patch.object(m.shutil,'which',return_value='/usr/bin/tool'),patch.object(m.subprocess,'run',return_value=result) as run:
@@ -119,6 +182,7 @@ class NetworkTests(unittest.TestCase):
             self.assertIn('existing-job',text)
             self.assertNotIn('old-command',text)
             self.assertEqual(text.count('# node-network-ddns'),1)
+            self.assertIn('/usr/bin/env timeout -k 15 600 python3',text)
             m.schedule(False)
             self.assertEqual(run.call_args.kwargs['input'],'0 1 * * * existing-job\n')
     @unittest.skipUnless(m.sys.platform=='linux','Linux lock and file permissions')

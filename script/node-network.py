@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Public IP discovery and opt-in Cloudflare DDNS; no third-party Python packages."""
 import argparse
+import errno
 import hashlib
 from concurrent.futures import ThreadPoolExecutor
 import getpass
@@ -11,6 +12,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import warnings
 import sys
 import time
 import tempfile
@@ -44,12 +46,21 @@ class Client:
         if data is not None:
             headers['Content-Type'] = 'application/json'
         req = urllib.request.Request(url, data=None if data is None else json.dumps(data).encode(), headers=headers, method=method)
+        deadline = time.monotonic() + 15
         try:
             with urllib.request.build_opener(NoRedirect()).open(req, timeout=10) as response:
-                body = response.read(262145)
-                if len(body) > 262144:
-                    raise NetworkError('Response exceeded size limit')
-                return body.decode('utf-8')
+                body = bytearray()
+                while True:
+                    if time.monotonic() >= deadline:
+                        raise NetworkError('Network response exceeded time limit')
+                    # One buffered/socket read, not read(n) waiting for n bytes
+                    # while a peer trickles data below the idle timeout.
+                    chunk = response.read1(min(8192, 262145 - len(body)))
+                    if not chunk:
+                        return body.decode('utf-8')
+                    body.extend(chunk)
+                    if len(body) > 262144:
+                        raise NetworkError('Response exceeded size limit')
         except urllib.error.HTTPError as error:
             delay = error.headers.get('Retry-After', '')
             delay = min(max(int(delay), 300), 86400) if delay.isdigit() else 900
@@ -307,23 +318,89 @@ def run():
         write_private(STATE, {})
 
 
+def local_command(command, **kwargs):
+    try:
+        return subprocess.run(command, timeout=30, **kwargs)
+    except subprocess.TimeoutExpired:
+        raise NetworkError('Local service or scheduler operation timed out; configuration and DNS records were retained') from None
+
+
+def terminal_input(prompt, secret=False):
+    # Never echo a token into a pipe or wait forever while holding an installer
+    # lock. Fully specified --token-file operations require no terminal.
+    import signal
+    def expired(signum, frame):
+        raise NetworkError('Terminal input timed out; retry with complete arguments and --token-file')
+    with open('/dev/tty', 'r+') as terminal:
+        previous = signal.signal(signal.SIGALRM, expired)
+        remaining = signal.alarm(120)
+        try:
+            if secret:
+                with warnings.catch_warnings():
+                    warnings.simplefilter('error', getpass.GetPassWarning)
+                    return getpass.getpass(prompt, stream=terminal).strip()
+            print(prompt, end='', file=terminal, flush=True)
+            value = terminal.readline()
+            if not value:
+                raise EOFError()
+            return value.strip()
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, previous)
+            if remaining:
+                signal.alarm(remaining)
+
+
+def publish_file(path, content, default_mode):
+    if path.is_symlink() or path.parent.is_symlink() or (path.exists() and not path.is_file()):
+        raise NetworkError('Refusing unsafe network program or service file')
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
+    mode = path.stat().st_mode & 0o777 if path.exists() else default_mode
+    directory = None
+    temporary = None
+    try:
+        if hasattr(os, 'O_DIRECTORY'):
+            directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        fd, name = tempfile.mkstemp(prefix='.'+path.name+'.', dir=str(path.parent))
+        temporary = path.parent / os.path.basename(name)
+        with os.fdopen(fd, 'wb') as output:
+            os.chmod(temporary, mode)
+            output.write(content.encode('utf-8') if isinstance(content, str) else content)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, path)
+        try:
+            if directory is not None:
+                os.fsync(directory)
+        except OSError as error:
+            if error.errno not in (errno.EINVAL, errno.ENOTSUP):
+                raise NetworkError('Network file was published but its directory could not be synchronized; verify local disk state before retrying') from None
+    finally:
+        if directory is not None:
+            os.close(directory)
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
 def schedule(enabled):
     if Path('/run/systemd/system').exists():
         if enabled:
-            Path('/etc/systemd/system/node-network.service').write_text('[Unit]\nDescription=Cloudflare node DDNS\nWants=network-online.target\nAfter=network-online.target\n[Service]\nType=oneshot\nExecStart=/usr/bin/env python3 /usr/local/lib/node-network/node-network.py run\nUMask=0077\n')
-            Path('/etc/systemd/system/node-network.timer').write_text('[Unit]\nDescription=Check node DNS every five minutes\n[Timer]\nOnBootSec=1min\nOnUnitActiveSec=5min\nRandomizedDelaySec=30s\n[Install]\nWantedBy=timers.target\n')
-            subprocess.run(['systemctl', 'daemon-reload'], check=True)
-        subprocess.run(['systemctl', 'enable' if enabled else 'disable', '--now', 'node-network.timer'], check=True)
+            publish_file(Path('/etc/systemd/system/node-network.service'),'[Unit]\nDescription=Cloudflare node DDNS\nWants=network-online.target\nAfter=network-online.target\n[Service]\nType=oneshot\nExecStart=/usr/bin/env python3 /usr/local/lib/node-network/node-network.py run\nTimeoutStartSec=600\nTimeoutStopSec=15\nUMask=0077\n',0o644)
+            publish_file(Path('/etc/systemd/system/node-network.timer'),'[Unit]\nDescription=Check node DNS every five minutes\n[Timer]\nOnBootSec=1min\nOnUnitActiveSec=5min\nRandomizedDelaySec=30s\n[Install]\nWantedBy=timers.target\n',0o644)
+            local_command(['systemctl', 'daemon-reload'], check=True)
+        local_command(['systemctl', 'enable' if enabled else 'disable', '--now', 'node-network.timer'], check=True)
+        if not enabled:
+            local_command(['systemctl', 'stop', 'node-network.service'], check=True)
     elif shutil.which('crontab') and shutil.which('rc-service'):
-        result = subprocess.run(['crontab', '-l'], capture_output=True, text=True)
+        result = local_command(['crontab', '-l'], capture_output=True, text=True)
         if result.returncode and result.stderr and 'no crontab' not in result.stderr.lower():
             raise NetworkError('Cannot read current crontab; existing schedule preserved')
         lines = [line for line in result.stdout.splitlines() if '# node-network-ddns' not in line]
         if enabled:
-            lines.append('*/5 * * * * /usr/bin/env python3 /usr/local/lib/node-network/node-network.py run >> /var/log/node-network.log 2>&1 # node-network-ddns')
-            subprocess.run(['rc-update', 'add', 'crond', 'default'], check=True)
-            subprocess.run(['rc-service', 'crond', 'start'], check=True)
-        subprocess.run(['crontab', '-'], input='\n'.join(lines)+'\n', text=True, check=True)
+            lines.append('*/5 * * * * /usr/bin/env timeout -k 15 600 python3 /usr/local/lib/node-network/node-network.py run >> /var/log/node-network.log 2>&1 # node-network-ddns')
+            local_command(['rc-update', 'add', 'crond', 'default'], check=True)
+            local_command(['rc-service', 'crond', 'start'], check=True)
+        local_command(['crontab', '-'], input='\n'.join(lines)+'\n', text=True, check=True)
     else:
         raise NetworkError('DDNS scheduling requires systemd or OpenRC with crontab')
 
@@ -353,44 +430,54 @@ def main():
     if sys.platform != 'linux' or os.geteuid() != 0:
         raise NetworkError('DDNS management requires root on Linux')
     if args.action in ('configure', 'report-configure'):
+        if not shutil.which('timeout'):
+            raise NetworkError('Install GNU coreutils timeout before configuring node-network')
+        try:
+            local_command(['timeout', '--foreground', '1', 'true'],check=True,capture_output=True)
+        except (NetworkError, subprocess.CalledProcessError):
+            raise NetworkError('Install GNU coreutils timeout before configuring node-network') from None
         if not Path('/run/systemd/system').exists() and not (shutil.which('crontab') and shutil.which('rc-service')):
             raise NetworkError('DDNS scheduling requires systemd or OpenRC with crontab')
         if args.action == 'report-configure':
-            panel = args.panel_url or input('HTTPS panel origin: ').strip()
-            token = args.token_file.read_text().strip() if args.token_file else getpass.getpass('Node report key: ').strip()
+            panel = args.panel_url or terminal_input('HTTPS panel origin: ')
+            token = args.token_file.read_text().strip() if args.token_file else terminal_input('Node report key: ', secret=True)
             config = validate_report({'panel_url': panel, 'token': token, 'family': args.family})
             if args.server_id is not None:
                 if args.server_id <= 0: raise NetworkError('Invalid server identity', True)
                 config['server_id'] = args.server_id
         else:
-            domain = args.domain or input('DNS hostname: ').strip()
-            zone = args.zone_id or input('Cloudflare Zone ID: ').strip()
-            token = args.token_file.read_text().strip() if args.token_file else getpass.getpass('Cloudflare API token (Zone DNS Edit): ').strip()
+            domain = args.domain or terminal_input('DNS hostname: ')
+            zone = args.zone_id or terminal_input('Cloudflare Zone ID: ')
+            token = args.token_file.read_text().strip() if args.token_file else terminal_input('Cloudflare API token (Zone DNS Edit): ', secret=True)
             config = validate({'domain': domain, 'zone_id': zone, 'token': token, 'family': args.family})
         import fcntl
         STATE.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         with open(STATE.parent / 'lock', 'w') as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise NetworkError('Another node-network operation is running; retry after it finishes') from None
             print('Configuring node address reporting' if config.get('mode') == 'panel' else 'Configuring direct Cloudflare DDNS (DNS-only)')
             # Verify credentials and DNS updates before replacing a working local setup.
             execute(Client(), config)
             INSTALLED.parent.mkdir(parents=True, exist_ok=True)
             if Path(__file__).resolve() != INSTALLED.resolve():
-                shutil.copyfile(__file__, INSTALLED)
-            INSTALLED.chmod(0o755)
-            Path('/usr/local/bin/node-network').write_text('#!/bin/sh\nexec /usr/bin/env python3 /usr/local/lib/node-network/node-network.py "$@"\n')
-            Path('/usr/local/bin/node-network').chmod(0o755)
+                publish_file(INSTALLED,Path(__file__).read_bytes(),0o755)
+            publish_file(Path('/usr/local/bin/node-network'),'#!/bin/sh\nexec /usr/bin/env timeout -k 15 600 python3 /usr/local/lib/node-network/node-network.py "$@"\n',0o755)
             save_target(config)
             schedule(True)
             print('Node network updates enabled; checks run every five minutes.')
     elif args.action == 'run':
         run()
     elif args.action == 'disable':
-        schedule(False)
         import fcntl
         STATE.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         with open(STATE.parent / 'lock', 'w') as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise NetworkError('Another node-network operation is running; retry after it finishes') from None
+            schedule(False)
             write_private(STATE, {'paused': True, 'disabled': True})
         print('DDNS disabled. Existing DNS records have been retained.')
     else:
@@ -406,7 +493,7 @@ def main():
 if __name__ == '__main__':
     try:
         sys.exit(main())
-    except (NetworkError, OSError, ValueError, EOFError, subprocess.SubprocessError) as error:
+    except (NetworkError, OSError, ValueError, EOFError, getpass.GetPassWarning, subprocess.SubprocessError) as error:
         # Never emit request headers, credentials or API response bodies.
         print(str(error) if isinstance(error, NetworkError) else 'Local operation failed; check files and service manager', file=sys.stderr)
         sys.exit(1)

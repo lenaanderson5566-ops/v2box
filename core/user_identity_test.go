@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"net"
+	"net/netip"
 	"strings"
 	"testing"
 
@@ -11,6 +12,56 @@ import (
 	"github.com/sagernet/sing-box/adapter"
 	M "github.com/sagernet/sing/common/metadata"
 )
+
+func TestTrafficSourceMustBeConcreteIP(t *testing.T) {
+	limiter.Init()
+	for _, test := range []struct {
+		name, address, want string
+	}{
+		{"invalid", "", ""},
+		{"unspecified-v4", "0.0.0.0", ""},
+		{"unspecified-v6", "::", ""},
+		{"mapped-unspecified", "::ffff:0.0.0.0", ""},
+		{"v4", "127.0.0.2", "127.0.0.2"},
+		{"mapped-v4", "::ffff:127.0.0.2", "127.0.0.2"},
+		{"v6", "::1", "::1"},
+		{"scoped-v6", "fe80::1%test-zone", "fe80::1"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			tag := "source-" + test.name
+			user := panel.UserInfo{Id: 42, Uuid: testUUID}
+			limits := limiter.AddLimiter("tuic", tag, []panel.UserInfo{user}, nil)
+			t.Cleanup(func() { limiter.DeleteLimiter(tag) })
+			tracker := newTrafficTracker()
+			tracker.setUsers(tag, []panel.UserInfo{user})
+			metadata := adapter.InboundContext{Inbound: tag, User: testUUID, Destination: M.ParseSocksaddr("127.0.0.1:443")}
+			if test.address != "" {
+				metadata.Source = M.Socksaddr{Addr: netip.MustParseAddr(test.address), Port: 4321}
+			}
+			meter := tracker.newMeter(context.Background(), metadata)
+			if meter != nil {
+				defer meter.cancel()
+			}
+			if test.want == "" {
+				if meter != nil {
+					t.Fatal("invalid or unspecified source admitted as an online device")
+				}
+			} else if meter == nil || meter.ip != test.want {
+				t.Fatal("concrete source IP was not normalized correctly")
+			}
+			devices, err := limits.GetOnlineDevice()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if test.want == "" && len(*devices) != 0 {
+				t.Fatal("invalid source leaked into online report")
+			}
+			if test.want != "" && (len(*devices) != 1 || (*devices)[0].IP != test.want) {
+				t.Fatal("online report did not preserve normalized actual source")
+			}
+		})
+	}
+}
 
 func TestRevokedGenerationCannotReenter(t *testing.T) {
 	limiter.Init()
