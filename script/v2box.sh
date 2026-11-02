@@ -39,12 +39,68 @@ require_timeout() {
     echo 'GNU coreutils timeout is required. Use the latest panel bootstrap to repair dependencies (including on OpenRC/Alpine).' >&2; return 1;
   }
 }
+legacy_installer_restart() {
+  [[ "${1:-}" == restart ]] || return 1
+  # v1.0.16 closes child lock descriptors but synchronously waits for this
+  # restart while retaining all three locks itself. Accept only that complete
+  # root Bash transaction, never an arbitrary busy lock or a caller-supplied PID.
+  local proc_root=/proc parent_dir parent_exe script_mode parent_uid script_uid current_uid
+  local parent_stat parent_start self_stat
+  local -a parent_fields self_fields
+  parent_dir="$proc_root/$PPID"
+  read -r parent_stat < "$parent_dir/stat" || return 1
+  read -r -a parent_fields <<< "${parent_stat##*) }"
+  parent_start=${parent_fields[19]:-}
+  [[ "$parent_start" =~ ^[0-9]+$ ]] || return 1
+  [[ -f "$parent_dir/fd/255" ]] || return 1
+  parent_exe=$(readlink -- "$parent_dir/exe") || return 1
+  parent_exe=${parent_exe%" (deleted)"}
+  [[ "$parent_exe" == */bash ]] || return 1
+  parent_uid=$(stat -Lc '%u' "$parent_dir") || return 1
+  script_uid=$(stat -Lc '%u' "$parent_dir/fd/255") || return 1
+  current_uid=$(id -u) || return 1
+  # lock_operation already requires EUID 0; matching the actual UID also lets
+  # sandboxed tests model root branches without weakening that production guard.
+  [[ "$parent_uid" == "$current_uid" && "$script_uid" == "$current_uid" ]] || return 1
+  script_mode=$(stat -Lc '%a' "$parent_dir/fd/255") || return 1
+  [[ "$script_mode" =~ ^[0-7]{3,4}$ ]] || return 1
+  (( (8#$script_mode & 0022) == 0 )) || return 1
+  local fd name expected actual device inode major minor locked
+  local field sequence kind advisory access owner identity first last remainder
+  for fd in 9 7 8; do
+    case "$fd" in 9) name=bootstrap;; 7) name=deployment;; 8) name=maintenance;; esac
+    [[ -f "/etc/v2box/.$name.lock" && ! -L "/etc/v2box/.$name.lock" ]] || return 1
+    expected=$(stat -Lc '%d:%i' "/etc/v2box/.$name.lock") || return 1
+    actual=$(stat -Lc '%d:%i' "$parent_dir/fd/$fd") || return 1
+    [[ "$actual" == "$expected" ]] || return 1
+    device=${expected%%:*}; inode=${expected#*:}
+    major=$(( ((device >> 8) & 0xfff) | ((device >> 32) & 0xfffff000) ))
+    minor=$(( (device & 0xff) | ((device >> 12) & 0xffffff00) ))
+    locked=false
+    while read -r field sequence kind advisory access owner identity first last remainder; do
+      [[ "$field" == lock: && "$kind" == FLOCK && "$advisory" == ADVISORY && "$access" == WRITE && "$first" == 0 && "$last" == EOF && -z "$remainder" ]] || continue
+      [[ "$identity" =~ ^([0-9a-fA-F]+):([0-9a-fA-F]+):([0-9]+)$ ]] || continue
+      [[ "${BASH_REMATCH[3]}" == "$inode" ]] || continue
+      (( 16#${BASH_REMATCH[1]} == major && 16#${BASH_REMATCH[2]} == minor )) || continue
+      locked=true
+      break
+    done < "$parent_dir/fdinfo/$fd"
+    $locked || return 1
+  done
+  read -r parent_stat < "$parent_dir/stat" || return 1
+  read -r -a parent_fields <<< "${parent_stat##*) }"
+  [[ "${parent_fields[19]:-}" == "$parent_start" ]] || return 1
+  read -r self_stat < "$proc_root/$$/stat" || return 1
+  read -r -a self_fields <<< "${self_stat##*) }"
+  [[ "${self_fields[1]:-}" == "$PPID" ]]
+}
 lock_operation() {
   [[ $EUID -eq 0 && $(uname -s) == Linux ]] || { echo 'Run as root on Linux' >&2; return 1; }
   for tool in install flock timeout; do command -v "$tool" >/dev/null || { echo "Required command is missing: $tool" >&2; return 1; }; done
   require_timeout
   [[ ! -L /etc/v2box && ! -L /etc/v2box/.bootstrap.lock && ! -L /etc/v2box/.deployment.lock && ! -L /etc/v2box/.maintenance.lock && ! -L /usr/local/lib/v2box ]] || { echo 'Refusing symlinked installation paths' >&2; return 1; }
   install -d -m 755 /etc/v2box
+  if legacy_installer_restart "${1:-}" 2>/dev/null; then return 0; fi
   # A panel worker may delegate only the locks it already holds. Child service
   # processes must never retain these descriptors after this command exits.
   if [[ "${V2BOX_BOOTSTRAP_LOCK_HELD:-}" != 1 ]]; then
@@ -241,7 +297,7 @@ case "$1" in
     run_service rc-service v2box status;;
   start|stop|restart|enable|disable)
     action=$1
-    lock_operation
+    lock_operation "$action"
     case "$action" in start|restart) require_enrolled_config;; esac
     if using_systemd; then
       run_service systemctl "$action" v2box

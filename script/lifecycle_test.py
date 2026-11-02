@@ -239,6 +239,48 @@ esac
         self.assertEqual(r.returncode, 0, r.stderr)
         self.preserved()
 
+    def test_v1016_installer_updates_running_service_with_new_release_manager(self):
+        # Exact historical public source: git show v1.0.16:script/install.sh.
+        # Keep it as a non-executable fixture so shallow/offline CI exercises the
+        # actual old caller rather than a rewritten approximation of its locks.
+        legacy=Path(__file__).with_name('fixtures')/'install-v1.0.16.txt'
+        self.assertEqual(hashlib.sha256(legacy.read_bytes()).hexdigest(),'91691500de451ea42c798b9957044711ecf77e2089b3ddaed7e841a7d53067c0')
+        source=legacy.read_text().replace('$EUID','0')
+        for prefix in ['/etc/v2box','/etc/node-network','/etc/systemd/system','/etc/init.d','/usr/local','/var/log','/proc/','/run/v2box.pid','/run/systemd/system']:
+            source=source.replace(prefix,str(self.root)+prefix)
+        old_installer=self.root/'legacy-install.sh';self.write(old_installer,source)
+        result=self.run_script(old_installer,'--update','v-test')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertIn('new-version',(self.lib/'v2box').read_text())
+        self.assertIn('old-version',(self.lib/'v2box.previous').read_text())
+        self.assertTrue(self.active.exists())
+        self.assertIn('restart v2box',(self.root/'service-calls').read_text())
+        self.preserved()
+
+    def test_parent_restart_delegation_requires_all_exact_write_locks(self):
+        for variant in ['unlocked','wrong-file','read-lock','unsafe-script']:
+            with self.subTest(variant=variant):
+                parent=self.root/'parent-transaction.sh'
+                deployment=self.config/('.different.lock' if variant=='wrong-file' else '.deployment.lock')
+                lock='' if variant=='unlocked' else ('flock -s 7' if variant=='read-lock' else 'flock -n 7')
+                self.write(parent,'#!/bin/bash\nexec 9>'+shlex.quote(str(self.config/'.bootstrap.lock'))+'\nflock -n 9\nexec 7>'+shlex.quote(str(deployment))+'\n'+lock+'\nexec 8>'+shlex.quote(str(self.config/'.maintenance.lock'))+'\nflock -n 8\nbash '+shlex.quote(str(self.root/'usr/local/bin/v2box'))+' restart 7>&- 8>&- 9>&-\nresult=$?\nexit "$result"\n')
+                if variant=='unsafe-script':parent.chmod(0o777)
+                result=self.run_script(parent)
+                self.assertNotEqual(result.returncode,0,result.stderr)
+                self.assertIn('Another deployment or maintenance',result.stderr)
+                self.assertFalse((self.root/'service-calls').exists());self.preserved()
+
+    def test_parent_transaction_never_delegates_other_management_actions(self):
+        for action in ['start','stop','reload','enable','disable','uninstall --yes']:
+            with self.subTest(action=action):
+                parent=self.root/'parent-transaction.sh'
+                self.write(parent,'#!/bin/bash\nexec 9>'+shlex.quote(str(self.config/'.bootstrap.lock'))+'\nflock -n 9\nexec 7>'+shlex.quote(str(self.config/'.deployment.lock'))+'\nflock -n 7\nexec 8>'+shlex.quote(str(self.config/'.maintenance.lock'))+'\nflock -n 8\nbash '+shlex.quote(str(self.root/'usr/local/bin/v2box'))+' '+action+' 7>&- 8>&- 9>&-\nresult=$?\nexit "$result"\n')
+                result=self.run_script(parent)
+                self.assertNotEqual(result.returncode,0,result.stderr)
+                self.assertIn('Another deployment or maintenance',result.stderr)
+                self.assertFalse((self.root/'service-calls').exists())
+                self.assertTrue((self.lib/'v2box').exists());self.preserved()
+
     def test_failed_restart_rolls_back_program_and_service(self):
         (self.root/'fail-start').touch()
         r = self.install()
