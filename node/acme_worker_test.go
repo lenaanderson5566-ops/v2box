@@ -1,15 +1,23 @@
 package node
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
+	"math/big"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -17,6 +25,8 @@ import (
 
 	"github.com/go-acme/lego/v4/certificate"
 	panel "github.com/lenaanderson5566-ops/v2box/api/v2board"
+	"github.com/lenaanderson5566-ops/v2box/conf"
+	"github.com/lenaanderson5566-ops/v2box/core"
 )
 
 func TestACMEWorkerProcess(t *testing.T) {
@@ -412,5 +422,267 @@ func TestSameKeyRenewalPreservesKeyInodeAndPermissions(t *testing.T) {
 	}
 	if !os.SameFile(before, after) || after.Mode().Perm() != 0400 {
 		t.Fatal("renewal rewrote the retained private key file")
+	}
+}
+
+// Use the standard library's public test CA, also used by the HTTPS panel
+// fixtures. The actual subprocess/parent publication and sing-box TLS listener
+// run normally; no ACME authority, DNS provider or real certificate is contacted.
+func TestAutomaticCertificateMaintenanceServesRenewedPair(t *testing.T) {
+	caServer := httptest.NewTLSServer(nil)
+	ca := caServer.Certificate()
+	caKey := caServer.TLS.Certificates[0].PrivateKey
+	caServer.Close()
+	roots := x509.NewCertPool()
+	roots.AddCert(ca)
+	t.Setenv("GODEBUG", os.Getenv("GODEBUG")+",x509usefallbackroots=1")
+	fixtureRootsOnce.Do(func() { x509.SetFallbackRoots(roots) })
+	for _, mode := range []string{"http", "dns"} {
+		for _, phase := range []string{"periodic", "restart-after-expiry"} {
+			t.Run(mode+"/"+phase, func(t *testing.T) {
+				remaining := 15 * 24 * time.Hour
+				if phase == "restart-after-expiry" {
+					remaining = -time.Hour
+				}
+				cert := acmeFixturePair(t, "renew.example.test", remaining)
+				cert.CertMode = mode
+				keyPEM, err := os.ReadFile(cert.KeyFile)
+				if err != nil {
+					t.Fatal(err)
+				}
+				block, _ := pem.Decode(keyPEM)
+				key, err := x509.ParsePKCS1PrivateKey(block.Bytes)
+				if err != nil {
+					t.Fatal(err)
+				}
+				issue := func(duration time.Duration) []byte {
+					t.Helper()
+					leaf := &x509.Certificate{SerialNumber: big.NewInt(time.Now().UnixNano()), DNSNames: []string{cert.CertDomain}, NotBefore: time.Now().Add(-2 * time.Hour), NotAfter: time.Now().Add(duration), KeyUsage: x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}}
+					der, err := x509.CreateCertificate(rand.Reader, leaf, ca, &key.PublicKey, caKey)
+					if err != nil {
+						t.Fatal(err)
+					}
+					return append(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: ca.Raw})...)
+				}
+				before, next := issue(remaining), issue(90*24*time.Hour)
+				if err = os.WriteFile(cert.CertFile, before, 0600); err != nil {
+					t.Fatal(err)
+				}
+				// Only the synthetic worker response uses these fields. File modes
+				// continue to serve the pair on disk until publication succeeds.
+				cert.TlsCert, cert.TlsKey = string(next), string(keyPEM)
+				probe, err := net.Listen("tcp", "127.0.0.1:0")
+				if err != nil {
+					t.Fatal(err)
+				}
+				port := probe.Addr().(*net.TCPAddr).Port
+				probe.Close()
+				info := &panel.NodeInfo{Tag: "certificate-" + mode + "-" + phase, Type: "vless", Security: panel.Tls, Common: &panel.CommonNode{ListenIP: "127.0.0.1", ServerPort: port, Network: "tcp", CertInfo: cert}}
+				controller := &Controller{info: info, tag: info.Tag}
+				var calls int
+				acquire := func(ctx context.Context, requested *panel.CertInfo, renew bool) error {
+					calls++
+					if !renew || requested != cert {
+						t.Fatal("maintenance did not renew the existing identity/key")
+					}
+					return coordinatedACME(ctx, requested, renew, func(ctx context.Context) error {
+						return runACMECommand(ctx, requested, renew, helperACMECommand(ctx, "success"))
+					})
+				}
+				ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+				defer cancel()
+				if err = controller.prepareCertificate(ctx, acquire); err != nil {
+					t.Fatal(err)
+				}
+				if phase == "periodic" && calls != 0 {
+					t.Fatal("usable certificate delayed startup for an ACME order")
+				}
+				if phase == "restart-after-expiry" && calls != 1 {
+					t.Fatal("expired automatic certificate was not recovered before startup")
+				}
+				// A final domain-publication hash can arrive while certificate
+				// maintenance runs. Subsequent receipts must keep that final hash.
+				controller.info.ConfigurationHash = strings.Repeat("a", 64)
+				controller.updateReceipt(strings.Repeat("b", 64), "")
+				var received []configurationReceipt
+				var receivedMu sync.Mutex
+				receipts := func() []configurationReceipt {
+					receivedMu.Lock()
+					defer receivedMu.Unlock()
+					return append([]configurationReceipt(nil), received...)
+				}
+				apiServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if strings.HasSuffix(r.URL.Path, "/configuration") {
+						w.WriteHeader(304)
+						return
+					}
+					if !strings.HasSuffix(r.URL.Path, "/capabilities") {
+						t.Errorf("unexpected receipt fixture endpoint %s", r.URL.Path)
+						w.WriteHeader(404)
+						return
+					}
+					var payload struct {
+						Configuration struct {
+							Hash        string `json:"hash"`
+							Fingerprint string `json:"certificateFingerprint"`
+						} `json:"configuration"`
+					}
+					if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+						t.Error(err)
+					}
+					receivedMu.Lock()
+					received = append(received, configurationReceipt{payload.Configuration.Hash, payload.Configuration.Fingerprint})
+					count := len(received)
+					receivedMu.Unlock()
+					if count == 1 {
+						w.WriteHeader(503)
+						return
+					}
+					w.Header().Set("Content-Type", "application/json")
+					w.Write([]byte(`{"data":{"accepted":true}}`))
+				}))
+				defer apiServer.Close()
+				retries := 0
+				controller.apiClient, err = panel.New(&conf.NodeConfig{APIHost: apiServer.URL, NodeID: 1, Key: "fixture-only", APIVersion: "v10", RetryCount: &retries})
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer controller.apiClient.CloseIdleConnections()
+				cfg := conf.New()
+				cfg.OutboundAllowCIDRs = []string{"127.0.0.0/8"}
+				server := core.New(cfg)
+				defer server.Close()
+				if err = server.AddNode(info.Tag, info); err != nil {
+					t.Fatal(err)
+				}
+				if err = server.SetUsers(info.Tag, nil); err != nil {
+					t.Fatal(err)
+				}
+				peek := func() ([]byte, error) {
+					conn, err := tls.DialWithDialer(&net.Dialer{Timeout: time.Second}, "tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)), &tls.Config{RootCAs: roots, ServerName: cert.CertDomain})
+					if err != nil {
+						return nil, err
+					}
+					defer conn.Close()
+					return conn.ConnectionState().PeerCertificates[0].Raw, nil
+				}
+				if phase == "periodic" {
+					got, err := peek()
+					oldBlock, _ := pem.Decode(before)
+					if err != nil || !bytes.Equal(got, oldBlock.Bytes) {
+						t.Fatalf("listener did not initially serve old usable pair: %v", err)
+					}
+					// A transient provider failure retains the valid pair. Its guard
+					// permits the next scheduled attempt only after the backoff.
+					failed := func(ctx context.Context, requested *panel.CertInfo, renew bool) error {
+						return coordinatedACME(ctx, requested, renew, func(context.Context) error { return &net.DNSError{Err: "synthetic timeout", IsTimeout: true} })
+					}
+					if err = controller.renewCertificate(ctx, failed); err != nil {
+						t.Fatal(err)
+					}
+					retained, _ := os.ReadFile(cert.CertFile)
+					if !bytes.Equal(retained, before) {
+						t.Fatal("provider failure changed active certificate")
+					}
+					if err = controller.renewCertificate(ctx, acquire); err != nil {
+						t.Fatal(err)
+					}
+					if calls != 1 {
+						t.Fatal("paused guard was bypassed")
+					}
+					if err = saveACMEState(acmeStatePath(cert), acmeState{Failures: 1, NextAttempt: time.Now().Add(-time.Second)}); err != nil {
+						t.Fatal(err)
+					}
+					if err = controller.renewCertificate(ctx, acquire); err != nil {
+						t.Fatal(err)
+					}
+					if calls != 2 {
+						t.Fatal("eligible automatic retry did not run")
+					}
+				}
+				deadline := time.Now().Add(10 * time.Second)
+				nextBlock, _ := pem.Decode(next)
+				for {
+					got, err := peek()
+					if err == nil && bytes.Equal(got, nextBlock.Bytes) {
+						break
+					}
+					if time.Now().After(deadline) {
+						t.Fatalf("renewed certificate was not served without restarting: %v", err)
+					}
+					time.Sleep(25 * time.Millisecond)
+				}
+				fingerprint, err := validateCertificate(next, keyPEM, cert.CertDomain, true, false)
+				if err != nil || controller.currentCertificateFingerprint() != fingerprint {
+					t.Fatal("renewal receipt retained old certificate fingerprint")
+				}
+				if phase == "periodic" {
+					if len(receipts()) != 1 {
+						t.Fatal("renewal did not attempt its certificate receipt")
+					}
+					if _, err = controller.apiClient.GetNodeInfo(ctx); err != nil {
+						t.Fatal(err)
+					}
+					if len(receipts()) != 2 {
+						t.Fatal("normal capabilities polling did not retry the pending receipt")
+					}
+					for _, receipt := range receipts() {
+						if receipt.hash != strings.Repeat("b", 64) || receipt.fingerprint != fingerprint {
+							t.Fatal("renewal receipt regressed final configuration hash or certificate fingerprint")
+						}
+					}
+				}
+				afterKey, _ := os.ReadFile(cert.KeyFile)
+				if !bytes.Equal(afterKey, keyPEM) {
+					t.Fatal("automatic renewal changed the retained private key")
+				}
+			})
+		}
+	}
+}
+
+func TestConcurrentCertificateReceiptUpdatesPreserveBothFields(t *testing.T) {
+	controller := &Controller{info: &panel.NodeInfo{ConfigurationHash: "initial", CertificateFingerprint: "old"}}
+	for range 100 {
+		controller.appliedReceipt.Store(nil)
+		var group sync.WaitGroup
+		group.Go(func() { controller.updateReceipt("final", "") })
+		group.Go(func() { controller.updateReceipt("", "renewed") })
+		group.Wait()
+		if receipt := controller.currentReceipt(); receipt.hash != "final" || receipt.fingerprint != "renewed" {
+			t.Fatal("concurrent renewal/publication lost one receipt field")
+		}
+	}
+}
+
+func TestCertificateMaintenanceDoesNotAcquireForExternalModesOrWrongIdentity(t *testing.T) {
+	for _, mode := range []string{"file", "remote", "self", "none", ""} {
+		t.Run(mode, func(t *testing.T) {
+			cert := acmeFixturePair(t, "external.example.test", -time.Hour)
+			cert.CertMode = mode
+			certPEM, _ := os.ReadFile(cert.CertFile)
+			keyPEM, _ := os.ReadFile(cert.KeyFile)
+			cert.TlsCert, cert.TlsKey = string(certPEM), string(keyPEM)
+			controller := &Controller{info: &panel.NodeInfo{Common: &panel.CommonNode{CertInfo: cert}}}
+			acquire := func(context.Context, *panel.CertInfo, bool) error {
+				t.Fatal("external certificate mode attempted ACME")
+				return nil
+			}
+			if err := controller.renewCertificate(context.Background(), acquire); err != nil {
+				t.Fatal(err)
+			}
+			if err := controller.prepareCertificate(context.Background(), acquire); err == nil {
+				t.Fatal("expired external certificate was accepted")
+			}
+		})
+	}
+	cert := acmeFixturePair(t, "right.example.test", -time.Hour)
+	cert.CertDomain = "wrong.example.test"
+	controller := &Controller{info: &panel.NodeInfo{Common: &panel.CommonNode{CertInfo: cert}}}
+	if err := controller.prepareCertificate(context.Background(), func(context.Context, *panel.CertInfo, bool) error {
+		t.Fatal("wrong identity launched renewal")
+		return nil
+	}); err == nil {
+		t.Fatal("wrong certificate identity accepted")
 	}
 }

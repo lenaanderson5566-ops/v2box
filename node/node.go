@@ -149,7 +149,7 @@ func (n *Node) ReportConfigurationContext(parent context.Context, code string) e
 			if c.info.Common.DomainTransition != nil {
 				id = c.info.Common.DomainTransition.ID
 			}
-			if err := c.apiClient.ReportConfiguration(ctx, c.info.ConfigurationHash, code, c.info.CertificateFingerprint, id); err != nil && id != "" {
+			if err := c.reportCurrentConfiguration(ctx, code, id); err != nil && id != "" {
 				transitionError = errors.Join(transitionError, err)
 			}
 		}
@@ -184,10 +184,20 @@ func (n *Node) ConfirmPublication(next *Node) bool {
 			return false
 		}
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
 	for i, info := range n.NodeInfos {
-		next.NodeInfos[i].CertificateFingerprint = info.CertificateFingerprint
+		fingerprint := info.CertificateFingerprint
+		if i < len(n.controllers) && n.controllers[i] != nil {
+			n.controllers[i].updateReceipt(next.NodeInfos[i].ConfigurationHash, "")
+			// The temporary candidate does not own the listener/certificate.
+			// Publish through the serving controller's lock and API client so a
+			// concurrent renewal cannot be followed by its stale fingerprint.
+			_ = n.controllers[i].reportCurrentConfiguration(ctx, "")
+			fingerprint = n.controllers[i].currentCertificateFingerprint()
+		}
+		next.NodeInfos[i].CertificateFingerprint = fingerprint
 	}
-	_ = next.ReportConfiguration("")
 	return true
 }
 

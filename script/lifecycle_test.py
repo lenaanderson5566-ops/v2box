@@ -742,6 +742,61 @@ esac
         self.assertFalse(self.active.exists())
         self.preserved()
 
+    def test_deployment_cancel_does_not_wait_on_the_workers_deployment_locks(self):
+        import fcntl
+        state=self.config/'deployment-state.json';state.write_text('retain selected private task')
+        self.write(self.lib/'panel-deploy.py','''#!/usr/bin/env python3
+import json,os,sys
+from pathlib import Path
+if sys.argv[1]=='--capabilities':print(json.dumps({'features':['reboot-recovery-v1']}))
+else:
+ assert sys.argv[1:] == ['--cancel']
+ Path(os.environ['TEST_ROOT'],'deployment-cancelled').touch()
+''')
+        with (self.config/'.bootstrap.lock').open('w') as bootstrap, (self.config/'.deployment.lock').open('w') as deployment:
+            fcntl.flock(bootstrap,fcntl.LOCK_EX|fcntl.LOCK_NB)
+            fcntl.flock(deployment,fcntl.LOCK_EX|fcntl.LOCK_NB)
+            result=self.run_script(self.root/'usr/local/bin/v2box','deploy-cancel')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertTrue((self.root/'deployment-cancelled').exists())
+        self.assertEqual(state.read_text(),'retain selected private task')
+        self.assertTrue(self.active.exists());self.preserved()
+
+    def test_deployment_cancel_without_new_helper_stops_legacy_transient(self):
+        self.write(self.bin/'systemctl','''#!/bin/bash
+echo "$*" >> "$TEST_ROOT/service-calls"
+if [[ "$1" == show ]]; then echo yes; fi
+if [[ "$1" == disable ]]; then exit 1; fi
+''')
+        result=self.run_script(self.root/'usr/local/bin/v2box','deploy-cancel')
+        self.assertEqual(result.returncode,0,result.stderr)
+        calls=(self.root/'service-calls').read_text().splitlines()
+        self.assertIn('stop v2box-deployment.service',calls)
+        self.assertFalse(any(line.startswith('disable ') for line in calls))
+        self.assertTrue(self.active.exists());self.preserved()
+
+    def test_uninstall_disables_persistent_deployment_before_removing_programs(self):
+        unit=self.root/'etc/systemd/system/v2box-deployment.service';unit.write_text('persistent deployment fixture')
+        state=self.config/'deployment-state.json';state.write_text('retain selected private task')
+        result=self.run_script(self.root/'usr/local/bin/v2box','uninstall','--yes')
+        self.assertEqual(result.returncode,0,result.stderr)
+        calls=(self.root/'service-calls').read_text().splitlines()
+        self.assertLess(calls.index('disable --now v2box-deployment.service'),calls.index('disable --now v2box'))
+        self.assertFalse((self.lib/'v2box').exists())
+        self.assertEqual(state.read_text(),'retain selected private task');self.preserved()
+
+    def test_failed_persistent_deployment_disable_stops_uninstall_before_program_removal(self):
+        (self.root/'etc/systemd/system/v2box-deployment.service').write_text('persistent deployment fixture')
+        self.write(self.bin/'systemctl','''#!/bin/bash
+echo "$*" >> "$TEST_ROOT/service-calls"
+if [[ "$*" == 'disable --now v2box-deployment.service' ]]; then exit 1; fi
+exit 0
+''')
+        result=self.run_script(self.root/'usr/local/bin/v2box','uninstall','--yes')
+        self.assertNotEqual(result.returncode,0)
+        self.assertTrue((self.lib/'v2box').exists())
+        self.assertTrue(self.active.exists());self.preserved()
+
     def test_failed_stop_never_removes_running_program(self):
         (self.root/'fail-stop').touch()
         r = self.run_script(self.root/'usr/local/bin/v2box', 'uninstall', '--yes')

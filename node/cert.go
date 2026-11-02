@@ -22,7 +22,18 @@ import (
 )
 
 func (c *Controller) renewCertTask(ctx context.Context) error {
+	return c.renewCertificate(ctx, runACME)
+}
+
+func automaticCertificate(cert *panel.CertInfo) bool {
+	return cert != nil && (cert.CertMode == "dns" || cert.CertMode == "http")
+}
+
+func (c *Controller) renewCertificate(ctx context.Context, acquire func(context.Context, *panel.CertInfo, bool) error) error {
 	cert := c.info.Common.CertInfo
+	if !automaticCertificate(cert) {
+		return nil
+	}
 	pem, err := os.ReadFile(cert.CertFile)
 	if err != nil {
 		return err
@@ -34,9 +45,30 @@ func (c *Controller) renewCertTask(ctx context.Context) error {
 	if !due {
 		return nil
 	}
-	err = runACME(ctx, cert, true)
+	err = acquire(ctx, cert, true)
 	if err != nil {
 		log.WithField("tag", c.tag).WithError(err).Warn("Certificate renewal paused or failed; existing certificate retained")
+		return nil
+	}
+	certPEM, err := os.ReadFile(cert.CertFile)
+	if err != nil {
+		return err
+	}
+	keyPEM, err := os.ReadFile(cert.KeyFile)
+	if err != nil {
+		return err
+	}
+	fingerprint, err := validateCertificate(certPEM, keyPEM, cert.CertDomain, true, false)
+	if err != nil {
+		return err
+	}
+	c.updateReceipt("", fingerprint)
+	if c.apiClient != nil {
+		// Store the latest receipt even if this request fails: the normal
+		// capabilities poll retries it without restarting the working listener.
+		if err := c.reportCurrentConfiguration(ctx, ""); err != nil {
+			log.WithField("tag", c.tag).Warn("Renewed certificate receipt pending; certificate remains active")
+		}
 	}
 
 	return nil
@@ -93,6 +125,10 @@ func (c *Controller) requestCert() error {
 }
 
 func (c *Controller) requestCertContext(ctx context.Context) error {
+	return c.prepareCertificate(ctx, runACME)
+}
+
+func (c *Controller) prepareCertificate(ctx context.Context, acquire func(context.Context, *panel.CertInfo, bool) error) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -142,7 +178,7 @@ func (c *Controller) requestCertContext(ctx context.Context) error {
 			}
 			switch cert.CertMode {
 			case "dns", "http":
-				if err := runACME(ctx, cert, false); err != nil {
+				if err := acquire(ctx, cert, false); err != nil {
 					return err
 				}
 			case "self":
@@ -167,11 +203,37 @@ func (c *Controller) requestCertContext(ctx context.Context) error {
 			return err
 		}
 	}
+	// The periodic task starts only after a listener is prepared. A certificate
+	// which expired while the service was stopped must therefore be renewed here,
+	// or every restart would reject it before automatic maintenance can run.
+	// A still-valid pair starts immediately; its first maintenance tick checks
+	// the normal renewal window without delaying service on an ACME outage.
+	if automaticCertificate(cert) {
+		if block, _ := pem.Decode(certPEM); block != nil {
+			if leaf, err := x509.ParseCertificate(block.Bytes); err == nil && !time.Now().Add(time.Minute).Before(leaf.NotAfter) {
+				if _, err := renewalResource(cert); err != nil {
+					return err
+				}
+				if err := acquire(ctx, cert, true); err != nil {
+					return err
+				}
+				certPEM, err = os.ReadFile(cert.CertFile)
+				if err != nil {
+					return err
+				}
+				keyPEM, err = os.ReadFile(cert.KeyFile)
+				if err != nil {
+					return err
+				}
+			}
+		}
+	}
 	fingerprint, err := validateCertificate(certPEM, keyPEM, cert.CertDomain, cert.CertMode != "self" && cert.CertMode != "remote", transition == nil && cert.CertMode == "remote")
 	if err != nil {
 		return fmt.Errorf("certificate verification failed: %w", err)
 	}
 	c.info.CertificateFingerprint = fingerprint
+	c.updateReceipt("", fingerprint)
 	c.certPrepared = true
 	return nil
 }

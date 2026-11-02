@@ -34,7 +34,7 @@ func runManager(path string, args []string) error {
 }
 
 func init() {
-	for _, name := range []string{"start", "stop", "restart", "status", "enable", "disable", "log", "ip", "credential", "ddns", "update", "uninstall", "resume"} {
+	for _, name := range []string{"start", "stop", "restart", "status", "enable", "disable", "log", "ip", "credential", "ddns", "update", "uninstall", "resume", "deploy-status", "deploy-log", "deploy-cancel"} {
 		command.AddCommand(&cobra.Command{Use: name, Short: "Manage installed V2Box: " + name, DisableFlagParsing: true,
 			RunE: func(cmd *cobra.Command, args []string) error {
 				return runManager(managerPath, append([]string{cmd.Name()}, args...))

@@ -41,24 +41,30 @@ func (c *Controller) startTasks(node *panel.NodeInfo) {
 		Execute:      func(ctx context.Context) error { c.reportTargetStatistics(ctx); return nil },
 	}
 	_ = c.targetReportPeriodic.Start(true)
-	if node.Security == panel.Tls {
-		switch c.info.Common.CertInfo.CertMode {
-		case "none", "", "file", "self", "remote":
-		default:
-			c.renewCertPeriodic = &task.Task{
-				Name:     "renewCertTask",
-				Interval: time.Hour * 24,
-				Execute:  c.renewCertTask,
-				ReloadCh: c.server.ReloadCh,
-			}
-			log.WithField("tag", c.tag).Info("Start renew cert")
-			// delay to start renewCert
-			_ = c.renewCertPeriodic.Start(true)
+	if node.Security == panel.Tls && automaticCertificate(c.info.Common.CertInfo) {
+		c.renewCertPeriodic = &task.Task{
+			Name:     "renewCertTask",
+			Interval: time.Hour,
+			Execute:  c.renewCertTask,
+			ReloadCh: c.server.ReloadCh,
 		}
+		log.WithField("tag", c.tag).Info("Start renew cert")
+		// delay to start renewCert
+		_ = c.renewCertPeriodic.Start(true)
 	}
 }
 
 func (c *Controller) nodeInfoMonitor(ctx context.Context) (err error) {
+	// Authorization must not wait for a valid replacement configuration. Keep
+	// the currently serving listener up to date even while reloads are rejected
+	// or the configuration endpoint is unavailable. Conversely, an ordinary
+	// users/alive error must not prevent configuration recovery.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := c.refreshUsers(ctx); err != nil {
+		return err
+	}
 	// A failed budget refresh preserves the last local restriction.
 	if budget, budgetErr := c.apiClient.GetTrafficBudget(ctx); budgetErr == nil {
 		snapshot := c.server.SetTrafficBudget(c.tag, budget)
@@ -69,7 +75,11 @@ func (c *Controller) nodeInfoMonitor(ctx context.Context) (err error) {
 		log.WithField("tag", c.tag).WithError(budgetErr).Error("Refresh traffic budget failed")
 	}
 	// get node info
+	// GetNodeInfo also republishes the cached receipt. Order it with renewal
+	// receipts so a slow earlier announcement cannot overwrite a newer pair.
+	c.receiptMu.Lock()
 	newN, err := c.apiClient.GetNodeInfo(ctx)
+	c.receiptMu.Unlock()
 	if err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return err
@@ -83,7 +93,8 @@ func (c *Controller) nodeInfoMonitor(ctx context.Context) (err error) {
 	if completedTransitionOnly(c.info, newN) {
 		// Publication removes candidate metadata but does not change listeners.
 		// Acknowledge the final hash without disconnecting clients a second time.
-		_ = c.apiClient.ReportConfiguration(ctx, newN.ConfigurationHash, "", c.info.CertificateFingerprint)
+		c.updateReceipt(newN.ConfigurationHash, "")
+		_ = c.reportCurrentConfiguration(ctx, "")
 		c.reloadPending = false
 		newN = nil
 	}
@@ -107,12 +118,16 @@ func (c *Controller) nodeInfoMonitor(ctx context.Context) (err error) {
 		return nil
 	}
 	log.WithField("tag", c.tag).Debug("Node info no change")
+	return nil
+}
 
+// Refresh authorization independently of configuration changes/retries.
+func (c *Controller) refreshUsers(ctx context.Context) error {
 	// get user info
 	newU, err := c.apiClient.GetUserList(ctx)
 	if err != nil {
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			return err
+		if ctx.Err() != nil {
+			return ctx.Err()
 		}
 		log.WithFields(log.Fields{
 			"tag": c.tag,
@@ -140,8 +155,8 @@ func (c *Controller) nodeInfoMonitor(ctx context.Context) (err error) {
 	// Refresh counts even on a 304 user response; failures retain prior limits.
 	newA, err := c.apiClient.GetUserAlive(ctx)
 	if err != nil {
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			return err
+		if ctx.Err() != nil {
+			return ctx.Err()
 		}
 		log.WithFields(log.Fields{
 			"tag": c.tag,

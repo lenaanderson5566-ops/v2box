@@ -130,6 +130,10 @@ func TestUserRevocationSurvivesOnlineCountFailure(t *testing.T) {
 func TestNativeRuleOnlyChangeRequestsReload(t *testing.T) {
 	var changed atomic.Bool
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/server/UniProxy/user" {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
 		if r.URL.Path != "/api/v2/server/config" {
 			t.Errorf("unexpected request: %s", r.URL.Path)
 			w.WriteHeader(404)
@@ -171,6 +175,10 @@ func TestNativeRuleOnlyChangeRequestsReload(t *testing.T) {
 func TestRejectedReloadIsRetriedWithoutConfigChange(t *testing.T) {
 	calls := 0
 	s := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/server/UniProxy/user" {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
 		calls++
 		if calls > 1 {
 			w.WriteHeader(304)

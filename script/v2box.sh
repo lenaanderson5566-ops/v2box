@@ -225,6 +225,10 @@ case "$1" in
       fi
       [[ "$answer" == uninstall ]] || { echo 'Uninstall cancelled.'; exit 1; }
     fi
+    if using_systemd && [[ -e /etc/systemd/system/v2box-deployment.service || -L /etc/systemd/system/v2box-deployment.service ]]; then
+      [[ -f /etc/systemd/system/v2box-deployment.service && ! -L /etc/systemd/system/v2box-deployment.service ]] || { echo 'Unsafe deployment service file; uninstall stopped before deleting programs.' >&2; exit 1; }
+      run_service systemctl disable --now v2box-deployment.service
+    fi
     if $stop_network; then
       if [[ -s /usr/local/lib/node-network/node-network.py ]]; then
         run_service python3 /usr/local/lib/node-network/node-network.py disable
@@ -309,6 +313,18 @@ case "$1" in
       esac
     fi
     case "$action" in start|restart) verify_service active;; stop) verify_service stopped;; esac;;
+  deploy-cancel)
+    [[ $EUID -eq 0 && $# -eq 1 ]] || { echo 'Run as root: v2box deploy-cancel' >&2; exit 1; }
+    using_systemd || { echo 'Automatic reboot recovery requires systemd. Stop the foreground deployment with Ctrl+C; private state and certificates remain.' >&2; exit 1; }
+    require_timeout
+    if [[ -f /usr/local/lib/v2box/panel-deploy.py && ! -L /usr/local/lib/v2box/panel-deploy.py ]] && timeout -k 2 10 python3 /usr/local/lib/v2box/panel-deploy.py --capabilities 7>&- 8>&- 9>&- 2>/dev/null | jq -e '.features | index("reboot-recovery-v1") != null' >/dev/null; then
+      run_service python3 /usr/local/lib/v2box/panel-deploy.py --cancel
+    else
+      capture_service systemctl show --property=Transient --value v2box-deployment.service
+      if [[ "$service_output" == yes ]]; then run_service systemctl stop v2box-deployment.service
+      else run_service systemctl disable --now v2box-deployment.service; fi
+      echo 'Automatic deployment recovery disabled. Private state, configuration and certificates retained; resume explicitly using the panel command.'
+    fi;;
   deploy-status)
     using_systemd || { echo 'Managed deployment requires systemd. Check the foreground deployment output.'; exit 1; }
     SYSTEMD_PAGER=cat timeout -k 2 10 systemctl status v2box-deployment --no-pager -l;;
@@ -337,6 +353,6 @@ case "$1" in
     timeout -k 5 180 python3 /usr/local/lib/v2box/node-credentials.py 7>&- 8>&- 9>&-;;
   ddns) shift; require_timeout; exec timeout -k 15 600 python3 /usr/local/lib/v2box/node-network.py "${@:-status}";;
   version|server|capabilities) exec "$binary" "$@";;
-  help) echo 'Usage: v2box {start|stop|restart|reload|status|enable|disable|log|version|server|ip|credential|share-listener GROUP NODE_NUMBER...|ddns|resume|deploy-status|deploy-log|update [release-tag]|uninstall [--stop-network] [--yes]|help}';;
+  help) echo 'Usage: v2box {start|stop|restart|reload|status|enable|disable|log|version|server|ip|credential|share-listener GROUP NODE_NUMBER...|ddns|resume|deploy-status|deploy-log|deploy-cancel|update [release-tag]|uninstall [--stop-network] [--yes]|help}';;
   *) echo 'Unknown command. Run: v2box help'; exit 1;;
 esac

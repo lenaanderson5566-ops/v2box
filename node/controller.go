@@ -4,6 +4,8 @@ import (
 	"context"
 
 	"fmt"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	panel "github.com/lenaanderson5566-ops/v2box/api/v2board"
@@ -15,18 +17,22 @@ import (
 )
 
 type Controller struct {
-	server                  *core.V2Core
-	apiClient               *panel.Client
-	tag                     string
-	limiter                 *limiter.Limiter
-	userList                []panel.UserInfo
-	certPrepared            bool
-	usersPrepared           bool
-	preparedBudget          *panel.TrafficBudget
-	reloadPending           bool
-	aliveMap                map[int]int
-	conf                    *conf.NodeConfig
-	info                    *panel.NodeInfo
+	server         *core.V2Core
+	apiClient      *panel.Client
+	tag            string
+	limiter        *limiter.Limiter
+	userList       []panel.UserInfo
+	certPrepared   bool
+	usersPrepared  bool
+	preparedBudget *panel.TrafficBudget
+	reloadPending  bool
+	aliveMap       map[int]int
+	conf           *conf.NodeConfig
+	info           *panel.NodeInfo
+	// Certificate maintenance and configuration polling run independently.
+	// Keep local receipt metadata outside the immutable panel configuration.
+	appliedReceipt          atomic.Pointer[configurationReceipt]
+	receiptMu               sync.Mutex
 	nodeInfoMonitorPeriodic *task.Task
 	userReportPeriodic      *task.Task
 	targetReportPeriodic    *task.Task
@@ -37,6 +43,55 @@ type Controller struct {
 	targetRetryAt     time.Time
 	targetRetryDelay  time.Duration
 	renewCertPeriodic *task.Task
+}
+
+type configurationReceipt struct {
+	hash, fingerprint string
+}
+
+func (c *Controller) currentReceipt() configurationReceipt {
+	if receipt := c.appliedReceipt.Load(); receipt != nil {
+		return *receipt
+	}
+	return configurationReceipt{c.info.ConfigurationHash, c.info.CertificateFingerprint}
+}
+
+// Each task updates only its own field, preserving a concurrent certificate
+// renewal or final configuration publication in the same atomic snapshot.
+func (c *Controller) updateReceipt(hash, fingerprint string) configurationReceipt {
+	for {
+		previous := c.appliedReceipt.Load()
+		next := configurationReceipt{c.info.ConfigurationHash, c.info.CertificateFingerprint}
+		if previous != nil {
+			next = *previous
+		}
+		if hash != "" {
+			next.hash = hash
+		}
+		if fingerprint != "" {
+			next.fingerprint = fingerprint
+		}
+		if c.appliedReceipt.CompareAndSwap(previous, &next) {
+			return next
+		}
+	}
+}
+
+func (c *Controller) currentCertificateFingerprint() string {
+	return c.currentReceipt().fingerprint
+}
+
+func (c *Controller) reportCurrentConfiguration(ctx context.Context, code string, transitionID ...string) error {
+	// Serialize sends as well as the snapshot: a slower earlier renewal receipt
+	// must not overwrite a later final-publication receipt in the API client.
+	c.receiptMu.Lock()
+	defer c.receiptMu.Unlock()
+	receipt := c.currentReceipt()
+	fingerprint := []string{receipt.fingerprint}
+	if len(transitionID) > 0 {
+		fingerprint = append(fingerprint, transitionID[0])
+	}
+	return c.apiClient.ReportConfiguration(ctx, receipt.hash, code, fingerprint...)
 }
 
 // NewController return a Node controller with default parameters.
