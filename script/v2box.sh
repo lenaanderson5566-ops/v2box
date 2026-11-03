@@ -34,6 +34,16 @@ trap cleanup_child EXIT
 trap 'handle_signal 130' INT
 trap 'handle_signal 143' TERM
 using_systemd() { [[ -d /run/systemd/system ]] && command -v systemctl >/dev/null; }
+trusted_path() {
+  local owner mode
+  [[ ! -L "$1" && ( -d "$1" || -f "$1" ) ]] || return 1
+  read -r owner mode < <(stat -c '%u %a' -- "$1") || return 1
+  [[ "$owner" == "$(id -u)" && "$mode" =~ ^[0-7]{3,4}$ ]] && (( (8#$mode & 0022) == 0 ))
+}
+trusted_helper() {
+  local directory=${1%/*}
+  [[ -d "$directory" && -f "$1" ]] && trusted_path "$directory" && trusted_path "$1"
+}
 require_timeout() {
   command -v timeout >/dev/null && timeout --foreground 1 true </dev/null 7>&- 8>&- 9>&- || {
     echo 'GNU coreutils timeout is required. Use the latest panel bootstrap to repair dependencies (including on OpenRC/Alpine).' >&2; return 1;
@@ -95,24 +105,39 @@ legacy_installer_restart() {
   [[ "${self_fields[1]:-}" == "$PPID" ]]
 }
 lock_operation() {
+  local lock
   [[ $EUID -eq 0 && $(uname -s) == Linux ]] || { echo 'Run as root on Linux' >&2; return 1; }
+  umask 077
   for tool in install flock timeout; do command -v "$tool" >/dev/null || { echo "Required command is missing: $tool" >&2; return 1; }; done
   require_timeout
   [[ ! -L /etc/v2box && ! -L /etc/v2box/.bootstrap.lock && ! -L /etc/v2box/.deployment.lock && ! -L /etc/v2box/.maintenance.lock && ! -L /usr/local/lib/v2box ]] || { echo 'Refusing symlinked installation paths' >&2; return 1; }
-  install -d -m 755 /etc/v2box
+  if [[ ! -e /etc/v2box ]]; then install -d -m 755 /etc/v2box; fi
+  [[ -d /etc/v2box ]] && trusted_path /etc/v2box || { echo 'Unsafe deployment state directory.' >&2; return 1; }
+  if [[ -e /usr/local/lib/v2box ]]; then
+    [[ -d /usr/local/lib/v2box ]] && trusted_path /usr/local/lib/v2box || { echo 'Unsafe V2Box program directory.' >&2; return 1; }
+  fi
+  for lock in /etc/v2box/.bootstrap.lock /etc/v2box/.deployment.lock /etc/v2box/.maintenance.lock; do
+    if [[ -e "$lock" ]]; then
+      [[ -f "$lock" ]] && trusted_path "$lock" || { echo 'Unsafe deployment or maintenance lock.' >&2; return 1; }
+    fi
+  done
+  case "${1:-}" in
+    start|stop|restart|reload) ;;
+    *) unset V2BOX_BOOTSTRAP_LOCK_HELD V2BOX_DEPLOYMENT_LOCK_HELD;;
+  esac
   if legacy_installer_restart "${1:-}" 2>/dev/null; then return 0; fi
   # A panel worker may delegate only the locks it already holds. Child service
   # processes must never retain these descriptors after this command exits.
   if [[ "${V2BOX_BOOTSTRAP_LOCK_HELD:-}" != 1 ]]; then
-    exec 9>/etc/v2box/.bootstrap.lock
+    exec 9>>/etc/v2box/.bootstrap.lock
     flock -n 9 || { echo 'Another deployment or maintenance operation is running.' >&2; return 1; }
   fi
   if [[ "${V2BOX_DEPLOYMENT_LOCK_HELD:-}" != 1 ]]; then
-    exec 7>/etc/v2box/.deployment.lock
+    exec 7>>/etc/v2box/.deployment.lock
     flock -n 7 || { echo 'Deployment is actively running; retry after it finishes.' >&2; return 1; }
   fi
   unset V2BOX_BOOTSTRAP_LOCK_HELD V2BOX_DEPLOYMENT_LOCK_HELD
-  exec 8>/etc/v2box/.maintenance.lock
+  exec 8>>/etc/v2box/.maintenance.lock
   flock -n 8 || { echo 'Another maintenance operation is running.' >&2; return 1; }
 }
 run_service() {
@@ -164,18 +189,21 @@ require_enrolled_config() {
     return 1
   fi
 }
+runtime_matches_installation() {
+  [[ "$1" =~ ^[1-9][0-9]*$ && -x "$binary" && "/proc/$1/exe" -ef "$binary" ]] && trusted_helper "$binary"
+}
 check_runtime() {
-  local pid=''
+  runtime_pid=''
   if using_systemd; then
     capture_service systemctl show v2box --property=MainPID --value || return 1
-    pid=$service_output
-    [[ "$pid" != 0 && -n "$pid" ]] || return 0
+    runtime_pid=$service_output
+    if [[ "$runtime_pid" == 0 ]]; then runtime_pid=''; return 0; fi
   else
     [[ -f /run/v2box.pid && ! -L /run/v2box.pid ]] || return 0
-    read -r pid < /run/v2box.pid
+    read -r runtime_pid < /run/v2box.pid || return 1
   fi
-  [[ "$pid" =~ ^[1-9][0-9]*$ && -x /proc/$pid/exe ]] || { echo 'Cannot verify running V2Box identity; existing nodes preserved.' >&2; return 1; }
-  timeout -k 2 10 /proc/"$pid"/exe capabilities 7>&- 8>&- 9>&- | jq -e --arg required "${1:-multi-panel-v1}" '.features | index("multi-panel-v1") != null and index("reload-signal-v1") != null and index($required) != null' >/dev/null || {
+  runtime_matches_installation "$runtime_pid" || { echo 'Cannot verify running V2Box identity; existing nodes preserved. Check the service and installed version.' >&2; return 1; }
+  timeout -k 2 10 "$binary" capabilities 7>&- 8>&- 9>&- | jq -e --arg required "${1:-multi-panel-v1}" '.features | index("multi-panel-v1") != null and index("reload-signal-v1") != null and index($required) != null' >/dev/null || {
     echo 'Running V2Box lacks independent multi-panel reload. Upgrade it in a maintenance window before deploying another node.' >&2; return 1;
   }
 }
@@ -185,24 +213,33 @@ case "$1" in
   update)
     shift
     (($# <= 1)) || { echo 'Usage: v2box update [release-tag]' >&2; exit 1; }
-    [[ -s /usr/local/lib/v2box/install.sh && ! -L /usr/local/lib/v2box/install.sh ]] || { echo 'Update installer is missing or unsafe. Download the current panel bootstrap and use --install with the published version to repair program files; configuration and certificates remain.' >&2; exit 1; }
+    [[ $EUID -eq 0 ]] || { echo 'Run as root: v2box update' >&2; exit 1; }
+    [[ -s /usr/local/lib/v2box/install.sh ]] && trusted_helper /usr/local/lib/v2box/install.sh || { echo 'Update installer is missing or unsafe. Download the current panel bootstrap and use --install with the published version to repair program files; configuration and certificates remain.' >&2; exit 1; }
+    unset V2BOX_BOOTSTRAP_LOCK_HELD V2BOX_DEPLOYMENT_LOCK_HELD
     exec bash /usr/local/lib/v2box/install.sh --update "$@";;
   resume)
     [[ $EUID -eq 0 && $# -eq 1 ]] || { echo 'Run as root: v2box resume' >&2; exit 1; }
+    umask 077
     require_timeout
     [[ -x "$binary" ]] || { echo 'V2Box is uninstalled; reinstall program files before resuming. Configuration and certificates remain.' >&2; exit 1; }
+    [[ -d /etc/v2box ]] && trusted_path /etc/v2box || { echo 'Unsafe deployment state directory.' >&2; exit 1; }
+    lock=/etc/v2box/.bootstrap.lock
+    if [[ -e "$lock" || -L "$lock" ]]; then
+      [[ -f "$lock" ]] && trusted_path "$lock" || { echo 'Unsafe deployment lock.' >&2; exit 1; }
+    fi
+    exec 9>>"$lock"
+    flock -n 9 || { echo 'Another deployment or maintenance operation is running.' >&2; exit 1; }
     shopt -s nullglob
     states=(/etc/v2box/deployment-state*.json)
     ((${#states[@]} > 0)) || { echo 'No pending deployment.'; exit 0; }
     ((${#states[@]} == 1)) || { echo 'Multiple pending deployments. Re-run the original panel command to resume its selected node.' >&2; exit 1; }
-    [[ -f /usr/local/lib/v2box/panel-deploy.py && ! -L /usr/local/lib/v2box/panel-deploy.py ]] || { echo 'Update the panel, then download its current bootstrap and run it with --resume. Deployment state and configuration were retained.' >&2; exit 1; }
+    trusted_path "${states[0]}" && [[ -f "${states[0]}" && ! -L /etc/v2box/.deployment.lock ]] || { echo 'Unsafe deployment state or lock.' >&2; exit 1; }
+    trusted_helper /usr/local/lib/v2box/panel-deploy.py || { echo 'Deployment helper is missing or unsafe. Download the current panel bootstrap and run it with --resume.' >&2; exit 1; }
     timeout -k 2 10 python3 /usr/local/lib/v2box/panel-deploy.py --capabilities 7>&- 8>&- 9>&- 2>/dev/null | jq -e '.features | index("management-lock-delegation-v1") != null' >/dev/null || {
       echo 'Deployment helper lacks management lock delegation. Update the panel, then re-download its current bootstrap and run it with --resume. Deployment state, configuration and certificates were retained.' >&2; exit 1;
     }
-    [[ ! -L /etc/v2box/.deployment.lock && ! -L /etc/v2box && ! -L /etc/v2box/.bootstrap.lock ]] || { echo 'Refusing symlinked deployment paths' >&2; exit 1; }
-    exec 9>/etc/v2box/.bootstrap.lock
-    flock -n 9 || { echo 'Another deployment or maintenance operation is running.' >&2; exit 1; }
     check_runtime
+    trusted_helper /usr/local/lib/v2box/node-network.py || { echo 'Reporting helper is missing or unsafe. Repair the node installation before resuming.' >&2; exit 1; }
     timeout -k 2 10 python3 /usr/local/lib/v2box/node-network.py capabilities | jq -e '.features | index("report-multi-target-v1") != null' >/dev/null || { echo 'Reporting helper lacks multi-target support; update node scripts before resuming.' >&2; exit 1; }
     exec python3 /usr/local/lib/v2box/panel-deploy.py --managed "${states[0]}";;
   uninstall)
@@ -230,7 +267,8 @@ case "$1" in
       run_service systemctl disable --now v2box-deployment.service
     fi
     if $stop_network; then
-      if [[ -s /usr/local/lib/node-network/node-network.py ]]; then
+      if [[ -e /usr/local/lib/node-network/node-network.py || -L /usr/local/lib/node-network/node-network.py ]]; then
+        trusted_helper /usr/local/lib/node-network/node-network.py || { echo 'Unsafe IP reporting helper; uninstall stopped before deleting programs.' >&2; exit 1; }
         run_service python3 /usr/local/lib/node-network/node-network.py disable
       elif using_systemd; then
         echo 'IP reporting helper is missing; stopping its systemd schedule directly. Reporting settings and DNS records are retained.'
@@ -241,13 +279,33 @@ case "$1" in
       fi
     fi
     if using_systemd; then
-      active=false
-      if run_service systemctl is-active --quiet v2box; then active=true;
-      else state=$?; [[ $state == 3 || $state == 4 ]] || { echo 'Cannot verify service state; removal stopped before deleting programs.' >&2; exit "$state"; }; fi
-      if [[ -f /etc/systemd/system/v2box.service ]] || $active; then
+      read_uninstall_state() {
+        local name value
+        load_state= active_state= main_pid=
+        capture_service systemctl show v2box --property=LoadState,ActiveState,MainPID || return 1
+        while IFS='=' read -r name value; do
+          case "$name" in
+            LoadState) load_state=$value;;
+            ActiveState) active_state=$value;;
+            MainPID) main_pid=$value;;
+          esac
+        done <<< "$service_output"
+        if [[ "$load_state" == not-found ]]; then
+          [[ "$active_state" == inactive && "${main_pid:-0}" == 0 ]] || return 1
+          main_pid=0
+          return 0
+        fi
+        [[ ( "$load_state" == loaded || "$load_state" == masked ) && -n "$active_state" && "$main_pid" =~ ^[0-9]+$ ]]
+      }
+      read_uninstall_state || { echo 'Cannot verify service state; removal stopped before deleting programs.' >&2; exit 1; }
+      if [[ "$load_state" != not-found ]]; then
         run_service systemctl disable --now v2box
-        if run_service systemctl is-active --quiet v2box; then echo 'Service is still running; removal stopped.' >&2; exit 1;
-        else state=$?; [[ $state == 3 || $state == 4 ]] || { echo 'Cannot verify the service stopped; program files retained.' >&2; exit "$state"; }; fi
+        if ! read_uninstall_state || [[ "$main_pid" != 0 || ( "$active_state" != inactive && "$active_state" != failed ) ]]; then
+          echo 'Cannot verify the service stopped; program files retained.' >&2
+          exit 1
+        fi
+      fi
+      if [[ -f /etc/systemd/system/v2box.service ]]; then
         rm -f -- /etc/systemd/system/v2box.service
         run_service systemctl daemon-reload
       fi
@@ -277,15 +335,14 @@ case "$1" in
     timeout -k 5 30 python3 /usr/local/lib/v2box/node-credentials.py --shared-listener "$@" 7>&- 8>&- 9>&-
     echo 'Initial shared-listener migration can replace the selected listeners. File watching may apply this immediately; otherwise run v2box reload. A stopped service stays stopped.';;
   reload)
-    lock_operation
+    lock_operation reload
     check_runtime
     if using_systemd; then
       run_service systemctl kill --kill-whom=main --signal=HUP v2box
     else
-      [[ -f /run/v2box.pid && ! -L /run/v2box.pid ]] || { echo 'V2Box is not running' >&2; exit 1; }
-      read -r pid < /run/v2box.pid
-      [[ "$pid" =~ ^[1-9][0-9]*$ ]] || exit 1
-      kill -HUP "$pid"
+      [[ -n "$runtime_pid" ]] || { echo 'V2Box is not running' >&2; exit 1; }
+      runtime_matches_installation "$runtime_pid" || { echo 'Cannot verify running V2Box identity; reload cancelled.' >&2; exit 1; }
+      kill -HUP "$runtime_pid"
     fi;;
   status)
     if using_systemd; then
@@ -317,7 +374,10 @@ case "$1" in
     [[ $EUID -eq 0 && $# -eq 1 ]] || { echo 'Run as root: v2box deploy-cancel' >&2; exit 1; }
     using_systemd || { echo 'Automatic reboot recovery requires systemd. Stop the foreground deployment with Ctrl+C; private state and certificates remain.' >&2; exit 1; }
     require_timeout
-    if [[ -f /usr/local/lib/v2box/panel-deploy.py && ! -L /usr/local/lib/v2box/panel-deploy.py ]] && timeout -k 2 10 python3 /usr/local/lib/v2box/panel-deploy.py --capabilities 7>&- 8>&- 9>&- 2>/dev/null | jq -e '.features | index("reboot-recovery-v1") != null' >/dev/null; then
+    if [[ -e /usr/local/lib/v2box/panel-deploy.py || -L /usr/local/lib/v2box/panel-deploy.py ]]; then
+      trusted_helper /usr/local/lib/v2box/panel-deploy.py || { echo 'Unsafe deployment helper; cancellation stopped.' >&2; exit 1; }
+    fi
+    if [[ -f /usr/local/lib/v2box/panel-deploy.py ]] && timeout -k 2 10 python3 /usr/local/lib/v2box/panel-deploy.py --capabilities 7>&- 8>&- 9>&- 2>/dev/null | jq -e '.features | index("reboot-recovery-v1") != null' >/dev/null; then
       run_service python3 /usr/local/lib/v2box/panel-deploy.py --cancel
     else
       capture_service systemctl show --property=Transient --value v2box-deployment.service

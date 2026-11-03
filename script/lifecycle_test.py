@@ -60,7 +60,13 @@ class LifecycleTest(unittest.TestCase):
         self.write(self.bin/'systemctl', '''#!/bin/sh
 echo "$*" >> "$TEST_ROOT/service-calls"
 case "$1" in
- show) if test -f "$TEST_ROOT/mainpid"; then cat "$TEST_ROOT/mainpid"; else echo 0; fi;;
+ show)
+   if test "$*" = 'show v2box --property=LoadState,ActiveState,MainPID'; then
+     if test -e "$TEST_ROOT/active"; then printf 'LoadState=loaded\nActiveState=active\nMainPID=123\n';
+     elif test -e "$TEST_ROOT/deactivating-after-disable"; then printf 'LoadState=loaded\nActiveState=deactivating\nMainPID=123\n';
+     elif test -f "$TEST_ROOT/etc/systemd/system/v2box.service" || test -f "$TEST_ROOT/usr/lib/systemd/system/v2box.service"; then printf 'LoadState=loaded\nActiveState=inactive\nMainPID=0\n';
+     else printf 'LoadState=not-found\nActiveState=inactive\nMainPID=0\n'; fi
+   elif test -f "$TEST_ROOT/mainpid"; then cat "$TEST_ROOT/mainpid"; else echo 0; fi;;
  is-active)
    if test -e "$TEST_ROOT/slow-polls"; then
      count=$(cat "$TEST_ROOT/slow-polls"); echo $((count+1)) > "$TEST_ROOT/slow-polls"
@@ -123,7 +129,8 @@ esac
 
     def test_reload_verifies_running_capabilities_without_restart(self):
         process=self.root/'proc/123';process.mkdir(parents=True)
-        self.write(process/'exe',"#!/bin/sh\necho '{\"features\":[\"multi-panel-v1\",\"reload-signal-v1\"]}'\n")
+        self.write(self.lib/'v2box',"#!/bin/sh\necho '{\"features\":[\"multi-panel-v1\",\"reload-signal-v1\"]}'\n")
+        (process/'exe').symlink_to(self.lib/'v2box')
         (self.root/'mainpid').write_text('123')
         result=subprocess.run(['bash',str(self.root/'usr/local/bin/v2box'),'reload'],env=self.env,capture_output=True,text=True)
         self.assertEqual(result.returncode,0,result.stderr)
@@ -145,6 +152,7 @@ esac
         (self.root/'mainpid').write_text('123')
         result = subprocess.run(['bash', str(self.root/'usr/local/bin/v2box'), 'share-listener', 'public', '1'], env=self.env, capture_output=True, text=True)
         self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Cannot verify running V2Box identity', result.stderr)
         self.assertEqual((self.config/'config.json').read_bytes(), self.original_config)
 
     def test_shared_listener_supported_program_preserves_stopped_service(self):
@@ -167,7 +175,7 @@ esac
 
     def test_reload_rejects_unsupported_running_binary(self):
         process=self.root/'proc/123';process.mkdir(parents=True)
-        self.write(process/'exe','#!/bin/sh\necho old-version\n');(self.root/'mainpid').write_text('123')
+        (process/'exe').symlink_to(self.lib/'v2box');(self.root/'mainpid').write_text('123')
         result=subprocess.run(['bash',str(self.root/'usr/local/bin/v2box'),'reload'],env=self.env,capture_output=True,text=True)
         self.assertNotEqual(result.returncode,0);self.assertIn('lacks independent',result.stderr)
         self.assertNotIn('kill ',(self.root/'service-calls').read_text());self.assertTrue(self.active.exists())
@@ -175,6 +183,25 @@ esac
         (self.root/'mainpid').write_text('not-a-pid')
         result=subprocess.run(['bash',str(self.root/'usr/local/bin/v2box'),'check-runtime'],env=self.env,capture_output=True,text=True)
         self.assertNotEqual(result.returncode,0);self.assertNotIn('kill ',(self.root/'service-calls').read_text())
+
+    def test_runtime_probe_never_executes_foreign_process_binary(self):
+        process = self.root/'proc/123'
+        process.mkdir(parents=True)
+        self.write(process/'exe', '''#!/bin/sh
+touch "$TEST_ROOT/foreign-binary-executed"
+echo '{"features":["multi-panel-v1","reload-signal-v1"]}'
+''')
+        (self.root/'mainpid').write_text('123')
+        (self.root/'run/v2box.pid').write_text('123\n')
+        for init in ('systemd', 'openrc'):
+            with self.subTest(init=init):
+                if init == 'openrc':
+                    (self.root/'run/systemd/system').rmdir()
+                result = self.run_script(self.root/'usr/local/bin/v2box', 'check-runtime')
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn('Cannot verify running V2Box identity', result.stderr)
+                self.assertFalse((self.root/'foreign-binary-executed').exists())
+        self.preserved()
 
     def package(self, missing=None, overrides=None):
         files = {'v2box': '#!/bin/sh\necho new-version\n',
@@ -339,7 +366,7 @@ esac
 
     def test_unknown_service_state_never_replaces_or_removes_programs(self):
         self.write(self.bin/'timeout','''#!/bin/sh
-if test "$4" = systemctl && test "$5" = is-active; then exit 124; fi
+if test "$4" = systemctl && { test "$5" = is-active || test "$5" = show; }; then exit 124; fi
 shift 3
 exec "$@"
 ''')
@@ -360,6 +387,29 @@ exec "$@"
         self.assertIn('timed out',r.stderr)
         self.assertTrue((self.lib/'v2box').exists())
         self.assertTrue((self.root/'etc/systemd/system/v2box.service').exists())
+        self.preserved()
+
+    def test_uninstall_preserves_programs_while_systemd_is_deactivating(self):
+        (self.root/'deactivating-after-disable').touch()
+        result = self.run_script(self.root/'usr/local/bin/v2box', 'uninstall', '--yes')
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn('Cannot verify the service stopped', result.stderr)
+        self.assertIn('disable --now v2box', (self.root/'service-calls').read_text())
+        self.assertTrue((self.lib/'v2box').exists())
+        self.assertTrue((self.root/'etc/systemd/system/v2box.service').exists())
+        self.preserved()
+
+    def test_uninstall_disables_inactive_vendor_unit_before_removing_programs(self):
+        vendor_unit = self.root/'usr/lib/systemd/system/v2box.service'
+        vendor_unit.parent.mkdir(parents=True)
+        vendor_unit.write_text('vendor unit')
+        (self.root/'etc/systemd/system/v2box.service').unlink()
+        self.active.unlink()
+        result = self.run_script(self.root/'usr/local/bin/v2box', 'uninstall', '--yes')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('disable --now v2box', (self.root/'service-calls').read_text())
+        self.assertFalse((self.lib/'v2box').exists())
+        self.assertEqual(vendor_unit.read_text(), 'vendor unit')
         self.preserved()
 
     def test_binary_version_timeout_never_installs_the_release(self):
@@ -404,6 +454,86 @@ exec /bin/cp "$@"
             self.assertIn('old-version', (self.lib/'v2box').read_text())
             self.preserved()
 
+    def test_update_checksum_must_name_the_downloaded_archive(self):
+        marker = self.root / 'candidate-ran'
+        self.package(overrides={'v2box': '#!/bin/sh\ntouch "$TEST_ROOT/candidate-ran"\necho new-version\n'})
+        digest = hashlib.sha256((self.root / 'release.zip').read_bytes()).hexdigest()
+        for manifest in (
+            hashlib.sha256(b'').hexdigest() + '  /dev/null\n',
+            digest + '  v2box-linux-amd64.zip\n' + digest + '  v2box-linux-amd64.zip\n',
+        ):
+            with self.subTest(manifest=manifest):
+                (self.root / 'release.zip.sha256').write_text(manifest)
+                result = self.install()
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertFalse(marker.exists())
+                self.assertIn('old-version', (self.lib / 'v2box').read_text())
+                self.preserved()
+
+    def test_update_ignores_curlrc_and_extracts_only_expected_files(self):
+        curl = self.bin / 'curl'
+        source = curl.read_text()
+        self.write(curl, source.replace("out=''", 'test "$1" = -q || exit 23\n' + "out=''", 1))
+        self.package(overrides={
+            'v2box': '#!/bin/sh\ntest ! -e "${0%/*}/unrelated" || exit 1\necho new-version\n',
+            'unrelated': 'not an installed release file',
+        })
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('new-version', (self.lib / 'v2box').read_text())
+
+    def test_update_rollback_does_not_follow_backup_or_restore_symlinks(self):
+        victim = self.root / 'retained-file'
+        victim.write_text('retain these bytes')
+        for filename in ('v2box.previous', 'v2box.restore'):
+            (self.lib / filename).symlink_to(victim)
+        (self.root / 'fail-start').touch()
+        result = self.install()
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn('restoring the previous program files', result.stderr)
+        self.assertNotIn('Rollback incomplete', result.stderr)
+        self.assertEqual(victim.read_text(), 'retain these bytes')
+        self.assertFalse((self.lib / 'v2box').is_symlink())
+        self.assertIn('old-version', (self.lib / 'v2box').read_text())
+        self.assertTrue(self.active.exists())
+        self.preserved()
+
+    def test_update_rejects_unsafe_staging_path(self):
+        destination = self.root / 'unrelated-directory'
+        destination.mkdir()
+        (self.lib / 'v2box.new').symlink_to(destination, target_is_directory=True)
+        result = self.install()
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn('unsafe installation staging path', result.stderr)
+        self.assertEqual(list(destination.iterdir()), [])
+        self.assertIn('old-version', (self.lib / 'v2box').read_text())
+
+    def test_update_creates_private_locks_with_permissive_caller_umask(self):
+        result = subprocess.run(
+            ['bash', '-c', 'umask 000; exec bash "$@"', 'fixture', str(self.installer), 'v-test', '--update'],
+            env=self.env, capture_output=True, text=True, timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for name in ('.bootstrap.lock', '.deployment.lock', '.maintenance.lock'):
+            self.assertEqual((self.config/name).stat().st_mode & 0o777, 0o600)
+
+    def test_update_rejects_fifo_locks_without_opening_them(self):
+        for filename in ('.bootstrap.lock', '.deployment.lock', '.maintenance.lock'):
+            with self.subTest(lock=filename):
+                path = self.config / filename
+                os.mkfifo(path)
+                try:
+                    result = self.install()
+                    self.assertNotEqual(result.returncode, 0, result.stdout)
+                    self.assertIn('unsafe installation file', result.stderr)
+                finally:
+                    path.unlink()
+        lock = self.config / '.maintenance.lock'
+        lock.write_text('existing lock file')
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(lock.read_text(), 'existing lock file')
+
     def test_pending_update_preserves_state_and_stopped_service(self):
         state = self.config/'deployment-state.json'
         state.write_text('pending')
@@ -446,6 +576,19 @@ else:raise AssertionError('Deployment state must not be read')
         self.assertIn('re-download',result.stderr);self.assertIn('--resume',result.stderr)
         self.assertEqual(state.read_text(),'pending')
         self.assertFalse((self.root/'service-calls').exists());self.preserved()
+
+    def test_resume_does_not_execute_writable_deployment_helper(self):
+        state = self.config/'deployment-state.json'
+        state.write_text('pending')
+        helper = self.lib/'panel-deploy.py'
+        marker = self.root/'helper-executed'
+        helper.write_text(f'from pathlib import Path\nPath({str(marker)!r}).touch()\n')
+        helper.chmod(0o666)
+        result = self.run_script(self.root/'usr/local/bin/v2box', 'resume')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Deployment helper is missing or unsafe', result.stderr)
+        self.assertFalse(marker.exists())
+        self.assertEqual(state.read_text(), 'pending')
 
     def test_repair_missing_program_preserves_pending_state_without_start(self):
         (self.config/'deployment-state.json').write_text('pending')

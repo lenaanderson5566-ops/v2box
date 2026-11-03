@@ -20,7 +20,6 @@ func (c *Controller) reportUserTrafficTask(ctx context.Context) (err error) {
 			log.WithField("tag", c.tag).WithError(saveErr).Error("Save traffic budget failed")
 		}
 	}
-	activity := c.server.TakeOnlineActivity(c.tag)
 	userTraffic, _ := c.server.GetUserTrafficSlice(c.tag, reportmin)
 	{
 		retained, reportErr := c.apiClient.ReportUserTrafficReliable(ctx, userTraffic)
@@ -47,7 +46,8 @@ func (c *Controller) reportUserTrafficTask(ctx context.Context) (err error) {
 			"tag": c.tag,
 			"err": err,
 		}).Info("Get online device failed")
-	} else if len(*onlineDevice) > 0 {
+	} else {
+		activity := c.server.TakeOnlineActivity(c.tag)
 		var result []panel.OnlineUser
 		for _, online := range *onlineDevice {
 			if activity[online.UID] >= int64(devicemin)*1000 {
@@ -59,20 +59,18 @@ func (c *Controller) reportUserTrafficTask(ctx context.Context) (err error) {
 			// json structure: { UID1:["ip1","ip2"],UID2:["ip3","ip4"] }
 			data[onlineuser.UID] = append(data[onlineuser.UID], onlineuser.IP)
 		}
-		if len(data) != 0 {
-			err := c.apiClient.ReportNodeOnlineUsers(ctx, &data)
-			if err != nil {
-
-				log.WithFields(log.Fields{
-					"tag": c.tag,
-					"err": err,
-				}).Info("Report online users failed")
-				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-					return err
-				}
+		// Each successful sample replaces this node's observation window,
+		// including the empty snapshot after users disconnect or fall idle.
+		if err := c.apiClient.ReportNodeOnlineUsers(ctx, &data); err != nil {
+			log.WithFields(log.Fields{
+				"tag": c.tag,
+				"err": err,
+			}).Info("Report online users failed")
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return err
 			}
 		}
-		log.WithField("tag", c.tag).Infof("Total %d online users, %d Reported", len(*onlineDevice), len(result))
+		log.WithField("tag", c.tag).Infof("Observed %d online devices; reported %d devices for %d users", len(*onlineDevice), len(result), len(data))
 	}
 
 	return nil

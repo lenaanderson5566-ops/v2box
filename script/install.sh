@@ -106,7 +106,17 @@ if [[ "$ddns" == true ]]; then
 fi
 [[ $EUID -eq 0 ]] || { echo 'Run as root' >&2; exit 1; }
 [[ $(uname -s) == Linux ]] || { echo 'This installer requires Linux' >&2; exit 1; }
+umask 077
 [[ ! -L /etc/v2box/.deployment.lock && ! -L /etc/v2box && ! -L /etc/v2box/config.json && ! -L /etc/v2box/.maintenance.lock && ! -L /etc/v2box/.bootstrap.lock && ! -L /usr/local/lib/v2box ]] || { echo 'Refusing symlinked installation paths' >&2; exit 1; }
+for path in /etc/v2box /usr/local/lib/v2box /etc/v2box/{config.json,.bootstrap.lock,.deployment.lock,.maintenance.lock}; do
+  [[ -e "$path" ]] || continue
+  case "$path" in
+    /etc/v2box|/usr/local/lib/v2box) [[ -d "$path" ]] || { echo "Refusing unsafe installation directory: $path" >&2; exit 1; };;
+    *) [[ -f "$path" ]] || { echo "Refusing unsafe installation file: $path" >&2; exit 1; };;
+  esac
+  mode=$(stat -c '%a' -- "$path")
+  [[ -O "$path" && "$mode" =~ ^[0-7]{1,4}$ ]] && (( (8#$mode & 0022) == 0 )) || { echo "Refusing unsafe installation permissions: $path" >&2; exit 1; }
+done
 if $update_only; then
   [[ -s /etc/v2box/config.json && -x /usr/local/lib/v2box/v2box ]] || { echo 'V2Box is not installed; use the panel deployment command.' >&2; exit 1; }
   [[ -z "$api_host$node_id$api_key" && "$ddns" == false && "$landing_page" == false ]] || { echo 'Update preserves existing settings; do not supply deployment options.' >&2; exit 1; }
@@ -120,17 +130,17 @@ for tool in curl unzip sha256sum jq install flock timeout; do
   command -v "$tool" >/dev/null || { echo "Install required command: $tool" >&2; exit 1; }
 done
 timeout --foreground 1 true </dev/null || { echo 'Install GNU coreutils timeout before updating (including on OpenRC/Alpine), or use the latest panel bootstrap to repair dependencies.' >&2; exit 1; }
-install -d -m 755 /etc/v2box
+if [[ ! -d /etc/v2box ]]; then install -d -m 755 /etc/v2box; fi
 # The root-owned panel bootstrap holds its lock while invoking this installer.
 # Keep that descriptor out of child services, including older release installers.
 if [[ "${V2BOX_BOOTSTRAP_LOCK_HELD:-}" != 1 ]]; then
-  exec 9>/etc/v2box/.bootstrap.lock
+  exec 9>>/etc/v2box/.bootstrap.lock
   flock -n 9 || { echo 'Another deployment is running.' >&2; exit 1; }
 fi
 unset V2BOX_BOOTSTRAP_LOCK_HELD
-exec 7>/etc/v2box/.deployment.lock
+exec 7>>/etc/v2box/.deployment.lock
 flock -n 7 || { echo 'Deployment is actively running. Wait for it to finish or stop its terminal command before updating.' >&2; exit 1; }
-exec 8>/etc/v2box/.maintenance.lock
+exec 8>>/etc/v2box/.maintenance.lock
 flock -n 8 || { echo 'Another maintenance operation is running.' >&2; exit 1; }
 case "$(uname -m)" in
   x86_64|amd64) arch=amd64;;
@@ -159,9 +169,22 @@ fi
 was_running=false
 had_binary=false
 [[ ! -f /usr/local/lib/v2box/v2box ]] || had_binary=true
+# install treats a directory (including a link to one) as a destination
+# directory. Never allow a pre-existing staging path to redirect a write.
+for temporary in /etc/v2box/config.json.new /etc/systemd/system/v2box.service.new /etc/init.d/v2box.new \
+  /usr/local/lib/v2box/{v2box,manager.sh,install.sh,node-credentials.py,node-network.py}.new /usr/local/bin/v2box.new; do
+  if [[ -L "$temporary" || ( -e "$temporary" && ! -f "$temporary" ) ]]; then
+    echo "Refusing unsafe installation staging path: $temporary" >&2
+    exit 1
+  fi
+done
 stage=$(mktemp -d)
 rollback=false
 program_files=(v2box v2box.previous manager.sh install.sh node-credentials.py node-network.py)
+copy_replacing_file() {
+  # Unlink the destination before copying, including stale symbolic links.
+  rm -f -- "$2" && cp -pT -- "$1" "$2"
+}
 cleanup() {
   result=$?
   trap - EXIT
@@ -176,13 +199,13 @@ cleanup() {
     restore_failed=false
     for file in "${program_files[@]}"; do
       if [[ -f "$stage/previous/$file" ]]; then
-        if ! cp -p -- "$stage/previous/$file" "/usr/local/lib/v2box/$file.restore" || ! mv -f -- "/usr/local/lib/v2box/$file.restore" "/usr/local/lib/v2box/$file"; then
+        if ! copy_replacing_file "$stage/previous/$file" "/usr/local/lib/v2box/$file.restore" || ! mv -fT -- "/usr/local/lib/v2box/$file.restore" "/usr/local/lib/v2box/$file"; then
           echo "Could not restore program file: $file" >&2; restore_failed=true
         fi
       else rm -f -- "/usr/local/lib/v2box/$file" || restore_failed=true; fi
     done
     if [[ -f "$stage/previous/wrapper" ]]; then
-      if ! cp -p -- "$stage/previous/wrapper" /usr/local/bin/v2box.restore || ! mv -f -- /usr/local/bin/v2box.restore /usr/local/bin/v2box; then restore_failed=true; fi
+      if ! copy_replacing_file "$stage/previous/wrapper" /usr/local/bin/v2box.restore || ! mv -fT -- /usr/local/bin/v2box.restore /usr/local/bin/v2box; then restore_failed=true; fi
     else rm -f -- /usr/local/bin/v2box || restore_failed=true; fi
     if $restore_failed; then
       echo "Rollback incomplete. Backup retained at $stage" >&2
@@ -211,20 +234,34 @@ else
   else state=$?; [[ $state == 3 ]] || { echo 'Cannot verify existing service state; programs were not changed.' >&2; exit "$state"; }; fi
 fi
 if [[ -z "$version" ]]; then
-  run_step 35 curl -fsSL --proto '=https' --proto-redir '=https' --connect-timeout 10 --max-time 30 "https://api.github.com/repos/$repo/releases/latest" -o "$stage/release.json"
+  run_step 35 curl -q -fsSL --proto '=https' --proto-redir '=https' --connect-timeout 10 --max-time 30 "https://api.github.com/repos/$repo/releases/latest" -o "$stage/release.json"
   version=$(jq -er .tag_name "$stage/release.json")
 fi
 [[ "$version" =~ ^[a-zA-Z0-9._-]+$ ]] || { echo 'Invalid release tag' >&2; exit 1; }
 archive="v2box-linux-${arch}.zip"
 base="https://github.com/$repo/releases/download/$version"
-run_step 185 curl -fSL --proto '=https' --proto-redir '=https' --connect-timeout 10 --max-time 180 "$base/$archive" -o "$stage/$archive"
-run_step 35 curl -fSL --proto '=https' --proto-redir '=https' --connect-timeout 10 --max-time 30 "$base/$archive.sha256" -o "$stage/$archive.sha256"
+run_step 185 curl -q -fSL --proto '=https' --proto-redir '=https' --connect-timeout 10 --max-time 180 "$base/$archive" -o "$stage/$archive"
+run_step 35 curl -q -fSL --proto '=https' --proto-redir '=https' --connect-timeout 10 --max-time 30 --max-filesize 256 "$base/$archive.sha256" -o "$stage/$archive.sha256"
+if [[ $(wc -c < "$stage/$archive.sha256") -gt 256 ]]; then
+  echo 'Release checksum is too large; installed programs were not changed.' >&2
+  exit 1
+fi
+mapfile -t checksum_lines < "$stage/$archive.sha256"
+checksum_pattern='^([[:xdigit:]]{64}) [ *](.+)$'
+if [[ ${#checksum_lines[@]} -ne 1 || ! ${checksum_lines[0]} =~ $checksum_pattern || ${BASH_REMATCH[2]} != "$archive" ]]; then
+  echo 'Release checksum must name the downloaded archive; installed programs were not changed.' >&2
+  exit 1
+fi
+# Supply the filename ourselves so the downloaded manifest cannot select a
+# different file for verification.
+printf '%s  %s\n' "${BASH_REMATCH[1]}" "$archive" > "$stage/archive.check"
+release_files=(v2box v2box.sh install.sh node-network.py node-credentials.py config.example.json LICENSE LICENSE.sing-box NOTICE.md README.md)
 pushd "$stage" >/dev/null
-run_step 30 sha256sum -c "$archive.sha256"
-run_step 60 unzip -oq "$archive"
+run_step 30 sha256sum -c archive.check
+UNZIP= UNZIPOPT= run_step 60 unzip -oq "$archive" "${release_files[@]}"
 popd >/dev/null
-for file in v2box v2box.sh install.sh node-network.py node-credentials.py config.example.json LICENSE LICENSE.sing-box NOTICE.md README.md; do
-  [[ -s "$stage/$file" && ! -L "$stage/$file" ]] || { echo "Release is missing required file: $file" >&2; exit 1; }
+for file in "${release_files[@]}"; do
+  [[ -f "$stage/$file" && -s "$stage/$file" && ! -L "$stage/$file" ]] || { echo "Release is missing required file: $file" >&2; exit 1; }
 done
 for script in v2box.sh install.sh; do
   run_step 20 bash -n "$stage/$script" || { echo "Release contains an invalid shell script: $script; installed programs were not changed." >&2; exit 1; }
@@ -234,7 +271,7 @@ if command -v python3 >/dev/null; then
 fi
 chmod +x "$stage/v2box"
 run_step 15 "$stage/v2box" version || { echo 'Release binary did not pass the version check; installed programs were not changed.' >&2; exit 1; }
-install -d -m 755 /usr/local/lib/v2box /etc/v2box
+if [[ ! -d /usr/local/lib/v2box ]]; then install -d -m 755 /usr/local/lib/v2box; fi
 if $had_binary; then
   mkdir "$stage/previous"
   for file in "${program_files[@]}"; do
@@ -244,7 +281,7 @@ if $had_binary; then
   rollback=true
 fi
 if [[ -f /usr/local/lib/v2box/v2box ]]; then
-  cp -p /usr/local/lib/v2box/v2box /usr/local/lib/v2box/v2box.previous
+  copy_replacing_file /usr/local/lib/v2box/v2box /usr/local/lib/v2box/v2box.previous
 fi
 install -m 755 "$stage/v2box" /usr/local/lib/v2box/v2box.new
 mv -f /usr/local/lib/v2box/v2box.new /usr/local/lib/v2box/v2box

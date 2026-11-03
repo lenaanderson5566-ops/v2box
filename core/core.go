@@ -207,10 +207,17 @@ func (v *V2Core) DelNode(tag string) error {
 	if !ok {
 		return nil
 	}
-	delete(v.nodes, tag)
 	if n.shared {
-		return v.shared.remove(v, n)
+		if err := v.shared.remove(v, n); err != nil {
+			if !n.shared {
+				delete(v.nodes, tag)
+			}
+			return err
+		}
+		delete(v.nodes, tag)
+		return nil
 	}
+	delete(v.nodes, tag)
 	v.revokeNode(tag, n)
 	v.tracker.setUsers(tag, nil)
 	if n.cancel != nil {
@@ -228,9 +235,15 @@ func (v *V2Core) Close() error {
 	defer v.access.Unlock()
 	v.closed = true
 	var errs []error
+	remaining := make(map[string]*nodeState)
 	for tag, n := range v.nodes {
 		if n.shared {
-			errs = append(errs, v.shared.remove(v, n))
+			if err := v.shared.remove(v, n); err != nil {
+				errs = append(errs, err)
+				if n.shared {
+					remaining[tag] = n
+				}
+			}
 			continue
 		}
 		v.revokeNode(tag, n)
@@ -244,7 +257,10 @@ func (v *V2Core) Close() error {
 			errs = append(errs, n.server.Close())
 		}
 	}
-	v.nodes = make(map[string]*nodeState)
+	// Keep owners when removal failed before detaching them. Box.Close drains
+	// cleanup callbacks once, so a detached group's final close error is reported
+	// without retaining an empty owner that cannot retry the failed callbacks.
+	v.nodes = remaining
 	return errors.Join(errs...)
 }
 

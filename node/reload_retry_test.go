@@ -4,8 +4,10 @@ import (
 	"context"
 	"crypto/x509"
 	"encoding/json"
+	"errors"
 	"fmt"
 	panel "github.com/lenaanderson5566-ops/v2box/api/v2board"
+	"github.com/lenaanderson5566-ops/v2box/common/format"
 	"github.com/lenaanderson5566-ops/v2box/conf"
 	"github.com/lenaanderson5566-ops/v2box/core"
 	"github.com/lenaanderson5566-ops/v2box/limiter"
@@ -207,6 +209,112 @@ func TestRejectedReloadIsRetriedWithoutConfigChange(t *testing.T) {
 		default:
 			t.Fatalf("reload not requested on poll %d", i)
 		}
+	}
+}
+
+func TestOnlineReportsIncludeEmptyAndThresholdFilteredSnapshots(t *testing.T) {
+	for _, version := range []string{"legacy", "v10"} {
+		t.Run(version, func(t *testing.T) {
+			var mu sync.Mutex
+			var snapshots []map[int][]string
+			s := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				snapshot := map[int][]string{}
+				if version == "v10" {
+					var body struct {
+						Records []struct {
+							ID  int      `json:"userId"`
+							IPs []string `json:"ips"`
+						} `json:"records"`
+					}
+					if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+						t.Error(err)
+					}
+					if body.Records == nil {
+						t.Error("empty snapshot must be an array, not null")
+					}
+					for _, record := range body.Records {
+						snapshot[record.ID] = record.IPs
+					}
+				} else if err := json.NewDecoder(r.Body).Decode(&snapshot); err != nil {
+					t.Error(err)
+				}
+				mu.Lock()
+				snapshots = append(snapshots, snapshot)
+				mu.Unlock()
+				fmt.Fprint(w, `{"data":{"accepted":true}}`)
+			}))
+			defer s.Close()
+			roots := x509.NewCertPool()
+			roots.AddCert(s.Certificate())
+			t.Setenv("GODEBUG", os.Getenv("GODEBUG")+",x509usefallbackroots=1")
+			fixtureRootsOnce.Do(func() { x509.SetFallbackRoots(roots) })
+			retries := 0
+			api, err := panel.New(&conf.NodeConfig{APIHost: s.URL, APIVersion: version, Key: "fixture", RetryCount: &retries, TrafficSpoolDirectory: t.TempDir()})
+			if err != nil {
+				t.Fatal(err)
+			}
+			server := core.New(conf.New())
+			defer server.Close()
+			tag := "online-snapshots-" + version
+			limits := limiter.AddLimiter("", tag, []panel.UserInfo{{Id: 1, Uuid: "fixture-user"}}, nil)
+			defer limiter.DeleteLimiter(tag)
+			info := &panel.NodeInfo{Common: &panel.CommonNode{BaseConfig: &panel.BaseConfig{}}}
+			controller := &Controller{apiClient: api, server: server, tag: tag, limiter: limits, info: info}
+			observe := func() {
+				if _, rejected := limits.CheckLimit(format.UserTag(tag, "fixture-user"), "127.0.0.1", false); rejected {
+					t.Fatal("test observation rejected")
+				}
+			}
+			observe()
+			if err = controller.reportUserTrafficTask(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			// No new observation must actively clear the previous node snapshot.
+			if err = controller.reportUserTrafficTask(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			info.Common.BaseConfig.DeviceOnlineMinTraffic = 1
+			observe()
+			if err = controller.reportUserTrafficTask(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if len(snapshots) != 3 || len(snapshots[0][1]) != 1 || len(snapshots[1]) != 0 || len(snapshots[2]) != 0 {
+				t.Fatalf("empty/filtered observation window not reported: %#v", snapshots)
+			}
+		})
+	}
+}
+
+func TestCancelledTrafficReportDoesNotDrainOnlineObservation(t *testing.T) {
+	s := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { t.Error("cancelled request reached server") }))
+	defer s.Close()
+	retries := 0
+	api, err := panel.New(&conf.NodeConfig{APIHost: s.URL, APIVersion: "legacy", Key: "fixture", RetryCount: &retries})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := core.New(conf.New())
+	defer server.Close()
+	tag := "cancelled-online-sample"
+	limits := limiter.AddLimiter("", tag, []panel.UserInfo{{Id: 1, Uuid: "fixture-user"}}, nil)
+	defer limiter.DeleteLimiter(tag)
+	limits.CheckLimit(format.UserTag(tag, "fixture-user"), "127.0.0.1", false)
+	server.RestoreUserTraffic(tag, []panel.UserTraffic{{UID: 1, Upload: 123}})
+	controller := &Controller{apiClient: api, server: server, tag: tag, limiter: limits, info: &panel.NodeInfo{Common: &panel.CommonNode{}}}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err = controller.reportUserTrafficTask(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatal("cancellation not preserved", err)
+	}
+	observed, err := limits.GetOnlineDevice()
+	if err != nil || len(*observed) != 1 {
+		t.Fatal("cancelled traffic request discarded the unreported online window")
+	}
+	traffic, _ := server.GetUserTrafficSlice(tag, 0)
+	if len(traffic) != 1 || traffic[0].Upload != 123 {
+		t.Fatal("cancelled non-durable traffic was not restored")
 	}
 }
 

@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"path/filepath"
-	"reflect"
 	"strconv"
 	"strings"
 	"time"
@@ -282,6 +281,11 @@ func (c *Client) GetNodeInfo(ctx context.Context) (node *NodeInfo, err error) {
 	if cm.BaseConfig == nil {
 		return nil, fmt.Errorf("missing base_config")
 	}
+	for _, minimum := range []int{cm.BaseConfig.NodeReportMinTraffic, cm.BaseConfig.DeviceOnlineMinTraffic} {
+		if minimum < 0 || int64(minimum) > (1<<63-1)/1000 {
+			return nil, fmt.Errorf("invalid panel traffic threshold")
+		}
+	}
 	// set interval
 	node.PushInterval = intervalToTime(cm.BaseConfig.PushInterval)
 	node.PullInterval = intervalToTime(cm.BaseConfig.PullInterval)
@@ -298,20 +302,29 @@ func (c *Client) GetNodeInfo(ctx context.Context) (node *NodeInfo, err error) {
 }
 
 func intervalToTime(i interface{}) time.Duration {
-	if i == nil {
-		return 0
-	}
-	switch reflect.TypeOf(i).Kind() {
-	case reflect.Int:
-		return time.Duration(i.(int)) * time.Second
-	case reflect.String:
-		i, _ := strconv.Atoi(i.(string))
-		return time.Duration(i) * time.Second
-	case reflect.Float64:
-		return time.Duration(i.(float64)) * time.Second
+	const maximumSeconds = int64((1<<63 - 1) / time.Second)
+	var seconds int64
+	switch value := i.(type) {
+	case int:
+		seconds = int64(value)
+	case string:
+		var err error
+		seconds, err = strconv.ParseInt(value, 10, 64)
+		if err != nil {
+			return 0
+		}
+	case float64:
+		if value < 1 || value > float64(maximumSeconds) || value != float64(int64(value)) {
+			return 0
+		}
+		seconds = int64(value)
 	default:
 		return 0
 	}
+	if seconds <= 0 || seconds > maximumSeconds {
+		return 0
+	}
+	return time.Duration(seconds) * time.Second
 }
 
 func (t TlsSettings) EffectiveServerNames() []string {

@@ -67,7 +67,7 @@ func (c *Client) getV10Alive(ctx context.Context) (map[int]int, error) {
 	}
 	out := map[int]int{}
 	for _, v := range *body.Data {
-		if v.ID <= 0 || v.Count < 0 {
+		if _, duplicate := out[v.ID]; v.ID <= 0 || v.Count < 0 || duplicate {
 			return nil, fmt.Errorf("invalid online count")
 		}
 		out[v.ID] = v.Count

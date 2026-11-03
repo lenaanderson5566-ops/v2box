@@ -43,7 +43,34 @@ type Client struct {
 	AliveMap              *AliveMap
 }
 
+// Allow large user directories while bounding memory used by unexpected proxy
+// responses. Streaming legacy responses enforce the same uncompressed limit.
+const maxPanelResponseBytes = 64 * 1024 * 1024
+
+type credentialSafeLogger struct{ key string }
+
+func (l credentialSafeLogger) message(format string, args ...any) string {
+	message := fmt.Sprintf(format, args...)
+	if l.key != "" {
+		message = strings.ReplaceAll(message, url.QueryEscape(l.key), "[REDACTED]")
+		message = strings.ReplaceAll(message, l.key, "[REDACTED]")
+	}
+	return message
+}
+func (l credentialSafeLogger) Errorf(format string, args ...any) {
+	logrus.Error(l.message(format, args...))
+}
+func (l credentialSafeLogger) Warnf(format string, args ...any) {
+	logrus.Warn(l.message(format, args...))
+}
+func (l credentialSafeLogger) Debugf(format string, args ...any) {
+	logrus.Debug(l.message(format, args...))
+}
+
 func New(c *conf.NodeConfig) (*Client, error) {
+	if c.Timeout < 0 || int64(c.Timeout) > int64((1<<63-1)/time.Second) {
+		return nil, errors.New("Timeout must be non-negative and fit a time.Duration in seconds")
+	}
 	if !conf.ValidSharedListener(c.SharedListener) {
 		return nil, errors.New("invalid SharedListener")
 	}
@@ -59,10 +86,15 @@ func New(c *conf.NodeConfig) (*Client, error) {
 		return nil, fmt.Errorf("unsupported NodeType %q", nodeType)
 	}
 	client := resty.New()
+	client.SetResponseBodyLimit(maxPanelResponseBytes)
+	client.SetLogger(credentialSafeLogger{key: c.Key})
 	client.SetRedirectPolicy(resty.NoRedirectPolicy())
 	retryCount := conf.DefaultNodeRetryCount
 	if c.RetryCount != nil {
 		retryCount = *c.RetryCount
+	}
+	if retryCount < 0 {
+		return nil, errors.New("RetryCount must be non-negative")
 	}
 	client.SetRetryCount(retryCount)
 	client.SetHeader("User-Agent", fmt.Sprintf("v2box go-resty/%s (https://github.com/go-resty/resty)", resty.Version))
@@ -71,12 +103,18 @@ func New(c *conf.NodeConfig) (*Client, error) {
 	} else {
 		client.SetTimeout(time.Duration(conf.DefaultNodeTimeout) * time.Second)
 	}
-	client.OnError(func(req *resty.Request, err error) {
-		var v *resty.ResponseError
-		if errors.As(err, &v) {
-			// v.Response contains the last response from the server
-			// v.Err contains the original error
-			logrus.Error(v.Err)
+	client.OnError(func(_ *resty.Request, err error) {
+		// The caller logs failures with node context. Strip legacy query-token
+		// credentials from transport errors without breaking cancellation checks.
+		var networkError *url.Error
+		if errors.As(err, &networkError) {
+			if endpoint, parseErr := url.Parse(networkError.URL); parseErr == nil {
+				endpoint.User, endpoint.RawQuery, endpoint.Fragment = nil, "", ""
+				endpoint.ForceQuery = false
+				networkError.URL = endpoint.String()
+			} else {
+				networkError.URL = "[panel]"
+			}
 		}
 	})
 	client.SetBaseURL(c.APIHost)

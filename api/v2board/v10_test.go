@@ -624,6 +624,33 @@ func TestDomainTransitionRequiresPublicationAcknowledgement(t *testing.T) {
 	}
 }
 
+func TestOnlineCountSnapshotRejectsAmbiguousOrInvalidCounts(t *testing.T) {
+	for _, tc := range []struct {
+		body  string
+		valid bool
+	}{
+		{`{"data":[]}`, true},
+		{`{"data":[{"userId":1,"count":0}]}`, true},
+		{`{}`, false},
+		{`{"data":null}`, false},
+		{`{"data":[{"userId":1,"count":-1}]}`, false},
+		{`{"data":[{"userId":0,"count":1}]}`, false},
+		{`{"data":[{"userId":1,"count":5},{"userId":1,"count":1}]}`, false},
+	} {
+		t.Run(tc.body, func(t *testing.T) {
+			server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, tc.body) }))
+			defer server.Close()
+			client, err := newTestPanel(t, server, &conf.NodeConfig{APIHost: server.URL, APIVersion: "v10", RetryCount: new(int)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err = client.GetUserAlive(context.Background()); (err == nil) != tc.valid {
+				t.Fatal("invalid online-count snapshot accepted or empty snapshot rejected", err)
+			}
+		})
+	}
+}
+
 func TestSharedListenerSelectionCannotBeProvidedByPanel(t *testing.T) {
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, "/capabilities") {

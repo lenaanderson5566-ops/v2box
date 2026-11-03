@@ -9,6 +9,37 @@ import (
 	"github.com/lenaanderson5566-ops/v2box/limiter"
 )
 
+func TestSharedRemovalFailureKeepsOwnerForRetry(t *testing.T) {
+	v := New(testConf())
+	n := &nodeState{shared: true, info: &panel.NodeInfo{Tag: "shared", SharedListener: "group"}}
+	v.nodes[n.info.Tag] = n
+	v.nodes["regular"] = &nodeState{}
+	v.shared.groups["group"] = &sharedListener{members: map[string]*sharedMember{
+		n.info.Tag: {tracker: v.tracker, state: n},
+	}}
+	// Invalid shared configuration makes removal fail before touching a listener.
+	if err := v.DelNode(n.info.Tag); err == nil {
+		t.Fatal("invalid shared node removal unexpectedly succeeded")
+	}
+	if v.nodes[n.info.Tag] != n {
+		t.Fatal("failed node removal lost its shared-listener owner")
+	}
+	if err := v.Close(); err == nil {
+		t.Fatal("shared cleanup failure was not reported")
+	}
+	if !v.closed || len(v.nodes) != 1 || v.nodes[n.info.Tag] != n {
+		t.Fatal("close lost failed shared state or retained cleaned ordinary nodes")
+	}
+	// Once the listener group has gone, shutdown must retry despite closed=true.
+	delete(v.shared.groups, "group")
+	if err := v.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if len(v.nodes) != 0 {
+		t.Fatal("successful cleanup retained the shared owner")
+	}
+}
+
 func TestSharedProtocolsIndependentPanels(t *testing.T) {
 	limiter.Init()
 	for _, protocol := range []string{"anytls", "vless", "vmess", "trojan", "shadowsocks", "ss2022", "ss2022-256", "hysteria2", "tuic", "vless-tls", "vmess-tls", "vless-ws", "vmess-grpc"} {

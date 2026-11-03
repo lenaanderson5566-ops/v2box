@@ -2,14 +2,19 @@ package panel
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"github.com/lenaanderson5566-ops/v2box/conf"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/vmihailenco/msgpack/v5"
 )
 
 func TestUserListAndFailedReport(t *testing.T) {
@@ -57,6 +62,158 @@ func TestPanelRejectsUnsafeEndpoints(t *testing.T) {
 				t.Fatal("unsafe panel endpoint accepted")
 			}
 		})
+	}
+}
+
+func TestPanelHTTPConfigurationBounds(t *testing.T) {
+	negative := -1
+	configs := []conf.NodeConfig{{Timeout: -1}, {RetryCount: &negative}}
+	maximumSeconds := int64((1<<63 - 1) / time.Second)
+	if int64(^uint(0)>>1) > maximumSeconds {
+		configs = append(configs, conf.NodeConfig{Timeout: int(maximumSeconds) + 1})
+	}
+	for _, config := range configs {
+		config.APIHost = "https://panel.example.test"
+		if _, err := New(&config); err == nil {
+			t.Fatal("invalid HTTP timeout/retry configuration accepted")
+		}
+	}
+	client, err := New(&conf.NodeConfig{APIHost: "https://panel.example.test"})
+	if err != nil || client.client.GetClient().Timeout != conf.DefaultNodeTimeout*time.Second || client.client.RetryCount != conf.DefaultNodeRetryCount {
+		t.Fatal("default timeout/retry settings changed", err)
+	}
+}
+
+func TestPanelIntervalBounds(t *testing.T) {
+	for _, value := range []any{1, "60", float64(60)} {
+		if intervalToTime(value) <= 0 {
+			t.Fatal("valid integer polling interval rejected")
+		}
+	}
+	for _, value := range []any{nil, true, -1, "0", "1.5", "9223372037", "18446744073709551616", float64(0.5), float64(1.5), float64(9223372037)} {
+		if intervalToTime(value) != 0 {
+			t.Fatal("invalid or overflowing interval accepted")
+		}
+	}
+}
+
+func TestLegacyUserSnapshotRequiresCompleteEnvelope(t *testing.T) {
+	valid, err := msgpack.Marshal(map[string]any{"users": []any{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name, body, contentType string
+	}{
+		{"missing", `{}`, "application/json"},
+		{"null", `{"users":null}`, "application/json"},
+		{"truncated-array", `{"users":[`, "application/json"},
+		{"truncated-envelope", `{"users":[]`, "application/json"},
+		{"nested-only", `{"meta":{"users":[]}}`, "application/json"},
+		{"trailing-record", `{"users":[]}{"users":[]}`, "application/json"},
+		{"duplicate-field", `{"users":[],"users":[]}`, "application/json"},
+		{"duplicate-id", `{"users":[{"id":1,"uuid":"a"},{"id":1,"uuid":"b"}]}`, "application/json"},
+		{"empty-msgpack", string(valid), "application/x-msgpack"},
+		{"msgpack-trailing-record", string(append(append([]byte{}, valid...), valid...)), "application/x-msgpack"},
+		{"msgpack-false-array-length", "\x81\xa5users\xdd\xff\xff\xff\xff", "application/x-msgpack"},
+		{"msgpack-enormous-trailing-array", string(valid) + "\xdd\xff\xff\xff\xff", "application/x-msgpack"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", tc.contentType)
+				w.Header().Set("ETag", `"invalid-next"`)
+				fmt.Fprint(w, tc.body)
+			}))
+			defer server.Close()
+			client, err := newTestPanel(t, server, &conf.NodeConfig{APIHost: server.URL, APIVersion: "legacy", RetryCount: new(int)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			client.userEtag = `"previous"`
+			if tc.name == "empty-msgpack" {
+				if users, err := client.GetUserList(context.Background()); err != nil || users == nil || len(users) != 0 || client.userEtag != `"invalid-next"` {
+					t.Fatal("valid empty MessagePack snapshot rejected", err)
+				}
+				return
+			}
+			if users, err := client.GetUserList(context.Background()); err == nil || users != nil || client.userEtag != `"previous"` {
+				t.Fatal("incomplete snapshot replaced authorization/cache state", err)
+			}
+		})
+	}
+}
+
+func TestPanelUserResponseLimitsAndRecovery(t *testing.T) {
+	for _, version := range []string{"legacy", "v10"} {
+		t.Run(version, func(t *testing.T) {
+			var oversized atomic.Bool
+			oversized.Store(true)
+			server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("ETag", `"next"`)
+				if oversized.Load() {
+					fmt.Fprint(w, strings.Repeat(" ", 256))
+				}
+				if version == "legacy" {
+					fmt.Fprint(w, `{"users":[]}`)
+				} else {
+					fmt.Fprint(w, `{"data":[]}`)
+				}
+			}))
+			defer server.Close()
+			client, err := newTestPanel(t, server, &conf.NodeConfig{APIHost: server.URL, APIVersion: version, RetryCount: new(int)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if client.client.ResponseBodyLimit < 64*1024*1024 {
+				t.Fatal("normal large-directory allowance reduced")
+			}
+			// A small test-only cap exercises both Resty and the streaming path.
+			client.client.SetResponseBodyLimit(128)
+			if _, err = client.GetUserList(context.Background()); err == nil || client.userEtag != "" {
+				t.Fatal("oversized user response accepted or cached")
+			}
+			oversized.Store(false)
+			users, err := client.GetUserList(context.Background())
+			if err != nil || users == nil || len(users) != 0 || client.userEtag != `"next"` {
+				t.Fatal("valid empty snapshot did not recover after oversized response", err)
+			}
+		})
+	}
+}
+
+func TestLegacyLargeSnapshotStillStreams(t *testing.T) {
+	// Do not regress large installations to a small 4/8 MiB response ceiling.
+	padding := strings.Repeat(" ", 9*1024*1024)
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, padding, `{"users":[]}`)
+	}))
+	defer server.Close()
+	client, err := newTestPanel(t, server, &conf.NodeConfig{APIHost: server.URL, APIVersion: "legacy", RetryCount: new(int)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if users, err := client.GetUserList(context.Background()); err != nil || users == nil {
+		t.Fatal("large complete legacy snapshot rejected", err)
+	}
+}
+
+func TestLegacyRequestErrorsHideCredentialsAndPreserveCancellation(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { t.Error("cancelled request reached server") }))
+	defer server.Close()
+	key := "fixture&secret+with-space"
+	client, err := newTestPanel(t, server, &conf.NodeConfig{APIHost: server.URL, APIVersion: "legacy", Key: key, RetryCount: new(int)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err = client.GetUserList(ctx)
+	if !errors.Is(err, context.Canceled) || strings.Contains(err.Error(), key) || strings.Contains(err.Error(), "token=") {
+		t.Fatal("request error exposed a query credential or lost cancellation", err)
+	}
+	message := (credentialSafeLogger{key: key}).message("request %s / %s", key, url.QueryEscape(key))
+	if strings.Contains(message, key) || strings.Contains(message, url.QueryEscape(key)) {
+		t.Fatal("retry logger exposed raw or encoded credentials")
 	}
 }
 
@@ -140,6 +297,11 @@ func TestLegacyAliveErrorsAreNotEmptySuccess(t *testing.T) {
 		{"unavailable", 503, "", true},
 		{"unauthorized", 403, "", true},
 		{"malformed", 200, "not-json", true},
+		{"missing", 200, `{}`, true},
+		{"null", 200, `{"alive":null}`, true},
+		{"invalid-user", 200, `{"alive":{"0":2}}`, true},
+		{"negative", 200, `{"alive":{"1":-1}}`, true},
+		{"empty", 200, `{"alive":{}}`, false},
 		{"unsupported", 404, "", false},
 		{"valid", 200, `{"alive":{"1":2}}`, false},
 	} {

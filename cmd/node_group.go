@@ -209,11 +209,15 @@ func (w *nodeWorker) run() {
 }
 func (w *nodeWorker) closeRuntime() {
 	if w.nodes != nil {
-		_ = w.nodes.Close()
+		if err := w.nodes.Close(); err != nil {
+			log.WithError(err).Error("Close node controllers failed")
+		}
 		w.nodes = nil
 	}
 	if w.core != nil {
-		_ = w.core.Close()
+		if err := w.core.Close(); err != nil {
+			log.WithError(err).Error("Close node core failed")
+		}
 	}
 }
 func (w *nodeWorker) reconcile(ctx context.Context, config *conf.Conf) error {
