@@ -4,8 +4,8 @@ import (
 	"context"
 	"errors"
 
+	panel "github.com/lenaanderson5566-ops/v2box/api/v2board"
 	log "github.com/sirupsen/logrus"
-	panel "github.com/wyx2685/v2node/api/v2board"
 )
 
 func (c *Controller) reportUserTrafficTask(ctx context.Context) (err error) {
@@ -15,10 +15,19 @@ func (c *Controller) reportUserTrafficTask(ctx context.Context) (err error) {
 		reportmin = c.info.Common.BaseConfig.NodeReportMinTraffic
 		devicemin = c.info.Common.BaseConfig.DeviceOnlineMinTraffic
 	}
+	if snapshot := c.server.TrafficBudgetSnapshot(c.tag); snapshot != nil {
+		if saveErr := c.apiClient.SaveTrafficBudget(snapshot); saveErr != nil {
+			log.WithField("tag", c.tag).WithError(saveErr).Error("Save traffic budget failed")
+		}
+	}
 	userTraffic, _ := c.server.GetUserTrafficSlice(c.tag, reportmin)
-	if len(userTraffic) > 0 {
-		err = c.apiClient.ReportUserTraffic(ctx, userTraffic)
+	{
+		retained, reportErr := c.apiClient.ReportUserTrafficReliable(ctx, userTraffic)
+		err = reportErr
 		if err != nil {
+			if !retained {
+				c.server.RestoreUserTraffic(c.tag, userTraffic)
+			}
 			log.WithFields(log.Fields{
 				"tag": c.tag,
 				"err": err,
@@ -26,7 +35,7 @@ func (c *Controller) reportUserTrafficTask(ctx context.Context) (err error) {
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				return err
 			}
-		} else {
+		} else if len(userTraffic) > 0 {
 			log.WithField("tag", c.tag).Infof("Report %d users traffic", len(userTraffic))
 			//log.WithField("tag", c.tag).Debugf("User traffic: %+v", userTraffic)
 		}
@@ -37,17 +46,11 @@ func (c *Controller) reportUserTrafficTask(ctx context.Context) (err error) {
 			"tag": c.tag,
 			"err": err,
 		}).Info("Get online device failed")
-	} else if len(*onlineDevice) > 0 {
+	} else {
+		activity := c.server.TakeOnlineActivity(c.tag)
 		var result []panel.OnlineUser
-		var nocountUID = make(map[int]struct{})
-		for _, traffic := range userTraffic {
-			total := traffic.Upload + traffic.Download
-			if total < int64(devicemin*1000) {
-				nocountUID[traffic.UID] = struct{}{}
-			}
-		}
 		for _, online := range *onlineDevice {
-			if _, ok := nocountUID[online.UID]; !ok {
+			if activity[online.UID] >= int64(devicemin)*1000 {
 				result = append(result, online)
 			}
 		}
@@ -56,19 +59,18 @@ func (c *Controller) reportUserTrafficTask(ctx context.Context) (err error) {
 			// json structure: { UID1:["ip1","ip2"],UID2:["ip3","ip4"] }
 			data[onlineuser.UID] = append(data[onlineuser.UID], onlineuser.IP)
 		}
-		if len(data) != 0 {
-			err := c.apiClient.ReportNodeOnlineUsers(ctx, &data)
-			if err != nil {
-				log.WithFields(log.Fields{
-					"tag": c.tag,
-					"err": err,
-				}).Info("Report online users failed")
-				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-					return err
-				}
+		// Each successful sample replaces this node's observation window,
+		// including the empty snapshot after users disconnect or fall idle.
+		if err := c.apiClient.ReportNodeOnlineUsers(ctx, &data); err != nil {
+			log.WithFields(log.Fields{
+				"tag": c.tag,
+				"err": err,
+			}).Info("Report online users failed")
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return err
 			}
 		}
-		log.WithField("tag", c.tag).Infof("Total %d online users, %d Reported", len(*onlineDevice), len(result))
+		log.WithField("tag", c.tag).Infof("Observed %d online devices; reported %d devices for %d users", len(*onlineDevice), len(result), len(data))
 	}
 
 	return nil
@@ -84,7 +86,10 @@ func compareUserList(old, new []panel.UserInfo) (deleted, added, modified []pane
 		if o, ok := oldMap[u.Uuid]; !ok {
 			added = append(added, u)
 		} else {
-			if o.SpeedLimit != u.SpeedLimit || o.DeviceLimit != u.DeviceLimit {
+			if o.Id != u.Id {
+				deleted = append(deleted, o)
+				added = append(added, u)
+			} else if o.SpeedLimit != u.SpeedLimit || o.DeviceLimit != u.DeviceLimit {
 				modified = append(modified, u)
 			}
 			delete(oldMap, u.Uuid)

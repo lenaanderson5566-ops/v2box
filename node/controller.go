@@ -2,29 +2,96 @@ package node
 
 import (
 	"context"
-	"errors"
-	"fmt"
 
+	"fmt"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	panel "github.com/lenaanderson5566-ops/v2box/api/v2board"
+	"github.com/lenaanderson5566-ops/v2box/common/task"
+	"github.com/lenaanderson5566-ops/v2box/conf"
+	"github.com/lenaanderson5566-ops/v2box/core"
+	"github.com/lenaanderson5566-ops/v2box/limiter"
 	log "github.com/sirupsen/logrus"
-	panel "github.com/wyx2685/v2node/api/v2board"
-	"github.com/wyx2685/v2node/common/task"
-	"github.com/wyx2685/v2node/conf"
-	"github.com/wyx2685/v2node/core"
-	"github.com/wyx2685/v2node/limiter"
 )
 
 type Controller struct {
-	server                  *core.V2Core
-	apiClient               *panel.Client
-	tag                     string
-	limiter                 *limiter.Limiter
-	userList                []panel.UserInfo
-	aliveMap                map[int]int
-	conf                    *conf.NodeConfig
-	info                    *panel.NodeInfo
+	server         *core.V2Core
+	apiClient      *panel.Client
+	tag            string
+	limiter        *limiter.Limiter
+	userList       []panel.UserInfo
+	certPrepared   bool
+	usersPrepared  bool
+	preparedBudget *panel.TrafficBudget
+	reloadPending  bool
+	aliveMap       map[int]int
+	conf           *conf.NodeConfig
+	info           *panel.NodeInfo
+	// Certificate maintenance and configuration polling run independently.
+	// Keep local receipt metadata outside the immutable panel configuration.
+	appliedReceipt          atomic.Pointer[configurationReceipt]
+	receiptMu               sync.Mutex
 	nodeInfoMonitorPeriodic *task.Task
 	userReportPeriodic      *task.Task
-	renewCertPeriodic       *task.Task
+	targetReportPeriodic    *task.Task
+	// Owned solely by the target statistics task goroutine.
+	targetLastReport  time.Time
+	targetInterval    time.Duration
+	targetRetry       bool
+	targetRetryAt     time.Time
+	targetRetryDelay  time.Duration
+	renewCertPeriodic *task.Task
+}
+
+type configurationReceipt struct {
+	hash, fingerprint string
+}
+
+func (c *Controller) currentReceipt() configurationReceipt {
+	if receipt := c.appliedReceipt.Load(); receipt != nil {
+		return *receipt
+	}
+	return configurationReceipt{c.info.ConfigurationHash, c.info.CertificateFingerprint}
+}
+
+// Each task updates only its own field, preserving a concurrent certificate
+// renewal or final configuration publication in the same atomic snapshot.
+func (c *Controller) updateReceipt(hash, fingerprint string) configurationReceipt {
+	for {
+		previous := c.appliedReceipt.Load()
+		next := configurationReceipt{c.info.ConfigurationHash, c.info.CertificateFingerprint}
+		if previous != nil {
+			next = *previous
+		}
+		if hash != "" {
+			next.hash = hash
+		}
+		if fingerprint != "" {
+			next.fingerprint = fingerprint
+		}
+		if c.appliedReceipt.CompareAndSwap(previous, &next) {
+			return next
+		}
+	}
+}
+
+func (c *Controller) currentCertificateFingerprint() string {
+	return c.currentReceipt().fingerprint
+}
+
+func (c *Controller) reportCurrentConfiguration(ctx context.Context, code string, transitionID ...string) error {
+	// Serialize sends as well as the snapshot: a slower earlier renewal receipt
+	// must not overwrite a later final-publication receipt in the API client.
+	c.receiptMu.Lock()
+	defer c.receiptMu.Unlock()
+	receipt := c.currentReceipt()
+	fingerprint := []string{receipt.fingerprint}
+	if len(transitionID) > 0 {
+		fingerprint = append(fingerprint, transitionID[0])
+	}
+	return c.apiClient.ReportConfiguration(ctx, receipt.hash, code, fingerprint...)
 }
 
 // NewController return a Node controller with default parameters.
@@ -39,37 +106,35 @@ func NewController(api *panel.Client, conf *conf.NodeConfig, info *panel.NodeInf
 
 // Start implement the Start() function of the service interface
 func (c *Controller) Start(x *core.V2Core) error {
+	return c.StartContext(context.Background(), x)
+}
+
+func (c *Controller) StartContext(ctx context.Context, x *core.V2Core) error {
 	// Init Core
 	c.server = x
 	var err error
 	// First fetch Node Info
 	node := c.info
 	if node == nil {
-		c.info, err = c.apiClient.GetNodeInfo(context.Background())
+		c.info, err = c.apiClient.GetNodeInfo(ctx)
 		if err != nil {
 			return fmt.Errorf("get node info error: %s", err)
 		}
 		node = c.info
 	}
-	// Update user
-	c.userList, err = c.apiClient.GetUserList(context.Background())
-	if err != nil {
-		return fmt.Errorf("get user list error: %s", err)
-	}
-	if len(c.userList) == 0 {
-		return errors.New("add users error: not have any user")
-	}
-	c.aliveMap, err = c.apiClient.GetUserAlive(context.Background())
-	if err != nil {
-		return fmt.Errorf("failed to get user alive list: %s", err)
+	if !c.usersPrepared {
+		if err := c.prepareUsersContext(ctx); err != nil {
+			return err
+		}
 	}
 	c.tag = node.Tag
+	c.server.SetTrafficBudget(c.tag, c.preparedBudget)
 
 	// add limiter
 	l := limiter.AddLimiter(c.info.Type, c.tag, c.userList, c.aliveMap)
 	c.limiter = l
 	if node.Security == panel.Tls {
-		err = c.requestCert()
+		err = c.requestCertContext(ctx)
 		if err != nil {
 			return fmt.Errorf("request cert error: %s", err)
 		}
@@ -79,7 +144,7 @@ func (c *Controller) Start(x *core.V2Core) error {
 	if err != nil {
 		return fmt.Errorf("add new node error: %s", err)
 	}
-	added, err := c.server.AddUsers(&core.AddUsersParams{
+	added, err := c.server.AddUsersContext(ctx, &core.AddUsersParams{
 		Tag:      c.tag,
 		Users:    c.userList,
 		NodeInfo: node,
@@ -93,19 +158,79 @@ func (c *Controller) Start(x *core.V2Core) error {
 	return nil
 }
 
+// Fetch all authentication inputs before replacing live listeners.
+func (c *Controller) prepareUsers() error {
+	return c.prepareUsersContext(context.Background())
+}
+
+func (c *Controller) prepareUsersContext(ctx context.Context) error {
+	users, err := c.apiClient.GetUserList(ctx)
+	if err != nil {
+		return fmt.Errorf("get user list error: %w", err)
+	}
+	alive, err := c.apiClient.GetUserAlive(ctx)
+	if err != nil {
+		c.apiClient.InvalidateUserCache()
+		return fmt.Errorf("get user alive list error: %w", err)
+	}
+	budget, err := c.apiClient.GetTrafficBudget(ctx)
+	if err != nil {
+		c.apiClient.InvalidateUserCache()
+		return fmt.Errorf("get traffic budget error: %w", err)
+	}
+	c.preparedBudget = budget
+	c.userList, c.aliveMap, c.usersPrepared = users, alive, true
+	return nil
+}
+
 // Close implement the Close() function of the service interface
 func (c *Controller) Close() error {
-	limiter.DeleteLimiter(c.tag)
+	return c.closeContext(context.Background())
+}
+
+func (c *Controller) cancelTasks() {
+	for _, t := range []*task.Task{c.nodeInfoMonitorPeriodic, c.userReportPeriodic, c.targetReportPeriodic, c.renewCertPeriodic} {
+		if t != nil {
+			t.Cancel()
+		}
+	}
+}
+
+func (c *Controller) closeContext(ctx context.Context) error {
+	c.cancelTasks()
+	if c.apiClient != nil {
+		defer c.apiClient.CloseIdleConnections()
+	}
+	if c.server == nil || c.limiter == nil {
+		return nil
+	}
+
 	if c.nodeInfoMonitorPeriodic != nil {
 		c.nodeInfoMonitorPeriodic.Close()
 	}
 	if c.userReportPeriodic != nil {
 		c.userReportPeriodic.Close()
 	}
+	if c.targetReportPeriodic != nil {
+		c.targetReportPeriodic.Close()
+	}
 	if c.renewCertPeriodic != nil {
 		c.renewCertPeriodic.Close()
 	}
+	c.preparedBudget = c.server.TrafficBudgetSnapshot(c.tag)
 	err := c.server.DelNode(c.tag)
+	reportCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	traffic, _ := c.server.GetUserTrafficSlice(c.tag, 0)
+	retained, reportErr := c.apiClient.ReportUserTrafficReliable(reportCtx, traffic)
+	if reportErr != nil {
+		if !retained {
+			c.server.RestoreUserTraffic(c.tag, traffic)
+		}
+		log.WithError(reportErr).Warn("Final traffic report failed")
+	}
+
+	limiter.DeleteLimiter(c.tag)
 	if err != nil {
 		return fmt.Errorf("del node error: %s", err)
 	}

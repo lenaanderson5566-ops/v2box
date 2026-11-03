@@ -1,7 +1,5 @@
 example/config.yml
 example/main
-example/XrayR
-example/XrayR*
 example/mytest
 example/access.logo
 example/error.log
@@ -16,3 +14,11 @@ output/*
 .idea/*
 new.sh
 quick_update.sh
+
+/build_assets/
+/v2box
+/v2box.exe
+/*.test
+
+# Python deployment helper
+__pycache__/
