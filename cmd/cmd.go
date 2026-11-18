@@ -7,12 +7,12 @@ import (
 )
 
 var command = &cobra.Command{
-	Use: "v2node",
+	Use: "v2box",
 }
 
 func Run() {
 	err := command.Execute()
 	if err != nil {
-		log.WithField("err", err).Error("Execute command failed")
+		log.WithField("err", err).Fatal("Execute command failed")
 	}
 }

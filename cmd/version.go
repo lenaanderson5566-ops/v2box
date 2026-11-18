@@ -2,14 +2,15 @@ package cmd
 
 import (
 	"fmt"
+	"github.com/lenaanderson5566-ops/v2box/internal/buildinfo"
 
 	"github.com/spf13/cobra"
 )
 
 var (
 	version  = "TempVersion" //use ldflags replace
-	codename = "v2node"
-	intro    = "A V2board backend based on modified xray-core"
+	codename = "v2box"
+	intro    = "A V2board backend powered by sing-box 1.14.3"
 )
 
 var versionCommand = cobra.Command{
@@ -21,6 +22,7 @@ var versionCommand = cobra.Command{
 }
 
 func init() {
+	buildinfo.Version = version
 	command.AddCommand(&versionCommand)
 }
 

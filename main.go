@@ -1,7 +1,7 @@
 package main
 
 import (
-	"github.com/wyx2685/v2node/cmd"
+	"github.com/lenaanderson5566-ops/v2box/cmd"
 )
 
 func main() {
