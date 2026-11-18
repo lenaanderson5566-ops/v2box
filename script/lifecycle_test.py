@@ -266,6 +266,44 @@ echo '{"features":["multi-panel-v1","reload-signal-v1"]}'
         self.assertEqual(r.returncode, 0, r.stderr)
         self.preserved()
 
+    def test_running_update_checks_every_node_before_downloading_or_replacing_files(self):
+        first = json.loads(self.original_config)['Nodes'][0]
+        wrapper = self.root/'usr/local/bin/v2box'
+        old_wrapper = wrapper.read_bytes()
+        self.write(self.bin/'curl', '#!/bin/sh\ntouch "$TEST_ROOT/download-attempted"\nexit 41\n')
+        for second in [
+            {'ApiHost': first['ApiHost'], 'NodeID': 2},
+            {**first, 'ApiKey': '  replace_me  '},
+            {**first, 'ApiHost': 'https://PANEL.EXAMPLE.COM.:8443/path'},
+            {**first, 'NodeID': 1.5},
+        ]:
+            with self.subTest(second=second):
+                config = json.dumps({'Nodes': [first, second]})
+                (self.config/'config.json').write_text(config)
+                result = self.install()
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn('Running service has incomplete or example enrollment', result.stderr)
+                self.assertNotIn('Installed v2box', result.stdout)
+                self.assertFalse((self.root/'download-attempted').exists())
+                self.assertTrue(self.active.exists())
+                self.assertNotIn('restart', (self.root/'service-calls').read_text())
+                self.assertEqual(wrapper.read_bytes(), old_wrapper)
+                self.assertFalse((self.lib/'v2box.previous').exists())
+                self.assertIn('old-version', (self.lib/'v2box').read_text())
+                self.assertEqual((self.config/'config.json').read_text(), config)
+
+    def test_stopped_prepared_node_can_update_before_enrollment(self):
+        self.active.unlink()
+        (self.config/'.deployment-pending').write_text('programs-ready\n')
+        placeholder = json.dumps({'Nodes': [{'ApiHost': 'https://panel.example.com', 'NodeID': 1, 'ApiKey': 'REPLACE_ME'}]})
+        (self.config/'config.json').write_text(placeholder)
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('new-version', (self.lib/'v2box').read_text())
+        self.assertNotIn('restart', (self.root/'service-calls').read_text())
+        self.assertEqual((self.config/'config.json').read_text(), placeholder)
+        self.assertEqual((self.config/'.deployment-pending').read_text(), 'programs-ready\n')
+
     def test_v1016_installer_updates_running_service_with_new_release_manager(self):
         # Exact historical public source: git show v1.0.16:script/install.sh.
         # Keep it as a non-executable fixture so shallow/offline CI exercises the
@@ -548,6 +586,17 @@ exec /bin/cp "$@"
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(state.read_text(), 'pending')
         self.preserved()
+
+    def test_multiple_pending_tasks_direct_operator_to_selected_node_without_starting_one(self):
+        states = [self.config/'deployment-state.json', self.config/'deployment-state-second.json']
+        for path in states:
+            path.write_text('private-task-state')
+        result = self.run_script(self.root/'usr/local/bin/v2box', 'resume')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('node-specific recovery command', result.stderr)
+        self.assertNotIn('private-task-state', result.stderr + result.stdout)
+        self.assertFalse((self.root/'service-calls').exists())
+        self.assertEqual([path.read_text() for path in states], ['private-task-state'] * 2)
 
     def test_resume_uses_retained_state(self):
         (self.lib/'node-network.py').write_text('import json; print(json.dumps({"features":["report-multi-target-v1"]}))')

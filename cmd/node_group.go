@@ -221,14 +221,21 @@ func (w *nodeWorker) closeRuntime() {
 	}
 }
 func (w *nodeWorker) reconcile(ctx context.Context, config *conf.Conf) error {
+	reserveCertificates := func(candidate *node.Node) (func(bool), error) {
+		finish, err := w.claimResources(candidate)
+		if err != nil {
+			candidate.ReportConfigurationContext(ctx, "certificate")
+		}
+		return finish, err
+	}
 	if w.nodes != nil {
-		return reloadConfiguration(ctx, config, &w.nodes, &w.core, w.claimResources)
+		return reloadConfiguration(ctx, config, &w.nodes, &w.core, reserveCertificates)
 	}
 	nodes, err := node.NewContext(ctx, config.NodeConfigs)
 	if err != nil {
 		return &reloadRejected{err}
 	}
-	finish, err := w.claimResources(nodes)
+	finish, err := reserveCertificates(nodes)
 	if err != nil {
 		_ = nodes.Close()
 		return &reloadRejected{err}

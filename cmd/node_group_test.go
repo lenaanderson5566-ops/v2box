@@ -23,15 +23,16 @@ import (
 )
 
 type groupPanel struct {
-	server   *httptest.Server
-	port     atomic.Int64
-	fail     atomic.Bool
-	blocked  atomic.Bool
-	requests atomic.Int64
-	failed   atomic.Int64
-	applied  atomic.Int64
-	uuid     string
-	key      string
+	server      *httptest.Server
+	port        atomic.Int64
+	fail        atomic.Bool
+	blocked     atomic.Bool
+	requests    atomic.Int64
+	failed      atomic.Int64
+	lastFailure atomic.Pointer[panel.ConfigurationReport]
+	applied     atomic.Int64
+	uuid        string
+	key         string
 }
 
 func groupFreePort(t *testing.T) int {
@@ -78,12 +79,13 @@ func newGroupPanel(t *testing.T, uuid, key string, tlsSettings ...map[string]any
 		case "/api/v10/server/users":
 			fmt.Fprintf(w, `{"data":[{"id":1,"uuid":%q,"speedLimit":0,"deviceLimit":0}]}`, fixture.uuid)
 		case "/api/v10/server/capabilities":
-			var body struct{ Configuration struct{ State string } }
+			var body struct{ Configuration panel.ConfigurationReport }
 			json.NewDecoder(r.Body).Decode(&body)
 			if body.Configuration.State == "applied" {
 				fixture.applied.Add(1)
 			}
 			if body.Configuration.State == "failed" {
+				fixture.lastFailure.Store(&body.Configuration)
 				fixture.failed.Add(1)
 			}
 			io.WriteString(w, `{"data":{"accepted":true}}`)
@@ -349,6 +351,53 @@ func TestNodeGroupRejectsSharedCertificatePaths(t *testing.T) {
 	finish(false)
 	if len(group.resources) != 0 {
 		t.Fatal("rejected candidate leaked certificate ownership")
+	}
+}
+
+func TestNodeGroupReportsCertificateConflictOnStartupAndReload(t *testing.T) {
+	limiter.Init()
+	tls := map[string]any{"certMode": "self", "serverName": "node.example.test"}
+	owner := newGroupPanel(t, "b831381d-6324-4d53-ad4f-8cda48b30811", "owner", tls)
+	candidate := newGroupPanel(t, "c831381d-6324-4d53-ad4f-8cda48b30822", "candidate", tls)
+	ctx := context.Background()
+	group := newNodeGroup(ctx)
+	workerFor := func(p *groupPanel) (*nodeWorker, *conf.Conf) {
+		cfg := conf.New()
+		cfg.NodeConfigs = []conf.NodeConfig{p.entry(t)}
+		w := &nodeWorker{group: group, accounting: group.backendAccounting(cfg), reload: make(chan struct{}, 1)}
+		t.Cleanup(w.closeRuntime)
+		return w, cfg
+	}
+	ownerWorker, ownerConfig := workerFor(owner)
+	candidateWorker, candidateConfig := workerFor(candidate)
+	conflicting := *candidateConfig
+	conflicting.NodeConfigs = append([]conf.NodeConfig(nil), candidateConfig.NodeConfigs...)
+	conflicting.NodeConfigs[0].CertificateDirectory = ownerConfig.NodeConfigs[0].CertificateDirectory
+	checkConflict := func() {
+		t.Helper()
+		if err := candidateWorker.reconcile(ctx, &conflicting); err == nil || !strings.Contains(err.Error(), "already owned") {
+			t.Fatalf("expected a certificate ownership conflict, got %v", err)
+		}
+		expectedHash := fmt.Sprintf("%064x", candidate.port.Load())
+		if r := candidate.lastFailure.Load(); r == nil || r.Hash != expectedHash || r.ErrorCode != "certificate" {
+			t.Fatalf("missing failed certificate receipt for candidate %s: %+v", expectedHash, r)
+		}
+		if owner.failed.Load() != 0 || !groupListening(owner.port.Load()) || groupListening(candidate.port.Load()) {
+			t.Fatal("certificate conflict affected the owner or started the rejected listener")
+		}
+	}
+	if err := ownerWorker.reconcile(ctx, ownerConfig); err != nil {
+		t.Fatal(err)
+	}
+	checkConflict()
+	if err := candidateWorker.reconcile(ctx, candidateConfig); err != nil {
+		t.Fatal(err)
+	}
+	servingPort := candidate.port.Load()
+	candidate.port.Store(int64(groupFreePort(t)))
+	checkConflict()
+	if !groupListening(servingPort) {
+		t.Fatal("failed reload closed the previously applied listener")
 	}
 }
 

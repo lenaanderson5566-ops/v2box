@@ -184,7 +184,13 @@ verify_service() {
   return 1
 }
 require_enrolled_config() {
-  if [[ ! -f /etc/v2box/config.json || -L /etc/v2box/config.json ]] || ! command -v jq >/dev/null || ! jq -e '.Nodes | type == "array" and length > 0 and all(.[]; (.ApiHost | type == "string" and test("^https://[^/?#\\s@]+(/[^?#\\s]*)?$") and (test("^https://panel\\.example\\.com([/:]|$)";"i") | not)) and ((.NodeID | tonumber? // 0) | . > 0 and . == floor) and (.ApiKey | type == "string" and test("\\S") and (test("^\\s*replace_me\\s*$";"i") | not)))' /etc/v2box/config.json >/dev/null 2>&1; then
+  if [[ ! -f /etc/v2box/config.json || -L /etc/v2box/config.json ]] || ! command -v jq >/dev/null || ! jq -es '
+    length == 1 and (.[0].Nodes | type == "array" and length > 0 and all(.[];
+      (.ApiHost | type == "string" and test("^https://[^/?#\\s@]+(/[^?#\\s]*)?$") and
+        (test("^https://panel\\.example\\.com\\.?([/:]|$)"; "i") | not)) and
+      ((.NodeID | tonumber? // 0) | . > 0 and . == floor) and
+      (.ApiKey | type == "string" and test("\\S") and (test("^\\s*replace_me\\s*$"; "i") | not))
+    ))' /etc/v2box/config.json >/dev/null 2>&1; then
     echo 'Active node configuration is incomplete/example enrollment, or jq is missing. Resume deployment with v2box resume or use the panel deployment command; no service start was requested.' >&2
     return 1
   fi
@@ -232,7 +238,7 @@ case "$1" in
     shopt -s nullglob
     states=(/etc/v2box/deployment-state*.json)
     ((${#states[@]} > 0)) || { echo 'No pending deployment.'; exit 0; }
-    ((${#states[@]} == 1)) || { echo 'Multiple pending deployments. Re-run the original panel command to resume its selected node.' >&2; exit 1; }
+    ((${#states[@]} == 1)) || { echo 'Multiple pending deployments. In the panel, open the target node and copy its node-specific recovery command. Run it on this server to resume the saved task for that panel and node ID.' >&2; exit 1; }
     trusted_path "${states[0]}" && [[ -f "${states[0]}" && ! -L /etc/v2box/.deployment.lock ]] || { echo 'Unsafe deployment state or lock.' >&2; exit 1; }
     trusted_helper /usr/local/lib/v2box/panel-deploy.py || { echo 'Deployment helper is missing or unsafe. Download the current panel bootstrap and run it with --resume.' >&2; exit 1; }
     timeout -k 2 10 python3 /usr/local/lib/v2box/panel-deploy.py --capabilities 7>&- 8>&- 9>&- 2>/dev/null | jq -e '.features | index("management-lock-delegation-v1") != null' >/dev/null || {

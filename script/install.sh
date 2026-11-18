@@ -166,6 +166,15 @@ if [[ -f /etc/v2box/config.json ]]; then
     exit 1
   }
 fi
+enrolled_config() {
+  jq -es '
+    length == 1 and (.[0].Nodes | type == "array" and length > 0 and all(.[];
+      (.ApiHost | type == "string" and test("^https://[^/?#\\s@]+(/[^?#\\s]*)?$") and
+        (test("^https://panel\\.example\\.com\\.?([/:]|$)"; "i") | not)) and
+      ((.NodeID | tonumber? // 0) | . > 0 and . == floor) and
+      (.ApiKey | type == "string" and test("\\S") and (test("^\\s*replace_me\\s*$"; "i") | not))
+    ))' /etc/v2box/config.json >/dev/null 2>&1
+}
 was_running=false
 had_binary=false
 [[ ! -f /usr/local/lib/v2box/v2box ]] || had_binary=true
@@ -212,7 +221,7 @@ cleanup() {
       echo 'Fix disk space or file permissions and restore the retained previous programs before restarting. Configuration and certificates were not removed.' >&2
       exit "$result"
     fi
-    if $was_running; then
+    if $was_running && enrolled_config; then
       if [[ "$init" == systemd ]]; then run_service systemctl restart v2box || echo 'Previous service could not restart; inspect v2box log.' >&2
       else run_service rc-service v2box restart || echo 'Previous service could not restart; inspect v2box log.' >&2; fi
     fi
@@ -232,6 +241,10 @@ if [[ "$init" == systemd ]]; then
 else
   if run_service rc-service v2box status >/dev/null 2>&1; then was_running=true;
   else state=$?; [[ $state == 3 ]] || { echo 'Cannot verify existing service state; programs were not changed.' >&2; exit "$state"; }; fi
+fi
+if $was_running && ! enrolled_config; then
+  echo 'Running service has incomplete or example enrollment. Check ApiHost, NodeID and ApiKey for every node in /etc/v2box/config.json before updating. Installed programs and the running service were preserved.' >&2
+  exit 1
 fi
 if [[ -z "$version" ]]; then
   run_step 35 curl -q -fsSL --proto '=https' --proto-redir '=https' --connect-timeout 10 --max-time 30 "https://api.github.com/repos/$repo/releases/latest" -o "$stage/release.json"
@@ -360,7 +373,7 @@ if [[ "$ddns" == true ]]; then
   [[ -z "$ddns_token_file" ]] || ddns_args+=(--token-file "$ddns_token_file")
   run_step 600 python3 /usr/local/lib/v2box/node-network.py "${ddns_args[@]}"
 fi
-if jq -e '.Nodes | type == "array" and length > 0 and all(.[]; (.ApiHost | type == "string" and test("^https://[^/?#\\s@]+(/[^?#\\s]*)?$") and (test("^https://panel\\.example\\.com([/:]|$)";"i") | not)) and ((.NodeID | tonumber? // 0) | . > 0 and . == floor) and (.ApiKey | type == "string" and test("\\S") and (test("^\\s*replace_me\\s*$";"i") | not)))' /etc/v2box/config.json >/dev/null; then
+if enrolled_config; then
   if $was_running || { ! $had_binary && ! $pending_deployment; }; then
     # This installer already owns all operation locks. Do not re-enter the CLI,
     # which independently protects administrator start/stop/restart commands.
@@ -379,6 +392,9 @@ if jq -e '.Nodes | type == "array" and length > 0 and all(.[]; (.ApiHost | type 
     done
     ((healthy >= 3)) || { echo 'Updated service did not remain active; inspect v2box log. Rolling back.' >&2; exit 1; }
   else echo 'Updated without starting the previously stopped service. Run: v2box start'; fi
+elif $was_running; then
+  echo 'Active configuration changed during the update. Restore valid enrollment before retrying.' >&2
+  exit 1
 else
   echo 'Node enrollment is incomplete. Resume the panel deployment with v2box resume, or complete /etc/v2box/config.json before v2box start.'
 fi
